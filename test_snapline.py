@@ -51,6 +51,13 @@ def check_rows():
     sys_rows = chat.classify(chat.extract_rows(load("real_chat_sys.png")))
     assert len(sys_rows) == 20 and not any(r["keep"] for r in sys_rows), [r["kind"] for r in sys_rows]
     assert kinds_of(load("real_chat_ic.png")) == [AC, AC, SP]
+    wide = load("real_chat_ic.png").copy()
+    band = wide[20:100, 20:646].copy()
+    for x in (656, 1292):
+        np.maximum(wide[20:100, x:x + 626], band, out=wide[20:100, x:x + 626])
+    wide_rows = chat.classify(chat.extract_rows(wide))
+    ends = [r["glyphs"][-1][1] for r in wide_rows]
+    assert [r["kind"] for r in wide_rows] == [AC, AC, SP] and 1900 < max(ends) < 2369, ends
     pm = kinds_of(load("real_chat_pm.png"))
     assert pm == [AC, AC, SP, A, S, A, S] + [S] * 8 + [O, A, A], pm
 

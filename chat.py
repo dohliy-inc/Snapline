@@ -5,6 +5,7 @@ INK = 60
 BLACK = 6
 CHAT_SHOT_BLACK = 0.9
 CHAT_COLUMN = 0.4
+CHAT_GAP = 3
 WRAP_SHARE = 0.22
 SAME_ROW = 0.08
 
@@ -30,16 +31,10 @@ def _grow(a, r):
     return out
 
 
-def extract_rows(img):
-    width = img.shape[1]
-    colw = int(width * CHAT_COLUMN)
-    rgb = img[:, :colw].astype(np.float32)
-    lum = rgb.max(axis=2)
-    ink = lum > INK
+def _block(ink):
     lines = _runs(ink.any(axis=1))
     if not lines:
-        return []
-
+        return [], 0.0
     tall = np.median([b - a + 1 for a, b in lines])
     fused = []
     for a, b in lines:
@@ -56,6 +51,31 @@ def extract_rows(img):
         block.append((a, b))
     pitch = (float(np.median(np.diff([a for a, _ in block]))) if len(block) > 1
              else 1.3 * (block[0][1] - block[0][0] + 1))
+    return block, pitch
+
+
+def _chat_right(ink, block, pitch):
+    cols = _runs(ink[block[0][0]:block[-1][1] + 1].any(axis=0))
+    right = cols[0][1]
+    for a, b in cols[1:]:
+        if a - right > CHAT_GAP * pitch:
+            break
+        right = b
+    return right + 1
+
+
+def extract_rows(img):
+    width = img.shape[1]
+    ink = img.max(axis=2) > INK
+    block, pitch = _block(ink[:, :int(width * CHAT_COLUMN)])
+    if not block:
+        return []
+    right = _chat_right(ink, block, pitch)
+    rgb = np.zeros(img.shape, np.float32)
+    rgb[:, :right] = img[:, :right]
+    lum = rgb.max(axis=2)
+    ink = lum > INK
+    block, pitch = _block(ink)
 
     rows = []
     for a, b in block:

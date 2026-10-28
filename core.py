@@ -18,7 +18,7 @@ from PIL import Image, ImageGrab
 
 import chat
 
-VERSION = "1.0"
+VERSION = "1.0.1"
 APP_DIR = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent
 RES_DIR = Path(getattr(sys, "_MEIPASS", APP_DIR))
 CONFIG_PATH = APP_DIR / "config.ini"
