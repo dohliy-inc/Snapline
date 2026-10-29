@@ -7,6 +7,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import tkinter as tk
 import tkinter.font as tkfont
 from ctypes import wintypes
@@ -19,6 +20,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageTk
 
 import chat
+import chatlog
 import core
 
 VOID = "#0a0a0a"
@@ -37,7 +39,8 @@ ICONS = {"lines": "", "crop": "", "text": "", "copy": "", "folder": 
 CHROME = {"min": "", "max": "", "restore": "", "close": ""}
 CHROME_TEXT = {"min": "–", "max": "□", "restore": "❐", "close": "×"}
 FORMATS = {"square": "Квадрат", "full": "Экран", "16:9": "16:9", "4:3": "4:3", "4:5": "4:5"}
-SIZES = {"native": "Как снято", "fhd": "Full HD", "qhd": "QHD", "4k": "4K"}
+SIZES = {"native": "Как снято", "hd": "720", "fhd": "1080", "qhd": "1440", "4k": "2160"}
+FILES = {"jpg": "JPG", "png": "PNG"}
 SCALES = {"1": "×1", "1.25": "×1.25", "1.5": "×1.5", "1.75": "×1.75", "2": "×2"}
 OUTLINES = {"0": "Нет", "1": "1 px", "2": "2 px", "3": "3 px"}
 ZOOMS = {"1": "1×", "1.25": "1.25×", "1.5": "1.5×", "2": "2×"}
@@ -87,6 +90,20 @@ def same(a, b):
         return float(a) == float(b)
     except (TypeError, ValueError):
         return str(a).strip().lower() == str(b).strip().lower()
+
+
+def chatlog_worker(folder, stop):
+    report = lambda msg: core.EVENTS.put(("chatlog", msg))
+    try:
+        chatlog.run(chatlog.PORT, f"cfx-nui-{chatlog.RESOURCE}", folder, stop, report)
+    except Exception as e:
+        with open(core.ERROR_LOG, "a", encoding="utf-8") as f:
+            f.write(f"{datetime.now()}\n{traceback.format_exc()}\n")
+        report(f"Чатлог остановился из-за ошибки: {e}. Подробности в {core.ERROR_LOG}")
+
+
+def megabytes(size):
+    return f"{size / 2 ** 20:.1f} МБ" if size >= 2 ** 20 else f"{size // 1024} КБ"
 
 
 def when(name):
@@ -310,6 +327,74 @@ class Choice(tk.Frame):
         self.on_pick(value)
 
 
+class FramePick(tk.Frame):
+    def __init__(self, parent, value, on_pick, current, wrap):
+        super().__init__(parent, bg=parent["bg"])
+        self.on_pick, self.current, self.job = on_pick, current, None
+        custom = core.exact_of(value)
+        self.choice = Choice(self, {**FORMATS, "custom": "Свой"}, "custom" if custom else value, self.pick, wrap=wrap)
+        self.choice.pack(anchor="w")
+        self.line = tk.Frame(self, bg=self["bg"])
+        self.w = self.entry()
+        tk.Label(self.line, text="×", bg=self["bg"], fg=SUB, font=(FONT["ui"], 10)).pack(side="left", padx=px(6))
+        self.h = self.entry()
+        tk.Label(self.line, text="px", bg=self["bg"], fg=SUB, font=(FONT["ui"], 10)).pack(side="left", padx=px(6))
+        if custom:
+            self.fill(custom)
+            self.line.pack(anchor="w", pady=(px(2), 0))
+        self.bind("<Destroy>", lambda e: e.widget is self and self.job and self.after_cancel(self.job))
+
+    def entry(self):
+        e = tk.Entry(self.line, width=6, bg=ROW, fg=WHITE, insertbackground=WHITE, relief="flat", justify="center",
+                     font=(FONT["ui"], 10), highlightthickness=1, highlightbackground=LINE, highlightcolor=WHITE)
+        e.pack(side="left", ipady=px(4))
+        e.bind("<KeyRelease>", lambda _: self.typed())
+        return e
+
+    def fill(self, size):
+        for e, v in zip((self.w, self.h), size):
+            e.delete(0, "end")
+            e.insert(0, str(v))
+
+    def pick(self, value):
+        if value == "custom":
+            self.fill(self.current())
+            self.line.pack(anchor="w", pady=(px(2), 0))
+            self.apply()
+        else:
+            self.line.pack_forget()
+            self.on_pick(value)
+
+    def typed(self):
+        if self.job:
+            self.after_cancel(self.job)
+        self.job = self.after(250, self.apply)
+
+    def apply(self):
+        self.job = None
+        lo, hi = core.FRAME_RANGE
+        values = [e.get().strip() for e in (self.w, self.h)]
+        ok = [v.isdigit() and lo <= int(v) <= hi for v in values]
+        for e, good in zip((self.w, self.h), ok):
+            e.config(fg=WHITE if good else ERR, highlightbackground=LINE if good else ERR)
+        if all(ok):
+            self.on_pick(f"{int(values[0])}x{int(values[1])}")
+
+
+class SizePick(tk.Frame):
+    def __init__(self, parent, value, on_pick, wrap):
+        super().__init__(parent, bg=parent["bg"])
+        options = SIZES if value in SIZES else {**SIZES, value: value}
+        self.choice = Choice(self, options, value, on_pick, wrap=wrap)
+        self.note = tk.Label(self, text="Задан шириной и высотой кадра", bg=self["bg"], fg=SUB,
+                             font=(FONT["ui"], 10), anchor="w")
+
+    def show(self, fmt):
+        self.choice.pack_forget()
+        self.note.pack_forget()
+        (self.note if core.exact_of(fmt) else self.choice).pack(anchor="w")
+
+
 class Painter:
     def __init__(self, canvas):
         self.c = canvas
@@ -317,6 +402,21 @@ class Painter:
         self.layer = None
         self.photos = []
         self.geo = None
+        self.scaled = None
+        self.small = None
+
+    def frame(self, bg, rect, size):
+        x0, y0, x1, y1 = rect
+        d = size[0] / (x1 - x0)
+        if d >= 1:
+            return Image.fromarray(bg[y0:y1, x0:x1]).resize(size, Image.BILINEAR)
+        if self.scaled is None or self.scaled[0] is not bg or self.scaled[1] != d:
+            H, W = bg.shape[:2]
+            whole = Image.fromarray(bg).resize((max(1, round(W * d)), max(1, round(H * d))), Image.BILINEAR,
+                                               reducing_gap=2.0)
+            self.scaled = (bg, d, whole)
+        part = self.scaled[2].crop((round(x0 * d), round(y0 * d), round(x1 * d), round(y1 * d)))
+        return part if part.size == size else part.resize(size, Image.BILINEAR)
 
     def draw(self, shot, area, tag="shot"):
         bg, rows, edit = shot["bg"], shot["rows"], shot["edit"]
@@ -326,8 +426,7 @@ class Painter:
         d = min(aw / out_w, ah / out_h)
         dw, dh = max(1, round(out_w * d)), max(1, round(out_h * d))
         ix, iy = ax + (aw - dw) // 2, ay + (ah - dh) // 2
-        x0, y0, x1, y1 = p["rect"]
-        frame = Image.fromarray(bg[y0:y1, x0:x1]).resize((dw, dh), Image.BILINEAR, reducing_gap=2.0)
+        frame = self.frame(bg, p["rect"], (dw, dh))
         key = (id(shot), shot.get("name"), id(rows), len(rows), tuple(r["keep"] for r in rows), p["outline"],
                round(p["scale"], 4), out_h, p["margin"])
         if key != self.key:
@@ -342,12 +441,14 @@ class Painter:
         if layer is not None:
             lh, lw = layer.shape[:2]
             left, top = chat.place(out_w, out_h, lw, lh, pad, edit["pos"], p["margin"])
-            small = Image.fromarray(layer, "RGBA").resize((max(1, round(lw * d)), max(1, round(lh * d))),
-                                                          Image.LANCZOS)
-            self.photos.append(ImageTk.PhotoImage(small))
+            size = (max(1, round(lw * d)), max(1, round(lh * d)))
+            if self.small is None or self.small[0] != (self.key, size):
+                small = Image.fromarray(layer, "RGBA").resize(size, Image.LANCZOS)
+                self.small = ((self.key, size), ImageTk.PhotoImage(small))
+            self.photos.append(self.small[1])
             cx, cy = ix + round(left * d), iy + round(top * d)
             self.c.create_image(cx, cy, anchor="nw", image=self.photos[1], tags=(tag, tag + "-chat"))
-            geo["chat"] = {"x": cx, "y": cy, "w": small.width, "h": small.height, "lw": lw, "lh": lh}
+            geo["chat"] = {"x": cx, "y": cy, "w": size[0], "h": size[1], "lw": lw, "lh": lh}
         self.geo = geo
         return geo
 
@@ -367,6 +468,8 @@ class Feed:
         self.message = None
         self.note = ""
         self.save_job = None
+        self.save_target = None
+        self.loading = set()
         self.offset = 0
         self.last_wheel = 0.0
         self.sheet = None
@@ -403,6 +506,7 @@ class Feed:
         self.open_current()
 
     def open_current(self):
+        self.flush_save()
         name = self.name
         self.shot = None
         if name is None:
@@ -411,8 +515,15 @@ class Feed:
         if name in self.cache:
             self.shot = self.cache[name] or None
             self.redraw()
+            self.fetch_next()
             return
         self.redraw()
+        self.fetch(name)
+
+    def fetch(self, name):
+        if name in self.cache or name in self.loading:
+            return
+        self.loading.add(name)
         cfg = self.app.cfg
 
         def work():
@@ -424,13 +535,19 @@ class Feed:
 
         threading.Thread(target=work, daemon=True).start()
 
+    def fetch_next(self):
+        if 0 < self.index < len(self.names):
+            self.fetch(self.names[self.index])
+
     def loaded(self, name, shot):
+        self.loading.discard(name)
         self.cache[name] = shot or False
         if len(self.cache) > 6:
             self.cache.pop(next(iter(self.cache)))
         if name == self.name:
             self.shot = shot
             self.redraw()
+            self.fetch_next()
 
     def new_shot(self, name):
         self.cache.pop(name, None)
@@ -477,7 +594,7 @@ class Feed:
             return self.media[1]
         photo = None
         if self.names:
-            path = self.app.cfg["out"] / f"{self.names[0]}.png"
+            path = core.shot_image(self.app.cfg["out"], self.names[0])
             try:
                 key = (path, path.stat().st_mtime)
                 if self.media_src is None or self.media_src[0] != key:
@@ -533,8 +650,15 @@ class Feed:
         else:
             y = self.text(x, y, title, (FONT["display"], 30)) + px(12)
         y = self.text(x, y, body, (FONT["ui"], 13), SUB if level != "fail" else WHITE, width) + px(14)
-        self.text(x, y, f"Памятка: если диалог длинный, то нажми {dark} и вновь {key}. "
-                        f"Тогда в одной СС будет несколько чатбоксов.", (FONT["ui"], 10), SUB, width)
+        y = self.text(x, y, f"Памятка: если диалог длинный, то нажми {dark} и вновь {key}. "
+                            f"Тогда в одной СС будет несколько чатбоксов.", (FONT["ui"], 10), SUB, width)
+        if self.app.update:
+            version, url = self.app.update
+            self.c.create_text(x, y + px(10), text=f"Вышла Snapline {version} — скачать", fill=WHITE, anchor="nw",
+                               font=(FONT["semi"], 10), tags=("cap", "update", "link"))
+            self.c.tag_bind("update", "<Button-1>", lambda _: os.startfile(url))
+            self.c.tag_bind("update", "<Enter>", lambda _: self.c.config(cursor="hand2"))
+            self.c.tag_bind("update", "<Leave>", lambda _: self.c.config(cursor=""))
         self.lift_block("cap", H - PAD - px(12))
         if self.names:
             cx = (x + width + W - RAIL_W) / 2
@@ -583,7 +707,7 @@ class Feed:
     def draw_saved(self, area, name):
         ax, ay, aw, ah = area
         try:
-            with Image.open(self.app.cfg["out"] / f"{name}.png") as im:
+            with Image.open(core.shot_image(self.app.cfg["out"], name)) as im:
                 im = im.convert("RGB")
                 im.thumbnail((aw, ah), Image.BILINEAR)
                 self.photos.append(ImageTk.PhotoImage(im))
@@ -702,13 +826,22 @@ class Feed:
     def sheet_crop(self, body):
         edit = self.shot["edit"]
         self.label(body, "Формат")
-        self.choice(body, FORMATS, edit["format"], lambda v: self.change(format=v, center=[0.5, 0.5]))
+        FramePick(body, edit["format"], self.set_frame, lambda: core.plan(self.shot["bg"], self.shot["edit"])["size"],
+                  self.sheet_w).pack(anchor="w")
         self.label(body, "Приближение", 12)
         self.choice(body, ZOOMS, edit["zoom"], lambda v: self.change(zoom=float(v)))
         self.label(body, "Размер файла", 12)
-        self.choice(body, SIZES, edit["size"], lambda v: self.change(size=v))
+        self.size_pick = SizePick(body, edit["size"], lambda v: self.change(size=v), self.sheet_w)
+        self.size_pick.pack(fill="x")
+        self.size_pick.show(edit["format"])
+        self.label(body, "Файл", 12)
+        self.choice(body, FILES, edit["file"], lambda v: self.change(file=v))
         self.label(body, "Тяни картинку мышью, чтобы выбрать, что попадёт в кадр. Ctrl + колесо — приближение.", 12)
         Pill(body, "По центру", lambda: self.change(center=[0.5, 0.5]), kind="ghost").pack(anchor="w")
+
+    def set_frame(self, value):
+        self.change(format=value, center=[0.5, 0.5])
+        self.size_pick.show(value)
 
     def sheet_text(self, body):
         edit = self.shot["edit"]
@@ -915,15 +1048,30 @@ class Feed:
         self.update_meta()
         if self.save_job:
             self.c.after_cancel(self.save_job)
+        self.save_target = self.shot
         self.save_job = self.c.after(450, self.save_now)
 
-    def snapshot(self):
-        shot = self.shot
+    def flush_save(self):
+        if self.save_job:
+            self.c.after_cancel(self.save_job)
+            self.save_now()
+
+    def save_sync(self):
+        if self.save_job:
+            self.c.after_cancel(self.save_job)
+            self.save_job = None
+            try:
+                core.save_shot(self.snapshot(self.save_target))
+            except Exception:
+                pass
+
+    def snapshot(self, shot=None):
+        shot = shot or self.shot
         return {**shot, "rows": [dict(r) for r in shot["rows"]], "edit": json.loads(json.dumps(shot["edit"]))}
 
     def save_now(self):
         self.save_job = None
-        snap = self.snapshot()
+        snap = self.snapshot(self.save_target)
         name = snap["name"]
 
         def work():
@@ -944,7 +1092,7 @@ class Feed:
     def copy(self):
         name = self.name
         snap = self.snapshot() if self.shot is not None else None
-        path = self.app.cfg["out"] / f"{name}.png"
+        path = core.shot_image(self.app.cfg["out"], name)
         self.note = "копирую…"
         self.update_meta()
 
@@ -966,8 +1114,9 @@ class Feed:
     def open_folder(self):
         out = self.app.cfg["out"]
         out.mkdir(parents=True, exist_ok=True)
-        if self.name and (out / f"{self.name}.png").exists():
-            subprocess.Popen(["explorer", "/select,", str(out / f"{self.name}.png")])
+        path = core.shot_image(out, self.name) if self.name else None
+        if path and path.exists():
+            subprocess.Popen(["explorer", "/select,", str(path)])
         else:
             os.startfile(out)
 
@@ -1012,7 +1161,11 @@ class Settings:
         self.example.bind("<Configure>", lambda _: self.settle())
         self.painter = Painter(self.example)
         self.sample = None
+        self.sample_loading = False
+        self.sample_missing = False
         self.capturing = False
+        self.chatlog_stop = None
+        self.chatlog_folder = None
         self.build(left)
         self.bind_wheel(holder)
 
@@ -1031,6 +1184,8 @@ class Settings:
         self.discord = self.link(who, "Дохлый", lambda: os.startfile(DISCORD))
         tk.Label(who, text=" для ", bg=VOID, fg=SUB, font=(FONT["ui"], 9), bd=0, padx=0, pady=0).pack(side="left")
         self.site = self.link(who, "ls-project.com", lambda: os.startfile(SITE))
+        self.update_link = tk.Label(text, bg=VOID, fg=WHITE, font=(FONT["semi"], 9), bd=0, padx=0, cursor="hand2",
+                                    anchor="w")
         try:
             with Image.open(core.RES_DIR / "assets" / "ls_project.png") as im:
                 im = im.convert("RGBA")
@@ -1042,6 +1197,12 @@ class Settings:
             tk.Label(line, image=self.logo, bg=VOID, bd=0).pack(side="right", anchor="e")
         except OSError:
             self.logo = None
+
+    def show_update(self):
+        version, url = self.app.update
+        self.update_link.config(text=f"Вышла версия {version} — скачать")
+        self.update_link.bind("<Button-1>", lambda _: os.startfile(url))
+        self.update_link.pack(fill="x", pady=(px(6), 0))
 
     def link(self, parent, text, action):
         label = tk.Label(parent, text=text, bg=VOID, fg=WHITE, font=(FONT["ui"], 9), bd=0, padx=0, pady=0,
@@ -1101,19 +1262,35 @@ class Settings:
         return control, subl, text
 
     def choice(self, control, options, value, on_pick, **kw):
-        Choice(control, options, value, on_pick, wrap=self.list_w - self.label_w, **kw).pack(anchor="w")
+        choice = Choice(control, options, value, on_pick, wrap=self.list_w - self.label_w, **kw)
+        choice.pack(anchor="w")
+        return choice
+
+    def section(self, parent, title, first=False):
+        tk.Label(parent, text=title.upper(), bg=VOID, fg=SUB, font=(FONT["semi"], 9), anchor="w").pack(
+            fill="x", pady=(px(4) if first else px(30), px(6)))
+        tk.Frame(parent, bg=HAIR, height=1).pack(fill="x")
 
     def build(self, f):
         cfg, raw = self.app.cfg, self.app.raw
+        self.section(f, "Съёмка", first=True)
         control, self.key_sub, text = self.row(f, "Клавиша съёмки", "Нажми и выбери новую")
         self.key_pill = Pill(control, cfg["key"], self.capture_key, kind="ghost", size=12, height=36, padx=18)
         self.key_pill.pack(anchor="w")
         control, self.mode_sub, text = self.row(f, "Режим", self.mode_text())
         self.choice(control, MODES, "yes" if cfg["auto"] else "no", self.set_mode)
-        control, _, _ = self.row(f, "Кадр")
-        self.choice(control, FORMATS, cfg["format"], lambda v: self.app.set("format", v))
-        control, _, _ = self.row(f, "Размер файла", "По короткой стороне")
-        self.choice(control, SIZES, cfg["size"], lambda v: self.app.set("size", v))
+        control, _, _ = self.row(f, "Звук", "Сигнал, когда СС готова")
+        self.choice(control, SOUND, "yes" if cfg["sound"] else "no", lambda v: self.app.set("sound", v))
+        self.section(f, "Кадр и файл")
+        control, _, _ = self.row(f, "Кадр", "Свой — ширина и высота в пикселях")
+        FramePick(control, cfg["format"], self.set_frame, self.frame_now, self.list_w - self.label_w).pack(anchor="w")
+        control, _, _ = self.row(f, "Размер файла", "По короткой стороне, в пикселях")
+        self.size_pick = SizePick(control, cfg["size"], lambda v: self.app.set("size", v), self.list_w - self.label_w)
+        self.size_pick.pack(anchor="w")
+        self.size_pick.show(cfg["format"])
+        control, _, _ = self.row(f, "Файл", "JPG весит примерно втрое меньше PNG, чат остаётся чётким")
+        self.choice(control, FILES, cfg["file"], lambda v: self.app.set("file", v))
+        self.section(f, "Чат на СС")
         control, _, _ = self.row(f, "Текст чата")
         self.choice(control, SCALES, raw["text_scale"], lambda v: self.app.set("text_scale", v))
         control, _, _ = self.row(f, "Обводка")
@@ -1130,8 +1307,7 @@ class Settings:
             pill.pack(side="left", padx=(0, px(6)))
             pill.set_kind("on" if kind in cfg["keep"] else "chip")
             self.kind_pills[kind] = pill
-        control, _, _ = self.row(f, "Звук", "Сигнал, когда СС готова")
-        self.choice(control, SOUND, "yes" if cfg["sound"] else "no", lambda v: self.app.set("sound", v))
+        self.section(f, "Файлы")
         control, _, _ = self.row(f, "Папка")
         self.out_label = tk.Label(control, text=str(cfg["out"]), bg=VOID, fg=SUB, font=(FONT["ui"], 9), anchor="w",
                                   justify="left", wraplength=self.list_w - self.label_w - px(10))
@@ -1140,6 +1316,75 @@ class Settings:
         buttons.pack(anchor="w", pady=(px(8), 0))
         Pill(buttons, "Изменить", self.pick_folder, kind="ghost").pack(side="left", padx=(0, px(6)))
         Pill(buttons, "Открыть", self.app.feed.open_folder, kind="ghost").pack(side="left")
+        control, _, _ = self.row(f, "Исходники", "Кадры, из которых собрана СС. Без них СС не поправить в редакторе")
+        self.src_label = tk.Label(control, bg=VOID, fg=SUB, font=(FONT["ui"], 9), anchor="w")
+        self.src_label.pack(fill="x")
+        Pill(control, "Очистить", self.clear_src, kind="ghost").pack(anchor="w", pady=(px(8), 0))
+        self.update_src()
+        self.section(f, "Чатлог")
+        control, _, _ = self.row(f, "Запись чата", "Каждая строка чата с временем, по файлу на день")
+        self.choice(control, SOUND, "yes" if cfg["chatlog"] else "no",
+                    lambda v: (self.app.set("chatlog", v), self.toggle_chatlog(v)))
+        self.chatlog_state = tk.Label(control, text="Выключен", bg=VOID, fg=SUB, font=(FONT["ui"], 9), anchor="w",
+                                      justify="left", wraplength=self.list_w - self.label_w - px(10))
+        self.chatlog_state.pack(fill="x", pady=(px(4), 0))
+        Pill(control, "Открыть", self.open_chatlog, kind="ghost").pack(anchor="w", pady=(px(8), 0))
+
+    def toggle_chatlog(self, value):
+        if value == "yes" and self.chatlog_stop is None:
+            self.chatlog_stop = threading.Event()
+            self.chatlog_folder = self.app.cfg["out"] / "chatlog"
+            threading.Thread(target=chatlog_worker, args=(self.chatlog_folder, self.chatlog_stop), daemon=True).start()
+            self.chatlog_note("Запускаю…")
+        elif value == "no" and self.chatlog_stop is not None:
+            self.chatlog_stop.set()
+            self.chatlog_stop = None
+            self.chatlog_state.config(text="Выключен", fg=SUB)
+
+    def chatlog_note(self, msg):
+        if self.chatlog_stop is not None:
+            self.chatlog_state.config(text=msg, fg=WHITE)
+
+    def open_chatlog(self):
+        folder = self.chatlog_folder or self.app.cfg["out"] / "chatlog"
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            os.startfile(folder)
+        except OSError as e:
+            self.chatlog_state.config(text=f"Папка не открылась: {e}", fg=ERR)
+
+    def set_frame(self, value):
+        self.app.set("format", value)
+        self.size_pick.show(value)
+
+    def frame_now(self):
+        shot = self.sample or core.sample_shot(self.app.cfg)
+        return core.plan(shot["bg"], core.new_edit(self.app.cfg, shot["rows"]))["size"]
+
+    def update_src(self):
+        try:
+            size, count = core.src_size(self.app.cfg["out"])
+        except OSError:
+            size, count = 0, 0
+        self.src_label.config(text=f"{count} СС · {megabytes(size)}" if size else "Пусто")
+        return size, count
+
+    def clear_src(self):
+        size, count = self.update_src()
+        if not size:
+            return
+        question = (f"Удалить исходники {count} СС ({megabytes(size)})?\n\n"
+                    "Готовые СС останутся в папке, но поправить их в редакторе будет нельзя.")
+        if not messagebox.askyesno("Snapline", question, parent=self.app.root):
+            return
+        core.clear_src(self.app.cfg["out"])
+        feed = self.app.feed
+        feed.cache.clear()
+        if feed.index:
+            feed.open_current()
+        self.sample = None
+        self.update_src()
+        self.draw_example()
 
     def mode_text(self):
         cfg = self.app.cfg
@@ -1187,6 +1432,9 @@ class Settings:
         if path:
             self.app.set("output", path)
             self.out_label.config(text=str(self.app.cfg["out"]))
+            problem = core.check_out(self.app.cfg)
+            self.app.feed.message = ("fail", problem) if problem else None
+            self.update_src()
             self.app.feed.refresh_names()
             self.app.feed.index = 0
             self.sample = None
@@ -1201,19 +1449,44 @@ class Settings:
         self.example_job = None
         self.draw_example()
 
+    def load_sample(self):
+        feed = self.app.feed
+        cached = feed.cache.get(feed.names[0]) if feed.names else None
+        if cached:
+            self.sample = {**cached, "rows": [dict(r) for r in cached["rows"]]}
+            return True
+        if not self.sample_loading and not self.sample_missing:
+            self.sample_loading = True
+            cfg = self.app.cfg
+
+            def work():
+                try:
+                    shot = core.sample_shot(cfg)
+                except (OSError, ValueError):
+                    shot = None
+                self.app.inbox.put(("sample_loaded", None, shot))
+
+            threading.Thread(target=work, daemon=True).start()
+        return False
+
+    def sample_loaded(self, _, shot):
+        self.sample_loading = False
+        self.sample_missing = shot is None
+        if self.sample is None:
+            self.sample = shot
+        self.draw_example()
+
     def draw_example(self):
         W, H = self.example.winfo_width(), self.example.winfo_height()
         if W < 50 or H < 50:
             return
         cfg = self.app.cfg
         self.example.delete("all")
-        if self.sample is None:
-            try:
-                self.sample = core.sample_shot(cfg)
-            except (OSError, ValueError):
-                self.example.create_text(0, 0, anchor="nw", fill=SUB, font=(FONT["ui"], 10),
-                                         text="Пример не загрузился: нет ни своих СС, ни встроенного кадра.")
-                return
+        if self.sample is None and not self.load_sample():
+            text = ("Пример не загрузился: нет ни своих СС, ни встроенного кадра." if self.sample_missing
+                    else "Загружаю пример…")
+            self.example.create_text(0, 0, anchor="nw", fill=SUB, font=(FONT["ui"], 10), text=text)
+            return
         shot = self.sample
         for r in shot["rows"]:
             r["keep"] = r["kind"] in cfg["keep"]
@@ -1258,8 +1531,13 @@ class App:
         self.tab = None
         self.show("feed")
         root.bind_all("<Key>", self.key)
-        if self.problem:
-            self.feed.message = ("fail", self.problem)
+        problem = self.problem or core.check_out(self.cfg)
+        if problem:
+            self.feed.message = ("fail", problem)
+        if self.cfg["chatlog"]:
+            self.settings.toggle_chatlog("yes")
+        self.update = None
+        threading.Thread(target=self.check_update, daemon=True).start()
         self.close = root.destroy
         self.frame = None
         root.bind("<Configure>", self.on_configure, add="+")
@@ -1316,12 +1594,14 @@ class App:
             label.config(fg=WHITE if key == tab else SUB)
             line.config(bg=WHITE if key == tab else VOID)
         if tab == "feed":
-            self.settings.f.pack_forget()
-            self.feed.c.pack(fill="both", expand=True)
+            self.root.focus_set()
+            self.feed.c.place(x=0, y=0, relwidth=1, relheight=1)
+            tk.Misc.tkraise(self.feed.c)
             self.feed.redraw()
         else:
-            self.feed.c.pack_forget()
-            self.settings.f.pack(fill="both", expand=True)
+            self.settings.f.place(x=0, y=0, relwidth=1, relheight=1)
+            tk.Misc.tkraise(self.settings.f)
+            self.settings.update_src()
             self.settings.draw_example()
 
     def set(self, key, value):
@@ -1337,6 +1617,11 @@ class App:
             self.feed.message = ("fail", f"Не удалось сохранить настройки: {e}")
         self.settings.draw_example()
         return True
+
+    def check_update(self):
+        found = core.latest_release()
+        if found:
+            self.inbox.put(("update", *found))
 
     def foreground(self):
         return ctypes.windll.user32.GetForegroundWindow() == self.hwnd
@@ -1367,12 +1652,20 @@ class App:
                 elif event[0] == "ss":
                     feed.new_shot(event[1])
                     self.settings.sample = None
+                elif event[0] == "chatlog":
+                    self.settings.chatlog_note(event[1])
         except queue.Empty:
             pass
         try:
             while True:
                 kind, name, value = self.inbox.get_nowait()
-                getattr(feed, kind)(name, value)
+                if kind == "update":
+                    self.update = (name, value)
+                    self.settings.show_update()
+                    if feed.index == 0:
+                        feed.redraw()
+                    continue
+                getattr(self.settings if kind == "sample_loaded" else feed, kind)(name, value)
         except queue.Empty:
             pass
         self.root.after(100, self.pump)
@@ -1578,6 +1871,7 @@ def main():
 
     def close():
         stop.set()
+        app.feed.save_sync()
         root.destroy()
 
     app.close = close

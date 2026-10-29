@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 import traceback
+import urllib.request
 import winsound
 from ctypes import wintypes
 from datetime import datetime
@@ -18,7 +19,8 @@ from PIL import Image, ImageGrab
 
 import chat
 
-VERSION = "1.0.1"
+VERSION = "1.1"
+RELEASES = "https://api.github.com/repos/dohliy-inc/Snapline/releases/latest"
 APP_DIR = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent
 RES_DIR = Path(getattr(sys, "_MEIPASS", APP_DIR))
 CONFIG_PATH = APP_DIR / "config.ini"
@@ -34,16 +36,23 @@ DEFAULTS = {
     "output": "~/Pictures/Snapline",
     "format": "square",
     "size": "native",
+    "file": "jpg",
     "chat_pos": "top-left",
     "margin": "24",
     "text_scale": "1.5",
     "outline": "2",
     "keep": "речь, действие",
     "sound": "yes",
+    "chatlog": "no",
 }
-SIZES = {"native": None, "fhd": 1080, "qhd": 1440, "4k": 2160}
+SIZES = {"native": None, "hd": 720, "fhd": 1080, "qhd": 1440, "4k": 2160}
+SIDE_RANGE = (360, 4320)
+FRAME_RANGE = (200, 7680)
+FILE_TYPES = {"jpg": {"quality": 92, "subsampling": 0}, "png": {"compress_level": 6}}
+SRC_BG = (".jpg", {"quality": 95, "subsampling": 0})
+SRC_CHAT = (".webp", {"lossless": True, "quality": 0, "method": 1})
 CHAT_POSITIONS = ("top-left", "top-right", "bottom-left", "bottom-right")
-LAYOUT_KEYS = ("format", "zoom", "center", "pos", "size", "text_scale", "outline", "margin")
+LAYOUT_KEYS = ("format", "zoom", "center", "pos", "size", "file", "text_scale", "outline", "margin")
 KEYS = {f"F{i}": 0x6F + i for i in range(1, 25)}
 KEYS.update(PAUSE=0x13, SCROLLLOCK=0x91, INSERT=0x2D, HOME=0x24, END=0x23, PAGEUP=0x21, PAGEDOWN=0x22)
 EXTENDED_KEYS = {0x2D, 0x24, 0x23, 0x21, 0x22}
@@ -147,16 +156,41 @@ def _num(raw, name, kind, lo, hi):
     return value
 
 
+def exact_of(fmt):
+    m = re.fullmatch(r"(\d+)\s*[x×]\s*(\d+)", str(fmt).strip().lower())
+    return (int(m[1]), int(m[2])) if m else None
+
+
 def ratio_of(fmt):
     fmt = fmt.strip().lower()
     if fmt == "full":
         return None
     if fmt == "square":
         return 1.0
+    exact = exact_of(fmt)
+    if exact:
+        lo, hi = FRAME_RANGE
+        if not all(lo <= v <= hi for v in exact):
+            raise ValueError(f"format = {fmt}: ширина и высота от {lo} до {hi} px")
+        return exact[0] / exact[1]
     m = re.fullmatch(r"(\d+(?:\.\d+)?)\s*:\s*(\d+(?:\.\d+)?)", fmt)
     if not m or float(m[1]) <= 0 or float(m[2]) <= 0:
-        raise ValueError(f"format = {fmt}: нужно square, full или соотношение вроде 4:3")
+        raise ValueError(f"format = {fmt}: нужно square, full, соотношение вроде 4:3 или размер вроде 1200x800")
     return float(m[1]) / float(m[2])
+
+
+def side_of(size):
+    return SIZES[size] if size in SIZES else int(size)
+
+
+def parse_size(value):
+    size = str(value).strip().lower()
+    lo, hi = SIDE_RANGE
+    if size in SIZES:
+        return size
+    if size.isdigit() and lo <= int(size) <= hi:
+        return str(int(size))
+    raise ValueError(f"size = {size}: можно {', '.join(SIZES)} или число от {lo} до {hi}")
 
 
 def parse_config(raw):
@@ -165,9 +199,13 @@ def parse_config(raw):
         raise ValueError(f"hotkey = {key} совпадает с клавишей игры, которую программа жмёт сама")
     fmt = raw["format"].strip().lower()
     ratio = ratio_of(fmt)
-    size = raw["size"].strip().lower()
-    if size not in SIZES:
-        raise ValueError(f"size = {size}: можно {', '.join(SIZES)}")
+    exact = exact_of(fmt)
+    if exact:
+        fmt = f"{exact[0]}x{exact[1]}"
+    size = parse_size(raw["size"])
+    file = raw["file"].strip().lower()
+    if file not in FILE_TYPES:
+        raise ValueError(f"file = {file}: можно {', '.join(FILE_TYPES)}")
     pos = raw["chat_pos"].strip().lower()
     if pos not in CHAT_POSITIONS:
         raise ValueError(f"chat_pos = {pos}: можно {', '.join(CHAT_POSITIONS)}")
@@ -187,12 +225,14 @@ def parse_config(raw):
         "format": fmt,
         "ratio": ratio,
         "size": size,
+        "file": file,
         "chat_pos": pos,
         "margin": _num(raw, "margin", int, 0, 400),
         "text_scale": _num(raw, "text_scale", float, 0.5, 3),
         "outline": _num(raw, "outline", int, 0, 10),
         "keep": tuple(kinds[k] for k in keep),
         "sound": _bool(raw, "sound"),
+        "chatlog": _bool(raw, "chatlog"),
     }
 
 
@@ -212,6 +252,7 @@ def new_edit(cfg, rows):
         "center": [0.5, 0.5],
         "pos": cfg["chat_pos"],
         "size": cfg["size"],
+        "file": cfg["file"],
         "text_scale": cfg["text_scale"],
         "outline": cfg["outline"],
         "margin": cfg["margin"],
@@ -231,12 +272,13 @@ def plan(bg, edit):
     rect = chat.frame_rect(W, H, ratio_of(edit["format"]), edit["zoom"], edit["center"])
     cw, ch = rect[2] - rect[0], rect[3] - rect[1]
     short = min(cw, ch)
-    side = SIZES[edit["size"]] or short
+    exact = exact_of(edit["format"])
+    side = min(exact) if exact else side_of(edit["size"]) or short
     f = side / short
     k = side / REFERENCE_SIDE
     return {
         "rect": rect,
-        "size": (max(1, round(cw * f)), max(1, round(ch * f))),
+        "size": exact or (max(1, round(cw * f)), max(1, round(ch * f))),
         "outline": max(1, round(edit["outline"] * k)) if edit["outline"] else 0,
         "margin": round(edit["margin"] * k),
         "scale": edit["text_scale"] * side / min(H, W),
@@ -269,10 +311,13 @@ def watermark(chat_img):
     return None
 
 
-def _match(region, t):
-    a, b = region.max(axis=2), t.max(axis=2)
+def _corr(a, b):
     a, b = a - a.mean(), b - b.mean()
     return float((a * b).sum() / (np.sqrt((a * a).sum() * (b * b).sum()) + 1e-6))
+
+
+def _match(region, t):
+    return _corr(region.max(axis=2), t.max(axis=2))
 
 
 def clean_bg(bg, mark, threshold=0.5):
@@ -285,8 +330,9 @@ def clean_bg(bg, mark, threshold=0.5):
         return bg
     reach = max(h * 4, round(H * 0.1))
     best, at = threshold, None
+    strip, tl = chat.lum(bg[:, x:x + w]).astype(np.float32), t.max(axis=2)
     for y in list(range(0, reach)) + list(range(H - reach, H - h + 1)):
-        score = _match(bg[y:y + h, x:x + w].astype(np.float32), t)
+        score = _corr(strip[y:y + h], tl)
         if score > best:
             best, at = score, y
     if at is None:
@@ -330,19 +376,40 @@ def _fill(out, y0, y1, x0, x1, margin=3, steps=150):
 
 
 def chat_number(path):
-    return int(re.search(r"_chat(\d+)\.png$", path.name)[1])
+    return int(re.search(r"_chat(\d+)$", path.stem)[1])
 
 
 def shot_files(out, name):
     src = out / "src"
-    return src / f"{name}_bg.png", sorted(src.glob(f"{name}_chat*.png"), key=chat_number), src / f"{name}.json"
+    bgs = [src / f"{name}_bg{ext}" for ext in (SRC_BG[0], ".png")]
+    chats = [p for p in src.glob(f"{name}_chat*") if p.suffix in (SRC_CHAT[0], ".png")]
+    return next((p for p in bgs if p.exists()), bgs[0]), sorted(chats, key=chat_number), src / f"{name}.json"
+
+
+def shot_image(out, name):
+    paths = [out / f"{name}.{ext}" for ext in FILE_TYPES]
+    return next((p for p in paths if p.exists()), paths[0])
 
 
 def list_shots(out):
     if not out.is_dir():
         return []
-    shots = sorted(out.glob("SS_*.png"), key=lambda p: p.stat().st_mtime, reverse=True)
-    return [p.stem for p in shots]
+    shots = {p.stem: p for p in out.glob("SS_*.*") if p.suffix[1:].lower() in FILE_TYPES}
+    return sorted(shots, key=lambda n: shots[n].stat().st_mtime, reverse=True)
+
+
+def src_size(out):
+    files = [p for p in (out / "src").glob("SS_*") if p.is_file()]
+    return sum(p.stat().st_size for p in files), sum("_bg." in p.name for p in files)
+
+
+def clear_src(out):
+    with FILES:
+        for p in (out / "src").glob("SS_*"):
+            try:
+                p.unlink()
+            except OSError:
+                pass
 
 
 def read_image(path):
@@ -373,10 +440,13 @@ def load_shot(out, name, cfg):
 
 def save_shot(shot):
     img, painted = render(shot["bg"], shot["rows"], shot["edit"])
-    _, _, meta = shot_files(shot["out"], shot["name"])
+    out, name, file = shot["out"], shot["name"], shot["edit"]["file"]
+    _, _, meta = shot_files(out, name)
     with FILES:
         meta.parent.mkdir(parents=True, exist_ok=True)
-        save(img, shot["out"] / f"{shot['name']}.png")
+        save(img, out / f"{name}.{file}", **FILE_TYPES[file])
+        for other in FILE_TYPES.keys() - {file}:
+            (out / f"{name}.{other}").unlink(missing_ok=True)
         meta.write_text(json.dumps(shot["edit"], ensure_ascii=False), encoding="utf-8")
     return img, painted
 
@@ -443,14 +513,50 @@ def tap(key):
         time.sleep(KEY_HOLD_S)
 
 
-def save(arr, path, fast=False):
-    Image.fromarray(arr).save(path, compress_level=1 if fast else 6)
+def save(arr, path, **params):
+    Image.fromarray(arr).save(path, **params)
 
 
-def src_dir(cfg):
+def save_src(arr, cfg, stem, kind):
     path = cfg["out"] / "src"
     path.mkdir(parents=True, exist_ok=True)
-    return path
+    ext, params = kind
+    save(arr, path / f"{stem}{ext}", **params)
+
+
+def explain(e, cfg):
+    blocked = isinstance(e, OSError) and e.filename and Path(e.filename).is_relative_to(cfg["out"])
+    if not blocked:
+        return f"Не получилось: {e}"
+    return (f"Windows не даёт записать в папку {cfg['out']}. Обычно её защищает «Контролируемый доступ к папкам» "
+            "в Защитнике Windows. Выбери в настройках другую папку, например D:\\Snapline, "
+            "или разреши snapline.exe в Защитнике.")
+
+
+def version_key(version):
+    return tuple(int(n) for n in re.findall(r"\d+", version))
+
+
+def latest_release():
+    request = urllib.request.Request(RELEASES, headers={"User-Agent": f"Snapline/{VERSION}"})
+    try:
+        with urllib.request.urlopen(request, timeout=5) as r:
+            data = json.load(r)
+        tag = data["tag_name"].lstrip("v")
+        return (tag, data["html_url"]) if version_key(tag) > version_key(VERSION) else None
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def check_out(cfg):
+    try:
+        probe = cfg["out"] / "src" / "SS_write_check.tmp"
+        probe.parent.mkdir(parents=True, exist_ok=True)
+        probe.write_bytes(b"")
+        probe.unlink()
+    except OSError as e:
+        return explain(e, cfg)
+    return None
 
 
 def handle(img, state, cfg):
@@ -464,7 +570,7 @@ def handle(img, state, cfg):
                 "поставь в настройках графики GTA режим «Оконный без рамки».", "fail")
             return TONE_FAIL
         s.chats += 1
-        save(img, src_dir(cfg) / f"{s.name}_chat{s.chats}.png", fast=True)
+        save_src(img, cfg, f"{s.name}_chat{s.chats}", SRC_CHAT)
         s.mark = s.mark or watermark(img)
         s.rows = chat.merge(s.rows, rows)
         log(f"Чат #{s.chats}: строк {len(rows)}, из них в СС {sum(r['keep'] for r in rows)}.")
@@ -472,7 +578,7 @@ def handle(img, state, cfg):
         if s.bg is not None:
             s = state["session"] = Session()
         s.bg = img
-        save(img, src_dir(cfg) / f"{s.name}_bg.png", fast=True)
+        save_src(img, cfg, f"{s.name}_bg", SRC_BG)
         log("Фон принят.")
 
     if s.bg is None:
@@ -496,7 +602,7 @@ def handle(img, state, cfg):
     img, painted = save_shot({"name": s.name, "out": cfg["out"], "bg": bg, "rows": s.rows, "edit": edit})
     kept = sum(r["keep"] for r in s.rows)
     tail = "" if painted == kept else f" Влезло {painted} строк из {kept}."
-    log(f"СС готова: {s.name}.png, {img.shape[1]}×{img.shape[0]}.{tail}", "ok")
+    log(f"СС готова: {s.name}.{edit['file']}, {img.shape[1]}×{img.shape[0]}.{tail}", "ok")
     EVENTS.put(("ss", s.name))
     return TONE_SS
 
@@ -528,7 +634,7 @@ def auto_shot(state, cfg):
 
     s = state["session"] = Session()
     s.bg = bg
-    save(bg, src_dir(cfg) / f"{s.name}_bg.png", fast=True)
+    save_src(bg, cfg, f"{s.name}_bg", SRC_BG)
     return handle(shot, state, cfg)
 
 
@@ -556,7 +662,7 @@ def run(get_cfg, stop, paused=lambda: False):
             try:
                 tone = on_hotkey(state, cfg)
             except (ValueError, OSError) as e:
-                log(f"Не получилось: {e}", "fail")
+                log(explain(e, cfg), "fail")
                 tone = TONE_FAIL
             except Exception:
                 with open(ERROR_LOG, "a", encoding="utf-8") as f:

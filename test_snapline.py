@@ -23,8 +23,8 @@ def scaled(img, w, h):
 
 def make_cfg(out, **kw):
     cfg = {"key": "F11", "auto": True, "hud_key": "F7", "dark_key": "F2", "hud_delay": 0, "out": Path(out),
-           "format": "square", "ratio": 1.0, "size": "native", "chat_pos": "top-left", "margin": 24,
-           "text_scale": 1.5, "outline": 2, "keep": (SP, AC), "sound": False}
+           "format": "square", "ratio": 1.0, "size": "native", "file": "png", "chat_pos": "top-left", "margin": 24,
+           "text_scale": 1.5, "outline": 2, "keep": (SP, AC), "sound": False, "chatlog": False}
     cfg.update(kw)
     return cfg
 
@@ -125,6 +125,26 @@ def check_editing():
 
         assert core.load_shot(Path(tmp), "SS_missing", cfg) is None
 
+        again["edit"].update(format="1000x500", size="4k")
+        img, painted = core.save_shot(again)
+        assert img.shape == (500, 1000, 3) and painted == 4, (img.shape, painted)
+        again["edit"].update(format="4:5", file="jpg", size="900")
+        img, _ = core.save_shot(again)
+        assert img.shape == (1125, 900, 3) and core.list_shots(Path(tmp)) == [name]
+        assert core.shot_image(Path(tmp), name).suffix == ".jpg" and not (Path(tmp) / f"{name}.png").exists()
+
+        src = Path(tmp) / "src"
+        for path in [*src.glob("*.jpg"), *src.glob("*.webp")]:
+            Image.open(path).save(path.with_suffix(".png"))
+            path.unlink()
+        legacy = core.load_shot(Path(tmp), name, cfg)
+        assert len(legacy["rows"]) == 18 and legacy["edit"]["size"] == "900"
+        size, count = core.src_size(Path(tmp))
+        assert count == 1 and size > 0
+        core.clear_src(Path(tmp))
+        assert core.src_size(Path(tmp)) == (0, 0) and core.load_shot(Path(tmp), name, cfg) is None
+        assert core.list_shots(Path(tmp)) == [name]
+
 
 def check_resolutions():
     bg = load("real_bg.webp")
@@ -135,7 +155,7 @@ def check_resolutions():
             got = kinds_of(scaled(load(n), w, h))
             assert got == native[n], (w, n, got)
         screen_bg, chat_ic = scaled(bg, w, h), scaled(load("real_chat_ic.png"), w, h)
-        for size, side in (("native", h), ("fhd", 1080), ("qhd", 1440), ("4k", 2160)):
+        for size, side in (("native", h), ("hd", 720), ("fhd", 1080), ("qhd", 1440), ("4k", 2160), ("900", 900)):
             with tempfile.TemporaryDirectory() as tmp:
                 cfg = make_cfg(tmp, size=size)
                 state = {"session": core.Session()}
@@ -162,8 +182,13 @@ def check_config():
             core.write_raw(raw)
             raw2, cfg2 = core.load_config()
             assert raw2 == raw and cfg2["ratio"] == 0.8 and cfg2["keep"] == (SP, O) and cfg2["size"] == "4k"
-            for bad in (dict(raw, hotkey="F7"), dict(raw, size="8k"), dict(raw, format="wide"),
-                        dict(raw, text_scale="9"), dict(raw, keep="крики"), dict(raw, sound="maybe")):
+            assert core.parse_config(dict(raw, size=" 0900 "))["size"] == "900"
+            framed = core.parse_config(dict(raw, format="1200 X 0800"))
+            assert framed["format"] == "1200x800" and framed["ratio"] == 1.5
+            for bad in (dict(raw, hotkey="F7"), dict(raw, size="8k"), dict(raw, size="100"), dict(raw, size="9000"),
+                        dict(raw, format="wide"), dict(raw, format="100x800"), dict(raw, format="1200x0"),
+                        dict(raw, file="gif"), dict(raw, text_scale="9"),
+                        dict(raw, keep="крики"), dict(raw, sound="maybe")):
                 try:
                     core.parse_config(bad)
                 except ValueError:
@@ -171,6 +196,11 @@ def check_config():
                 raise AssertionError(bad)
             core.CONFIG_PATH.write_text("﻿[lspscreen]\nhotkey = F10\n", encoding="utf-8")
             assert core.load_config()[1]["key"] == "F10"
+            out = Path(tmp) / "out"
+            blocked = FileNotFoundError(2, "not found", str(out / "src"))
+            assert "Контролируемый доступ" in core.explain(blocked, {"out": out})
+            assert core.explain(OSError("x"), {"out": out}) == "Не получилось: x"
+            assert core.check_out({"out": out}) is None and not list((out / "src").iterdir())
     finally:
         core.CONFIG_PATH = saved
 
@@ -199,7 +229,7 @@ def check_session():
         ys, xs = np.nonzero((out[:, colw:] != bg[:, colw:]).any(axis=2))
         assert len(ys) == 0 or (ys.max() < 0.08 * H and xs.min() + colw > 0.88 * W), (ys.max(), xs.min() + colw)
         assert not np.array_equal(out[:, :colw], bg[:, :colw])
-        assert len(list((Path(tmp) / "src").glob("*.png"))) == 4
+        assert sorted(p.suffix for p in (Path(tmp) / "src").iterdir()) == [".jpg", ".json", ".webp", ".webp", ".webp"]
 
 
 class FakeGame:

@@ -13,8 +13,12 @@ SPEECH, ACTION, AME, SYSTEM, OOC = "речь", "действие", "над го�
 KINDS = (SPEECH, ACTION, AME, SYSTEM, OOC)
 
 
+def lum(img):
+    return np.maximum(np.maximum(img[..., 0], img[..., 1]), img[..., 2])
+
+
 def is_chat_shot(img):
-    return (img.max(axis=2) <= BLACK).mean() > CHAT_SHOT_BLACK
+    return (lum(img) <= BLACK).mean() > CHAT_SHOT_BLACK
 
 
 def _runs(mask):
@@ -66,24 +70,25 @@ def _chat_right(ink, block, pitch):
 
 def extract_rows(img):
     width = img.shape[1]
-    ink = img.max(axis=2) > INK
+    ink = lum(img) > INK
     block, pitch = _block(ink[:, :int(width * CHAT_COLUMN)])
     if not block:
         return []
     right = _chat_right(ink, block, pitch)
-    rgb = np.zeros(img.shape, np.float32)
-    rgb[:, :right] = img[:, :right]
-    lum = rgb.max(axis=2)
-    ink = lum > INK
+    top, bottom = max(0, block[0][0] - round(pitch)), min(len(img), block[-1][1] + round(pitch) + 1)
+    rgb = np.zeros((bottom - top, width, 3), np.float32)
+    rgb[:, :right] = img[top:bottom, :right]
+    shade = lum(rgb)
+    ink = shade > INK
     block, pitch = _block(ink)
 
     rows = []
     for a, b in block:
         rink = ink[a:b + 1]
         dense = rink.sum(axis=1)
-        rlum = lum[a:b + 1]
+        rlum = shade[a:b + 1]
         rows.append({
-            "y0": a,
+            "y0": top + a,
             "base": int(np.flatnonzero(dense >= 0.5 * dense.max())[-1]),
             "pitch": pitch,
             "screen_w": width,
