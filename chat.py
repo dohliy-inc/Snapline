@@ -7,6 +7,7 @@ CHAT_SHOT_BLACK = 0.9
 CHAT_COLUMN = 0.4
 CHAT_GAP = 3
 WRAP_SHARE = 0.22
+WORD_GAP = 0.18
 SAME_ROW = 0.08
 
 SPEECH, ACTION, AME, SYSTEM, OOC = "речь", "действие", "над головой", "система", "OOC"
@@ -163,13 +164,95 @@ def classify(rows, keep=(SPEECH, ACTION)):
             kind = ACTION
         else:
             kind = SPEECH
-        if (mark is None and prev is not None
+        cont = (mark is None and prev is not None
                 and prev["glyphs"][-1][1] >= WRAP_SHARE * row["screen_w"]
-                and np.abs(body - prev["body"]).max() < 10):
+                and np.abs(body - prev["body"]).max() < 10)
+        if cont:
             kind = prev["kind"]
-        row["kind"], row["body"], row["keep"] = kind, body, kind in keep
+        row["kind"], row["body"], row["keep"], row["cont"], row["mark"] = kind, body, kind in keep, cont, mark
         prev = row
     return rows
+
+
+def words(row):
+    spans = []
+    for a, b in row["glyphs"]:
+        if spans and a - spans[-1][1] - 1 < WORD_GAP * row["pitch"]:
+            spans[-1] = (spans[-1][0], b)
+        else:
+            spans.append((a, b))
+    return spans
+
+
+def _star_end(row, a, b):
+    pitch, ink = row["pitch"], row["ink"]
+    for ga, gb in row["glyphs"]:
+        if ga < a or gb > b:
+            continue
+        ys = np.flatnonzero(ink[:, ga:gb + 1].any(axis=1))
+        if len(ys) and ys[-1] - ys[0] + 1 < 0.4 * pitch and ys[-1] - row["base"] < -0.25 * pitch:
+            return gb + 1
+        return a
+    return a
+
+
+def nick_spans(rows):
+    found, start = [], None
+    for i, r in enumerate(rows):
+        if not r.get("cont"):
+            start = r
+        w = words(r)
+        spans = []
+        if not r.get("cont") and len(w) >= 3:
+            if r["kind"] == SPEECH:
+                spans = w[:2]
+            elif r["kind"] == ACTION and r.get("mark") == "*":
+                spans = w[1:3]
+        last = i + 1 == len(rows) or not rows[i + 1].get("cont")
+        if (not spans and last and r["kind"] == ACTION and start is not None and start.get("mark") != "*"
+                and len(w) >= 3):
+            (a, b), tail = w[-2], w[-1]
+            spans = [(_star_end(r, a, b), b), tail]
+        found.append([(int(a), int(b)) for a, b in spans if b >= a])
+    return found
+
+
+def _dropped(row):
+    gone = {tuple(span) for span in row.get("drop", [])}
+    spans = words(row)
+    cols = []
+    for j, (a, b) in enumerate(spans):
+        if (a, b) not in gone:
+            continue
+        if j + 1 < len(spans):
+            cols.append((a, spans[j + 1][0]))
+        elif j and spans[j - 1] not in gone:
+            cols.append((spans[j - 1][1] + 1, b + 1))
+        else:
+            cols.append((a, b + 1))
+    return cols
+
+
+def masked(row, preview=False):
+    if not row.get("hide") and not row.get("drop"):
+        return row["rgb"]
+    rgb = row["rgb"].copy()
+    color = np.clip(row["body"], 0, 255)
+    for a, b in row.get("hide", []):
+        ys = np.flatnonzero(row["ink"][:, a:b + 1].any(axis=1))
+        rgb[:, a:b + 1] = 0
+        if len(ys):
+            rgb[ys[0]:row["base"] + 1, a:b + 1] = color
+    if preview:
+        for a, b in row.get("drop", []):
+            rgb[:, a:b + 1] *= 0.3
+        return rgb
+    keep = np.ones(rgb.shape[1], bool)
+    for a, b in _dropped(row):
+        keep[a:b] = False
+    out = np.zeros_like(rgb)
+    out[:, :keep.sum()] = rgb[:, keep]
+    return out
 
 
 def _same(a, b):
@@ -215,7 +298,7 @@ def _strip(kept, scale, max_h):
     h = max(y0 + len(r["rgb"]) for y0, r in slots)
     rgb = np.zeros((h, kept[0]["rgb"].shape[1], 3), np.float32)
     for y0, r in slots:
-        np.maximum(rgb[y0:y0 + len(r["rgb"])], r["rgb"], out=rgb[y0:y0 + len(r["rgb"])])
+        np.maximum(rgb[y0:y0 + len(r["rgb"])], masked(r), out=rgb[y0:y0 + len(r["rgb"])])
     ink = rgb.max(axis=2) > 0
     ys, xs = np.flatnonzero(ink.any(axis=1)), np.flatnonzero(ink.any(axis=0))
     rgb = rgb[ys[0]:ys[-1] + 1, xs[0]:xs[-1] + 1]

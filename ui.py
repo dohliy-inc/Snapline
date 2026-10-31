@@ -17,7 +17,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageTk
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageGrab, ImageTk
 
 import chat
 import chatlog
@@ -34,13 +34,19 @@ WHITE = "#f4f4f5"
 SUB = "#a3a8b3"
 ERR = "#ff7a70"
 
-ICONS = {"lines": "", "crop": "", "text": "", "copy": "", "folder": "",
+ICONS = {"images": "", "cut": "", "lines": "", "crop": "", "text": "", "copy": "", "folder": "",
          "up": "", "down": "", "close": ""}
 CHROME = {"min": "", "max": "", "restore": "", "close": ""}
 CHROME_TEXT = {"min": "–", "max": "□", "restore": "❐", "close": "×"}
 FORMATS = {"square": "Квадрат", "full": "Экран", "16:9": "16:9", "4:3": "4:3", "4:5": "4:5"}
 SIZES = {"native": "Как снято", "hd": "720", "fhd": "1080", "qhd": "1440", "4k": "2160"}
 FILES = {"jpg": "JPG", "png": "PNG"}
+NICKS = {"no": "Показывать", "yes": "Прятать"}
+CLICKS = {"rows": "Убрать строку", "hide": "Скрыть слово", "drop": "Удалить слово"}
+CROPS = {"free": "Свободно", "1:1": "Квадрат", "4:3": "4:3", "3:4": "3:4", "16:9": "16:9", "9:16": "9:16"}
+HANDLES = ("l", "r", "t", "b", "lt", "rt", "lb", "rb")
+OV_SIZES = {"0.25": "25%", "0.4": "40%", "0.6": "60%", "1": "100%"}
+TOOLS = ("lines", "crop", "text", "images")
 SCALES = {"1": "×1", "1.25": "×1.25", "1.5": "×1.5", "1.75": "×1.75", "2": "×2"}
 OUTLINES = {"0": "Нет", "1": "1 px", "2": "2 px", "3": "3 px"}
 ZOOMS = {"1": "1×", "1.25": "1.25×", "1.5": "1.5×", "2": "2×"}
@@ -328,11 +334,11 @@ class Choice(tk.Frame):
 
 
 class FramePick(tk.Frame):
-    def __init__(self, parent, value, on_pick, current, wrap):
+    def __init__(self, parent, value, on_pick, current, wrap, options=FORMATS, limits=core.FRAME_RANGE):
         super().__init__(parent, bg=parent["bg"])
-        self.on_pick, self.current, self.job = on_pick, current, None
+        self.on_pick, self.current, self.job, self.limits = on_pick, current, None, limits
         custom = core.exact_of(value)
-        self.choice = Choice(self, {**FORMATS, "custom": "Свой"}, "custom" if custom else value, self.pick, wrap=wrap)
+        self.choice = Choice(self, {**options, "custom": "Свой"}, "custom" if custom else value, self.pick, wrap=wrap)
         self.choice.pack(anchor="w")
         self.line = tk.Frame(self, bg=self["bg"])
         self.w = self.entry()
@@ -372,7 +378,12 @@ class FramePick(tk.Frame):
 
     def apply(self):
         self.job = None
-        lo, hi = core.FRAME_RANGE
+        for e in (self.w, self.h):
+            pasted = re.split(r"\s*[x×х*]\s*|\s+", e.get().strip().lower())
+            if len(pasted) == 2 and all(pasted):
+                self.fill(pasted)
+                break
+        lo, hi = self.limits
         values = [e.get().strip() for e in (self.w, self.h)]
         ok = [v.isdigit() and lo <= int(v) <= hi for v in values]
         for e, good in zip((self.w, self.h), ok):
@@ -403,7 +414,9 @@ class Painter:
         self.photos = []
         self.geo = None
         self.scaled = None
-        self.small = None
+        self.small = {}
+        self.layers = []
+        self.pieces = {}
 
     def frame(self, bg, rect, size):
         x0, y0, x1, y1 = rect
@@ -427,30 +440,66 @@ class Painter:
         dw, dh = max(1, round(out_w * d)), max(1, round(out_h * d))
         ix, iy = ax + (aw - dw) // 2, ay + (ah - dh) // 2
         frame = self.frame(bg, p["rect"], (dw, dh))
-        key = (id(shot), shot.get("name"), id(rows), len(rows), tuple(r["keep"] for r in rows), p["outline"],
-               round(p["scale"], 4), out_h, p["margin"])
+        groups = core.parts(rows, edit)
+        key = (id(shot), shot.get("name"), id(rows), len(rows), tuple(r["keep"] for r in rows),
+               tuple((tuple(map(tuple, r.get("hide", []))), tuple(map(tuple, r.get("drop", [])))) for r in rows),
+               tuple(core.cuts(rows, edit)), p["outline"], round(p["scale"], 4), out_h, p["margin"])
         if key != self.key:
-            self.layer = chat.chat_layer(rows, p["outline"], p["scale"], out_h - 2 * p["margin"])
+            self.layers = [chat.chat_layer(part, p["outline"], p["scale"], out_h - 2 * p["margin"])
+                           for part, _ in groups]
             self.key = key
-        layer, painted, pad = self.layer
+            self.small = {}
         self.c.delete(tag)
         self.photos = [ImageTk.PhotoImage(frame)]
         self.c.create_image(ix, iy, anchor="nw", image=self.photos[0], tags=(tag,))
-        geo = {"img": (ix, iy, dw, dh), "d": d, "out": (out_w, out_h), "plan": p, "pad": pad, "chat": None,
-               "painted": painted}
-        if layer is not None:
+        pad = p["outline"] + 2
+        geo = {"img": (ix, iy, dw, dh), "d": d, "out": (out_w, out_h), "plan": p, "pad": pad, "chats": [],
+               "painted": sum(n for _, n, _ in self.layers), "overlays": []}
+        self.draw_overlays(shot, geo, tag)
+        for k, ((layer, _, _), (_, pos)) in enumerate(zip(self.layers, groups)):
+            if layer is None:
+                geo["chats"].append(None)
+                continue
             lh, lw = layer.shape[:2]
-            left, top = chat.place(out_w, out_h, lw, lh, pad, edit["pos"], p["margin"])
+            left, top = chat.place(out_w, out_h, lw, lh, pad, pos, p["margin"])
             size = (max(1, round(lw * d)), max(1, round(lh * d)))
-            if self.small is None or self.small[0] != (self.key, size):
+            if k not in self.small or self.small[k][0] != size:
                 small = Image.fromarray(layer, "RGBA").resize(size, Image.LANCZOS)
-                self.small = ((self.key, size), ImageTk.PhotoImage(small))
-            self.photos.append(self.small[1])
+                self.small[k] = (size, ImageTk.PhotoImage(small))
+            self.photos.append(self.small[k][1])
             cx, cy = ix + round(left * d), iy + round(top * d)
-            self.c.create_image(cx, cy, anchor="nw", image=self.photos[1], tags=(tag, tag + "-chat"))
-            geo["chat"] = {"x": cx, "y": cy, "w": size[0], "h": size[1], "lw": lw, "lh": lh}
+            self.c.create_image(cx, cy, anchor="nw", image=self.small[k][1], tags=(tag, tag + "-chat", f"{tag}-chat{k}"))
+            geo["chats"].append({"x": cx, "y": cy, "w": size[0], "h": size[1], "lw": lw, "lh": lh})
         self.geo = geo
         return geo
+
+    def draw_overlays(self, shot, geo, tag):
+        out, overlays = shot.get("out"), shot["edit"].get("overlays", [])
+        ix, iy, dw, dh = geo["img"]
+        d, (out_w, out_h) = geo["d"], geo["out"]
+        if len(self.pieces) > 12:
+            self.pieces.clear()
+        for k, ov in enumerate(overlays if out else []):
+            try:
+                source = core.overlay_image(out / "src" / ov["file"])
+            except OSError:
+                geo["overlays"].append(None)
+                continue
+            x, y, w, h = core.overlay_box(ov, (out_w, out_h), source.size)
+            dx, dy = round(ix + x * d), round(iy + y * d)
+            size = (max(1, round(w * d)), max(1, round(h * d)))
+            key = (ov["file"], tuple(ov["crop"]), size)
+            if key not in self.pieces:
+                self.pieces[key] = core.overlay_piece(source, ov, size)
+            l, t = max(ix, dx), max(iy, dy)
+            r, b = min(ix + dw, dx + size[0]), min(iy + dh, dy + size[1])
+            if r <= l or b <= t:
+                geo["overlays"].append(None)
+                continue
+            photo = ImageTk.PhotoImage(self.pieces[key].crop((l - dx, t - dy, r - dx, b - dy)))
+            self.photos.append(photo)
+            self.c.create_image(l, t, anchor="nw", image=photo, tags=(tag, tag + "-ov", f"{tag}-ov{k}"))
+            geo["overlays"].append({"x": dx, "y": dy, "w": size[0], "h": size[1], "box": (l, t, r, b)})
 
 
 class Feed:
@@ -469,6 +518,8 @@ class Feed:
         self.note = ""
         self.save_job = None
         self.save_target = None
+        self.click_mode = "rows"
+        self.active_ov = 0
         self.loading = set()
         self.offset = 0
         self.last_wheel = 0.0
@@ -550,6 +601,9 @@ class Feed:
             self.fetch_next()
 
     def new_shot(self, name):
+        if self.save_job and self.save_target and self.save_target.get("name") == name:
+            self.c.after_cancel(self.save_job)
+            self.save_job = None
         self.cache.pop(name, None)
         self.refresh_names()
         if self.drag is None:
@@ -690,6 +744,7 @@ class Feed:
             if self.tool == "crop":
                 ix, iy, dw, dh = geo["img"]
                 self.c.create_rectangle(ix - 1, iy - 1, ix + dw, iy + dh, outline=WHITE, width=1, tags=("shot",))
+            self.mark_overlay(geo)
         if self.tool:
             self.build_sheet(H)
         else:
@@ -698,6 +753,7 @@ class Feed:
             ("lines", "Строки", lambda: self.toggle_tool("lines"), self.tool == "lines"),
             ("crop", "Кадр", lambda: self.toggle_tool("crop"), self.tool == "crop"),
             ("text", "Текст", lambda: self.toggle_tool("text"), self.tool == "text"),
+            ("images", "Картинки", lambda: self.toggle_tool("images"), self.tool == "images"),
         ]
         if self.shot is not None or view_only:
             tools.append(("copy", "Копировать", self.copy, False))
@@ -738,7 +794,7 @@ class Feed:
             hint = "Исходные кадры этой СС не найдены, её можно только посмотреть и скопировать."
         else:
             hint = ("Чат можно перетащить мышью, у краёв он прилипает к углам. "
-                    "Строки, кадр и текст — справа или клавишами 1, 2, 3. Колесо мыши листает СС.")
+                    "Строки, кадр, текст и картинки — справа или клавишами 1–4. Колесо мыши листает СС.")
         self.text(x, y, hint, (FONT["ui"], 10), SUB, width)
         self.lift_block("cap", H - PAD - px(12))
 
@@ -792,7 +848,7 @@ class Feed:
         self.sheet = sheet
         head = tk.Frame(sheet, bg=VOID)
         head.pack(fill="x")
-        title = {"lines": "Строки чата", "crop": "Кадр", "text": "Текст"}[self.tool]
+        title = {"lines": "Строки чата", "crop": "Кадр", "text": "Текст", "images": "Картинки"}[self.tool]
         tk.Label(head, text=title, bg=VOID, fg=WHITE, font=(FONT["display"], 20)).pack(side="left")
         close = tk.Label(head, text=ICONS["close"] if FONT["icon"] else "Закрыть", bg=VOID, fg=SUB, cursor="hand2",
                          font=(FONT["icon"], 12) if FONT["icon"] else (FONT["ui"], 10))
@@ -817,9 +873,13 @@ class Feed:
     def sheet_lines(self, body):
         self.label(body, "Нажимай на строки справа: белая галочка — строка в СС, пустой квадрат — убрана. "
                          "Колесо мыши прокручивает список.")
-        kept = sum(r["keep"] for r in self.shot["rows"])
-        self.count = tk.Label(body, text=f"В СС {kept} из {len(self.shot['rows'])}", bg=VOID, fg=WHITE,
-                              font=(FONT["semi"], 12), anchor="w")
+        self.label(body, "Ножницы у строки делят чат на части, до трёх. Каждую часть можно поставить в свой угол "
+                         "или перетащить на картинке.", 6)
+        self.label(body, "Клик по строке", 6)
+        self.choice(body, CLICKS, self.click_mode, self.set_click)
+        self.label(body, "Скрытое слово закрывается плашкой под цвет реплики, удалённое пропадает вместе с "
+                         "пробелом. Повторный клик возвращает слово.", 6)
+        self.count = tk.Label(body, text=self.count_text(), bg=VOID, fg=WHITE, font=(FONT["semi"], 12), anchor="w")
         self.count.pack(fill="x", pady=(px(6), px(14)))
         Pill(body, "Как после съёмки", self.reset_lines, kind="ghost").pack(anchor="w")
 
@@ -849,9 +909,11 @@ class Feed:
         self.choice(body, SCALES, edit["text_scale"], lambda v: self.change(text_scale=float(v)))
         self.label(body, "Обводка", 12)
         self.choice(body, OUTLINES, edit["outline"], lambda v: self.change(outline=int(v)))
-        self.label(body, "Угол", 12)
-        corner = edit["pos"] if isinstance(edit["pos"], str) else None
-        self.choice(body, POSITIONS, corner, lambda v: self.change(pos=v), cols=2)
+        spots = [pos for _, pos in core.parts(self.shot["rows"], edit)]
+        for k, pos in enumerate(spots):
+            self.label(body, "Угол" if len(spots) == 1 else f"Угол, часть {k + 1}", 12)
+            self.choice(body, POSITIONS, pos if isinstance(pos, str) else None,
+                        lambda v, k=k: self.pick_place(k, v), cols=2)
         self.label(body, "Или перетащи чат прямо на картинке.", 6)
 
     def change(self, **values):
@@ -872,6 +934,7 @@ class Feed:
             if self.tool == "crop":
                 ix, iy, dw, dh = geo["img"]
                 self.c.create_rectangle(ix - 1, iy - 1, ix + dw, iy + dh, outline=WHITE, width=1, tags=("shot",))
+            self.mark_overlay(geo)
             self.c.tag_lower("shot")
         self.update_meta()
 
@@ -886,7 +949,9 @@ class Feed:
         ax, ay, aw, ah = area
         rows = self.shot["rows"]
         widest = max(r["glyphs"][-1][1] + 8 for r in rows)
-        s = min(1.0, (aw - px(64)) / widest)
+        s = min(1.0, (aw - px(104)) / widest)
+        breaks = core.cuts(rows, self.shot["edit"])
+        self.lines_x0, self.lines_s = ax + px(48), s
         slot = max(px(28), round(rows[0]["pitch"] * s) + px(12))
         self.offset = max(0, min(self.offset, max(0, slot * len(rows) + px(24) - ah)))
         self.c.create_rectangle(ax, ay, ax + aw, ay + ah, fill=BLACK, outline="", tags=("shot",))
@@ -899,7 +964,7 @@ class Feed:
                 tag = f"row{i}"
                 self.c.create_rectangle(ax, y, ax + aw, y + slot, fill=BLACK, outline="",
                                         tags=("shot", tag, tag + "-bg"))
-                crop = r["rgb"][:, :r["glyphs"][-1][1] + 8] * (1.0 if r["keep"] else 0.3)
+                crop = chat.masked(r, preview=True)[:, :r["glyphs"][-1][1] + 8] * (1.0 if r["keep"] else 0.3)
                 img = Image.fromarray(np.uint8(np.clip(crop, 0, 255)))
                 if s < 1:
                     img = img.resize((max(1, round(img.width * s)), max(1, round(img.height * s))), Image.LANCZOS)
@@ -911,6 +976,22 @@ class Feed:
                 if not r["keep"]:
                     self.c.create_line(ax + px(48), y + slot / 2, ax + px(48) + img.width, y + slot / 2, fill=LINE,
                                        tags=("shot", tag))
+                for a, b in r.get("drop", []):
+                    self.c.create_line(ax + px(48) + a * s, y + slot / 2, ax + px(48) + (b + 1) * s, y + slot / 2,
+                                       fill=ERR, width=max(1, px(2)), tags=("shot", tag))
+                if i in breaks:
+                    self.c.create_line(ax + px(16), y, ax + aw - px(16), y, fill=SUB, dash=(4, 3), tags=("shot",))
+                    self.c.create_text(ax + aw - px(52), y + px(2), text=f"часть {breaks.index(i) + 2}", fill=SUB,
+                                       anchor="ne", font=(FONT["ui"], 9), tags=("shot",))
+                if i:
+                    cut = f"cut{i}"
+                    glyph, face = (ICONS["cut"], (FONT["icon"], 12)) if FONT["icon"] else ("✂", (FONT["ui"], 12))
+                    self.c.create_text(ax + aw - px(28), y + slot / 2, text=glyph, font=face, tags=("shot", cut),
+                                       fill=WHITE if i in breaks else MIST)
+                    self.c.tag_bind(cut, "<Enter>", lambda _, t=cut: (self.c.itemconfig(t, fill=WHITE),
+                                                                      self.c.config(cursor="hand2")))
+                    self.c.tag_bind(cut, "<Leave>", lambda _, t=cut, on=i in breaks: (
+                        self.c.itemconfig(t, fill=WHITE if on else MIST), self.c.config(cursor="")))
                 self.c.tag_bind(tag, "<Enter>", lambda _, t=tag: (self.c.itemconfig(t + "-bg", fill=ROW),
                                                                   self.c.config(cursor="hand2")))
                 self.c.tag_bind(tag, "<Leave>", lambda _, t=tag: (self.c.itemconfig(t + "-bg", fill=BLACK),
@@ -918,12 +999,212 @@ class Feed:
             y += slot
         self.c.tag_lower("shot")
 
+    def set_click(self, value):
+        self.click_mode = value
+
+    def toggle_word(self, i, x, key):
+        r = self.shot["rows"][i]
+        word = next(((a, b) for a, b in chat.words(r) if a - 3 <= x <= b + 3), None)
+        if word is None:
+            return
+        other = "drop" if key == "hide" else "hide"
+        mine = [tuple(span) for span in r.get(key, [])]
+        r[other] = [tuple(span) for span in r.get(other, []) if tuple(span) != word]
+        r[key] = [span for span in mine if span != word] if word in mine else mine + [word]
+        for name, field in core.MARKS:
+            self.shot["edit"][field] = core.spans_of(self.shot["rows"], name)
+        self.draw_lines(self.area())
+        self.schedule_save()
+
+    def mark_overlay(self, geo):
+        if self.tool != "images" or not geo or self.active_ov >= len(geo["overlays"]):
+            return
+        box = geo["overlays"][self.active_ov]
+        if not box:
+            return
+        l, t, r, b = box["x"], box["y"], box["x"] + box["w"], box["y"] + box["h"]
+        self.c.create_rectangle(l, t, r - 1, b - 1, outline=WHITE, width=1, dash=(4, 3), tags=("shot",))
+        locked = core.lock_ratio(self.shot["edit"]["overlays"][self.active_ov].get("cut", "free")) is not None
+        spots = {"l": (l, (t + b) / 2), "r": (r, (t + b) / 2), "t": ((l + r) / 2, t), "b": ((l + r) / 2, b),
+                 "lt": (l, t), "rt": (r, t), "lb": (l, b), "rb": (r, b)}
+        k = px(5)
+        for name in HANDLES:
+            if locked and len(name) == 1:
+                continue
+            x, y = spots[name]
+            tag = f"handle-{name}"
+            self.c.create_rectangle(x - k, y - k, x + k, y + k, fill=WHITE, outline=VOID, tags=("shot", tag))
+            cursor = {"l": "sb_h_double_arrow", "r": "sb_h_double_arrow", "t": "sb_v_double_arrow",
+                      "b": "sb_v_double_arrow"}.get(name, "sizing")
+            self.c.tag_bind(tag, "<Enter>", lambda _, c=cursor: self.c.config(cursor=c))
+            self.c.tag_bind(tag, "<Leave>", lambda _: self.c.config(cursor=""))
+
+    def sheet_images(self, body):
+        overlays = self.shot["edit"].setdefault("overlays", [])
+        self.label(body, "Картинки поверх СС: коллажи, вставки, стикеры. Тяни картинку мышью, колесо меняет "
+                         "размер. Белые метки по краям обрезают картинку, Shift + тяни внутри — сдвигает обрезку.")
+        line = tk.Frame(body, bg=VOID)
+        line.pack(anchor="w", pady=(px(4), 0))
+        Pill(line, "Из файла", self.add_file, kind="ghost").pack(side="left", padx=(0, px(6)))
+        Pill(line, "Из буфера", self.add_clipboard, kind="ghost").pack(side="left")
+        if not overlays:
+            return
+        self.active_ov = min(self.active_ov, len(overlays) - 1)
+        ov = overlays[self.active_ov]
+        if len(overlays) > 1:
+            self.label(body, "Картинка", 12)
+            self.choice(body, {str(i): str(i + 1) for i in range(len(overlays))}, str(self.active_ov),
+                        lambda v: self.select_ov(int(v)))
+        self.label(body, "Обрезка", 12)
+        FramePick(body, ov.get("cut", "free"), self.crop_ov, self.crop_size, self.sheet_w, CROPS, (16, 20000)).pack(
+            anchor="w")
+        Pill(body, "Сбросить обрезку", lambda: self.crop_ov("reset"), kind="ghost").pack(anchor="w", pady=(px(8), 0))
+        self.label(body, "Размер по ширине кадра", 12)
+        self.choice(body, OV_SIZES, ov["w"], lambda v: self.change_ov(w=float(v)))
+        Pill(body, "Убрать картинку", self.remove_ov, kind="ghost").pack(anchor="w", pady=(px(16), 0))
+
+    def add_file(self):
+        path = filedialog.askopenfilename(title="Картинка поверх СС", filetypes=[
+            ("Картинки", "*.png *.jpg *.jpeg *.webp *.bmp *.gif"), ("Все файлы", "*.*")])
+        if path:
+            try:
+                with Image.open(path) as im:
+                    self.add_image(im.copy())
+            except OSError as e:
+                self.note = f"картинка не открылась: {e}"
+                self.update_meta()
+
+    def add_clipboard(self):
+        try:
+            data = ImageGrab.grabclipboard()
+            if isinstance(data, list):
+                with Image.open(next(p for p in data if Path(p).is_file())) as im:
+                    data = im.copy()
+        except (OSError, StopIteration):
+            data = None
+        if not isinstance(data, Image.Image):
+            self.note = "в буфере обмена нет картинки"
+            self.update_meta()
+            return
+        self.add_image(data)
+
+    def add_image(self, image):
+        overlays = self.shot["edit"].setdefault("overlays", [])
+        if len(overlays) >= core.MAX_OVERLAYS:
+            self.note = f"больше {core.MAX_OVERLAYS} картинок не поместится"
+            self.update_meta()
+            return
+        try:
+            overlays.append(core.add_overlay(self.shot["out"], self.shot["name"], image))
+        except OSError as e:
+            self.note = f"картинка не сохранилась: {e}"
+            self.update_meta()
+            return
+        self.active_ov = len(overlays) - 1
+        self.redraw()
+        self.schedule_save()
+
+    def select_ov(self, k):
+        self.active_ov = k
+        self.redraw()
+
+    def source_size(self, ov):
+        try:
+            return core.overlay_image(self.shot["out"] / "src" / ov["file"]).size
+        except OSError:
+            return None
+
+    def crop_size(self):
+        ov = self.shot["edit"]["overlays"][self.active_ov]
+        W, H = self.source_size(ov) or (1, 1)
+        l, t, r, b = ov["crop"]
+        return round((r - l) * W), round((b - t) * H)
+
+    def crop_ov(self, value):
+        ov = self.shot["edit"]["overlays"][self.active_ov]
+        size = self.source_size(ov)
+        if size is None:
+            return
+        out_w = core.plan(self.shot["bg"], self.shot["edit"])["size"][0]
+        before = ov["w"] * out_w / max(1e-6, ov["crop"][2] - ov["crop"][0])
+        exact = core.exact_of(value)
+        if value == "reset":
+            ov["crop"], value = [0.0, 0.0, 1.0, 1.0], "free"
+        elif exact:
+            ov["crop"] = core.crop_exact(size, exact[0], exact[1], ov["crop"])
+        elif value != "free":
+            ov["crop"] = core.crop_for(size, core.lock_ratio(value), ov["crop"])
+        ov["w"] = round(before * (ov["crop"][2] - ov["crop"][0]) / out_w, 4)
+        changed, ov["cut"] = ov.get("cut") != value, value
+        if changed:
+            self.redraw()
+        else:
+            self.media_redraw()
+        self.schedule_save()
+
+    def change_ov(self, **values):
+        self.shot["edit"]["overlays"][self.active_ov].update(values)
+        self.media_redraw()
+        self.schedule_save()
+
+    def remove_ov(self):
+        overlays = self.shot["edit"]["overlays"]
+        overlays.pop(self.active_ov)
+        self.active_ov = max(0, self.active_ov - 1)
+        self.redraw()
+        self.schedule_save()
+
+    def toggle_cut(self, i):
+        rows, edit = self.shot["rows"], self.shot["edit"]
+        breaks = core.cuts(rows, edit)
+        spots = core.places(edit, len(breaks) + 1)[1:]
+        if i in breaks:
+            k = breaks.index(i)
+            breaks.pop(k)
+            spots.pop(k)
+        elif len(breaks) >= core.MAX_PARTS - 1:
+            self.note = "больше трёх частей не бывает"
+            self.update_meta()
+            return
+        else:
+            k = sorted(breaks + [i]).index(i)
+            used = [edit["pos"]] + spots
+            order = list(core.SPARE_PLACES.get(edit["pos"], core.SPARE_PLACES["top-left"])) + list(core.CHAT_POSITIONS)
+            free = [c for c in order if c not in used]
+            breaks.insert(k, i)
+            spots.insert(k, free[0] if free else core.places(edit, len(breaks) + 1)[-1])
+        edit["breaks"], edit["places"] = breaks, spots
+        self.draw_lines(self.area())
+        self.count.config(text=self.count_text())
+        self.schedule_save()
+
+    def count_text(self):
+        rows = self.shot["rows"]
+        n = len(core.parts(rows, self.shot["edit"]))
+        return f"В СС {sum(r['keep'] for r in rows)} из {len(rows)}" + (f" · частей: {n}" if n > 1 else "")
+
+    def set_place(self, part, pos):
+        edit = self.shot["edit"]
+        if part == 0:
+            edit["pos"] = pos
+            return
+        spots = core.places(edit, len(core.parts(self.shot["rows"], edit)))[1:]
+        spots[part - 1] = pos
+        edit["places"] = spots
+
+    def pick_place(self, part, pos):
+        if self.shot is None:
+            return
+        self.set_place(part, pos)
+        self.media_redraw()
+        self.schedule_save()
+
     def toggle_row(self, i):
         rows = self.shot["rows"]
         rows[i]["keep"] = not rows[i]["keep"]
         self.shot["edit"]["keep"] = [r["keep"] for r in rows]
         self.draw_lines(self.area())
-        self.count.config(text=f"В СС {sum(r['keep'] for r in rows)} из {len(rows)}")
+        self.count.config(text=self.count_text())
         self.schedule_save()
 
     def reset_lines(self):
@@ -942,13 +1223,37 @@ class Feed:
         if any(t.startswith(("rail", "nav", "older")) for t in tags) or self.shot is None or self.index == 0:
             return
         row = next((t for t in tags if re.fullmatch(r"row\d+", t)), None)
+        cut = next((t for t in tags if re.fullmatch(r"cut\d+", t)), None)
         if self.tool == "lines":
-            if row:
+            if cut:
+                self.toggle_cut(int(cut[3:]))
+            elif row and self.click_mode != "rows":
+                self.toggle_word(int(row[3:]), (e.x - self.lines_x0) / self.lines_s, self.click_mode)
+            elif row:
                 self.toggle_row(int(row[3:]))
             return
+        handle = next((t[7:] for t in tags if t.startswith("handle-")), None)
+        if self.tool == "images" and handle and self.painter.geo:
+            item = self.shot["edit"]["overlays"][self.active_ov]
+            box = self.painter.geo["overlays"][self.active_ov]
+            size = self.source_size(item)
+            if box and size:
+                self.drag = {"kind": "crop", "handle": handle, "part": self.active_ov, "x": e.x, "y": e.y,
+                             "crop": list(item["crop"]), "box": dict(box), "size": size}
+            return
+        ov = next((int(t[7:]) for t in tags if re.fullmatch(r"shot-ov\d+", t)), None)
+        if self.tool == "images" and ov is not None:
+            self.active_ov = ov
+            item = self.shot["edit"]["overlays"][ov]
+            kind = "ovpan" if e.state & 0x1 else "ov"
+            self.drag = {"kind": kind, "part": ov, "x": e.x, "y": e.y, "at": (item["x"], item["y"]),
+                         "crop": list(item["crop"])}
+            self.c.config(cursor="fleur")
+            return
         geo = self.painter.geo
-        if geo and geo["chat"] and "shot-chat" in tags:
-            self.drag = {"kind": "chat", "x": e.x, "y": e.y, "at": self.c.coords("shot-chat")}
+        part = next((int(t[9:]) for t in tags if re.fullmatch(r"shot-chat\d+", t)), None)
+        if geo and part is not None and part < len(geo["chats"]) and geo["chats"][part]:
+            self.drag = {"kind": "chat", "part": part, "x": e.x, "y": e.y, "at": self.c.coords(f"shot-chat{part}")}
         elif geo and self.tool == "crop" and self.inside(e, geo):
             self.drag = {"kind": "pan", "x": e.x, "y": e.y, "center": list(self.shot["edit"]["center"])}
             self.c.config(cursor="fleur")
@@ -963,11 +1268,29 @@ class Feed:
         geo = self.painter.geo
         if self.drag["kind"] == "chat":
             ix, iy, dw, dh = geo["img"]
-            ch = geo["chat"]
+            ch = geo["chats"][self.drag["part"]]
             slack = geo["pad"] * geo["d"]
             x = min(max(self.drag["at"][0] + e.x - self.drag["x"], ix - slack), ix + dw - ch["w"] + slack)
             y = min(max(self.drag["at"][1] + e.y - self.drag["y"], iy - slack), iy + dh - ch["h"] + slack)
-            self.c.coords("shot-chat", x, y)
+            self.c.coords(f"shot-chat{self.drag['part']}", x, y)
+        elif self.drag["kind"] == "crop":
+            self.drag_crop(e, geo)
+        elif self.drag["kind"] in ("ov", "ovpan"):
+            ov = self.shot["edit"]["overlays"][self.drag["part"]]
+            (out_w, out_h), d = geo["out"], geo["d"]
+            if self.drag["kind"] == "ov":
+                ov["x"] = round(min(max(self.drag["at"][0] + (e.x - self.drag["x"]) / d / out_w, 0.0), 1.0), 4)
+                ov["y"] = round(min(max(self.drag["at"][1] + (e.y - self.drag["y"]) / d / out_h, 0.0), 1.0), 4)
+            elif geo["overlays"][self.drag["part"]]:
+                box = geo["overlays"][self.drag["part"]]
+                l, t, r, b = self.drag["crop"]
+                sx = min(max(-(e.x - self.drag["x"]) * (r - l) / box["w"], -l), 1 - r)
+                sy = min(max(-(e.y - self.drag["y"]) * (b - t) / box["h"], -t), 1 - b)
+                ov["crop"] = [round(l + sx, 4), round(t + sy, 4), round(r + sx, 4), round(b + sy, 4)]
+                ov["cut"] = ov.get("cut", "free")
+            if not self.pending_media:
+                self.pending_media = True
+                self.c.after(16, self.flush_media)
         else:
             bg = self.shot["bg"]
             H, W = bg.shape[:2]
@@ -979,6 +1302,49 @@ class Feed:
             if not self.pending_media:
                 self.pending_media = True
                 self.c.after(16, self.flush_media)
+
+    def drag_crop(self, e, geo):
+        drag = self.drag
+        ov = self.shot["edit"]["overlays"][drag["part"]]
+        (out_w, out_h), d = geo["out"], geo["d"]
+        box, (SW, SH), (l, t, r, b) = drag["box"], drag["size"], drag["crop"]
+        X, Y = (box["x"] - geo["img"][0]) / d, (box["y"] - geo["img"][1]) / d
+        Wd, Hd = box["w"] / d, box["h"] / d
+        k = Wd / max(1e-6, (r - l) * SW)
+        L, T, R, B = X, Y, X + Wd, Y + Hd
+        bounds = (X - l * SW * k, Y - t * SH * k, R + (1 - r) * SW * k, B + (1 - b) * SH * k)
+        dx, dy, h = (e.x - drag["x"]) / d, (e.y - drag["y"]) / d, drag["handle"]
+        least = 12 / d
+        if "l" in h:
+            L = min(max(L + dx, bounds[0]), R - least)
+        if "r" in h:
+            R = max(min(R + dx, bounds[2]), L + least)
+        if "t" in h:
+            T = min(max(T + dy, bounds[1]), B - least)
+        if "b" in h:
+            B = max(min(B + dy, bounds[3]), T + least)
+        ratio = core.lock_ratio(ov.get("cut", "free"))
+        if ratio and len(h) == 2:
+            w, hh = R - L, B - T
+            if abs(dx) >= abs(dy) * ratio:
+                hh = w / ratio
+            else:
+                w = hh * ratio
+            room_w = (R - bounds[0]) if "l" in h else (bounds[2] - L)
+            room_h = (B - bounds[1]) if "t" in h else (bounds[3] - T)
+            scale = min(1.0, room_w / w, room_h / hh)
+            w, hh = w * scale, hh * scale
+            L, R = (R - w, R) if "l" in h else (L, L + w)
+            T, B = (B - hh, B) if "t" in h else (T, T + hh)
+        span_x, span_y = SW * k, SH * k
+        ov["crop"] = [round(min(max(l + (L - X) / span_x, 0.0), 1.0), 5), round(min(max(t + (T - Y) / span_y, 0.0), 1.0), 5),
+                      round(min(max(r + (R - X - Wd) / span_x, 0.0), 1.0), 5),
+                      round(min(max(b + (B - Y - Hd) / span_y, 0.0), 1.0), 5)]
+        ov["w"] = round((R - L) / out_w, 5)
+        ov["x"], ov["y"] = round((L + R) / 2 / out_w, 5), round((T + B) / 2 / out_h, 5)
+        if not self.pending_media:
+            self.pending_media = True
+            self.c.after(16, self.flush_media)
 
     def flush_media(self):
         self.pending_media = False
@@ -992,12 +1358,12 @@ class Feed:
         geo = self.painter.geo
         edit = self.shot["edit"]
         if drag["kind"] == "chat":
-            x, y = self.c.coords("shot-chat")
+            x, y = self.c.coords(f"shot-chat{drag['part']}")
             ix, iy = geo["img"][:2]
             d, pad = geo["d"], geo["pad"]
             out_w, out_h = geo["out"]
             left, top = (x - ix) / d, (y - iy) / d
-            ch = geo["chat"]
+            ch = geo["chats"][drag["part"]]
             margin = geo["plan"]["margin"]
             pos = [round((left + pad) / out_w, 4), round((top + pad) / out_h, 4)]
             for corner in core.CHAT_POSITIONS:
@@ -1005,7 +1371,11 @@ class Feed:
                 if ((cl - left) ** 2 + (ct - top) ** 2) ** 0.5 < 0.06 * min(out_w, out_h):
                     pos = corner
                     break
-            edit["pos"] = pos
+            self.set_place(drag["part"], pos)
+        elif drag["kind"] in ("ov", "ovpan", "crop"):
+            self.redraw()
+            self.schedule_save()
+            return
         else:
             H, W = self.shot["bg"].shape[:2]
             x0, y0, x1, y1 = chat.frame_rect(W, H, core.ratio_of(edit["format"]), edit["zoom"], edit["center"])
@@ -1019,7 +1389,7 @@ class Feed:
         if self.drag or self.index == 0 or self.shot is None or self.tool == "lines":
             return
         tags = self.tags_here()
-        if "shot-chat" in tags:
+        if "shot-chat" in tags or (self.tool == "images" and "shot-ov" in tags):
             self.c.config(cursor="fleur")
         elif self.tool == "crop" and self.painter.geo and self.inside(e, self.painter.geo):
             self.c.config(cursor="fleur")
@@ -1031,6 +1401,14 @@ class Feed:
         if self.tool == "lines" and self.shot is not None:
             self.offset += step * px(72)
             self.draw_lines(self.area())
+            return
+        ov = next((int(t[7:]) for t in self.tags_here() if re.fullmatch(r"shot-ov\d+", t)), None)
+        if self.tool == "images" and self.shot is not None and ov is not None:
+            item = self.shot["edit"]["overlays"][ov]
+            item["w"] = round(min(max(item["w"] * (1.08 if step < 0 else 1 / 1.08), 0.05), 2.0), 4)
+            self.active_ov = ov
+            self.media_redraw()
+            self.schedule_save()
             return
         if self.tool == "crop" and self.shot is not None and e.state & 0x4:
             zoom = min(3.0, max(1.0, round(self.shot["edit"]["zoom"] - step * 0.1, 2)))
@@ -1098,7 +1476,8 @@ class Feed:
 
         def work():
             try:
-                img = core.render(snap["bg"], snap["rows"], snap["edit"])[0] if snap else core.read_image(path)
+                img = (core.render(snap["bg"], snap["rows"], snap["edit"], snap["out"] / "src")[0] if snap
+                       else core.read_image(path))
                 core.copy_image(img)
                 self.app.inbox.put(("copied", name, None))
             except Exception as e:
@@ -1129,8 +1508,8 @@ class Feed:
             self.toggle_tool(self.tool)
         elif e.keycode == 67 and e.state & 0x4 and self.index > 0:
             self.copy()
-        elif e.keycode in (49, 50, 51) and self.shot is not None and self.index > 0:
-            self.toggle_tool(("lines", "crop", "text")[e.keycode - 49])
+        elif e.keycode in (49, 50, 51, 52) and self.shot is not None and self.index > 0:
+            self.toggle_tool(TOOLS[e.keycode - 49])
 
 
 class Settings:
@@ -1297,6 +1676,8 @@ class Settings:
         self.choice(control, OUTLINES, raw["outline"], lambda v: self.app.set("outline", v))
         control, _, _ = self.row(f, "Угол чата")
         self.choice(control, POSITIONS, cfg["chat_pos"], lambda v: self.app.set("chat_pos", v), cols=2)
+        control, _, _ = self.row(f, "Ники", "В новых СС. В редакторе — инструмент «Строки»")
+        self.choice(control, NICKS, "yes" if cfg["hide_names"] else "no", lambda v: self.app.set("hide_names", v))
         control, _, _ = self.row(f, "Строки в СС", "Остальные можно вернуть в редакторе")
         self.kind_pills = {}
         for i, (kind, label) in enumerate(KINDS.items()):
@@ -1490,6 +1871,9 @@ class Settings:
         shot = self.sample
         for r in shot["rows"]:
             r["keep"] = r["kind"] in cfg["keep"]
+            r["hide"] = []
+        if cfg["hide_names"]:
+            core.auto_hide(shot["rows"])
         shot["edit"] = core.new_edit(cfg, shot["rows"])
         out_w, out_h = core.plan(shot["bg"], shot["edit"])["size"]
         d = min(W / out_w, (H - px(72)) / out_h)
@@ -1627,6 +2011,8 @@ class App:
         return ctypes.windll.user32.GetForegroundWindow() == self.hwnd
 
     def key(self, e):
+        if isinstance(e.widget, tk.Entry):
+            return
         if self.settings.on_key(e):
             return
         if self.tab == "feed":
@@ -1639,6 +2025,8 @@ class App:
                 event = core.EVENTS.get_nowait()
                 if event[0] == "busy":
                     feed.busy = event[1]
+                    if event[1]:
+                        feed.flush_save()
                     if feed.index == 0:
                         feed.redraw()
                 elif event[0] == "log":

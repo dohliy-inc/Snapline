@@ -24,7 +24,7 @@ def scaled(img, w, h):
 def make_cfg(out, **kw):
     cfg = {"key": "F11", "auto": True, "hud_key": "F7", "dark_key": "F2", "hud_delay": 0, "out": Path(out),
            "format": "square", "ratio": 1.0, "size": "native", "file": "png", "chat_pos": "top-left", "margin": 24,
-           "text_scale": 1.5, "outline": 2, "keep": (SP, AC), "sound": False, "chatlog": False}
+           "text_scale": 1.5, "outline": 2, "keep": (SP, AC), "sound": False, "chatlog": False, "hide_names": False}
     cfg.update(kw)
     return cfg
 
@@ -283,6 +283,89 @@ def check_auto():
         core.tap, core.grab = tap, grab
 
 
+def check_parts():
+    rows = chat.classify(chat.extract_rows(load("real_chat_pm.png")))
+    for r in rows:
+        r["keep"] = True
+    edit = core.new_edit(make_cfg("."), rows)
+    edit["keep"] = [True] * len(rows)
+    assert core.places(edit, 3) == ["top-left", "bottom-left", "top-right"]
+    assert core.cuts(rows, dict(edit, breaks=[0, 99, 9, 5, 5, 7])) == [5, 7]
+    bg = load("real_bg.webp")
+    one, n1 = core.render(bg, rows, edit)
+    two, n2 = core.render(bg, rows, dict(edit, breaks=[9]))
+    assert n1 == n2 == len(rows), (n1, n2, len(rows))
+    assert not (one != core.render(bg, [], edit)[0]).any(axis=2)[2 * one.shape[0] // 3:].any()
+    H = two.shape[0]
+    frame = core.render(bg, [], edit)[0]
+    changed = (two != frame).any(axis=2)
+    assert changed[: H // 3].any() and changed[2 * H // 3:].any() and not changed[H // 3:2 * H // 3, : H // 3].any()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = make_cfg(tmp)
+        state = {"session": core.Session()}
+        core.handle(load("bg.webp"), state, cfg)
+        core.handle(load("chat2.webp"), state, cfg)
+        name = state["session"].name
+        shot = core.load_shot(Path(tmp), name, cfg)
+        gone = [i for i, r in enumerate(shot["rows"]) if r["keep"]][0]
+        shot["rows"][gone]["keep"] = False
+        shot["edit"].update(keep=[r["keep"] for r in shot["rows"]], breaks=[5], places=["bottom-right"])
+        core.save_shot(shot)
+        core.handle(load("chat3.webp"), state, cfg)
+        again = core.load_shot(Path(tmp), name, cfg)
+        assert not again["rows"][gone]["keep"] and again["edit"]["breaks"] == [5]
+        assert again["edit"]["places"] == ["bottom-right"] and len(again["rows"]) == 22
+
+
+def check_nicks_overlays():
+    rows = chat.classify(chat.extract_rows(load("real_chat_ic.png")))
+    assert [len(s) for s in chat.nick_spans(rows)] == [2, 0, 2] and len(chat.words(rows[2])) == 6
+    speech = dict(rows[2])
+    w = chat.words(speech)
+    speech["drop"] = w[:3]
+    cols = np.flatnonzero((chat.masked(speech) > chat.INK).any(axis=(0, 2)))
+    assert cols[0] == w[0][0] and cols[-1] == w[5][1] - (w[3][0] - w[0][0]), (cols[0], cols[-1], w)
+    action = dict(rows[0])
+    w = chat.words(action)
+    action["drop"] = w[1:3]
+    cols = np.flatnonzero((chat.masked(action) > chat.INK).any(axis=(0, 2)))
+    assert cols[-1] == w[-1][1] - (w[3][0] - w[1][0])
+    assert (chat.masked(action, preview=True).shape == action["rgb"].shape)
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = make_cfg(tmp, hide_names=True)
+        state = {"session": core.Session()}
+        core.handle(load("real_bg.webp"), state, cfg)
+        core.handle(load("real_chat_ic.png"), state, cfg)
+        name = state["session"].name
+        shot = core.load_shot(Path(tmp), name, cfg)
+        assert [len(r["hide"]) for r in shot["rows"]] == [2, 0, 2], [r["hide"] for r in shot["rows"]]
+        plain = core.render(shot["bg"], [dict(r, hide=[]) for r in shot["rows"]], shot["edit"])[0]
+        assert (plain != core.render(shot["bg"], shot["rows"], shot["edit"])[0]).any()
+        shot["rows"][2]["hide"], shot["rows"][2]["drop"] = [], chat.words(shot["rows"][2])[:3]
+        shot["edit"]["hidden"], shot["edit"]["dropped"] = core.spans_of(shot["rows"], "hide"), core.spans_of(shot["rows"], "drop")
+        core.save_shot(shot)
+        core.handle(load("real_chat_ic.png"), state, cfg)
+        again = core.load_shot(Path(tmp), name, cfg)
+        assert again["rows"][2]["drop"] == [tuple(s) for s in chat.words(again["rows"][2])[:3]], again["rows"][2]
+        assert again["rows"][2]["hide"] == [] and len(again["rows"][0]["hide"]) == 2
+
+        ov = core.add_overlay(Path(tmp), name, Image.new("RGB", (400, 200), (255, 0, 0)))
+        assert ov["file"] == f"{name}_ov1.png" and "frame" not in ov
+        assert core.crop_for((400, 200), 1.0, (0.5, 0.0, 1.0, 1.0)) == [0.5, 0.0, 1.0, 1.0]
+        assert core.crop_exact((400, 200), 100, 100, (0.0, 0.0, 1.0, 1.0)) == [0.375, 0.25, 0.625, 0.75]
+        assert core.crop_exact((400, 200), 100, 100, (0.9, 0.0, 1.0, 1.0))[2] == 1.0
+        assert core.lock_ratio("4:3") == 4 / 3 and core.lock_ratio("800x600") == 4 / 3 and core.lock_ratio("free") is None
+        ov["crop"] = core.crop_for((400, 200), 1.0)
+        shot["edit"]["overlays"] = [ov]
+        img, _ = core.save_shot(shot)
+        x, y, w, h = core.overlay_box(ov, (img.shape[1], img.shape[0]), (400, 200))
+        assert w == h and img[y + h // 2, x + w // 2][0] > 200 and img[y + h // 2, x + w // 2][1] < 60
+        assert core.load_shot(Path(tmp), name, cfg)["edit"]["overlays"] == [ov]
+        sticker = core.add_overlay(Path(tmp), name, Image.new("RGBA", (10, 10), (0, 0, 0, 0)))
+        assert sticker["file"] == f"{name}_ov2.png"
+
+
 def check_watermark():
     bg, shot = load("real_bg.webp"), load("real_chat_ic.png")
     mark = core.watermark(shot)
@@ -307,4 +390,6 @@ if __name__ == "__main__":
     check_config()
     check_session()
     check_auto()
+    check_parts()
+    check_nicks_overlays()
     print("ok")

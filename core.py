@@ -12,6 +12,7 @@ import urllib.request
 import winsound
 from ctypes import wintypes
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -19,7 +20,7 @@ from PIL import Image, ImageGrab
 
 import chat
 
-VERSION = "1.1"
+VERSION = "1.2"
 RELEASES = "https://api.github.com/repos/dohliy-inc/Snapline/releases/latest"
 APP_DIR = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent
 RES_DIR = Path(getattr(sys, "_MEIPASS", APP_DIR))
@@ -43,6 +44,7 @@ DEFAULTS = {
     "outline": "2",
     "keep": "речь, действие",
     "sound": "yes",
+    "hide_names": "no",
     "chatlog": "no",
 }
 SIZES = {"native": None, "hd": 720, "fhd": 1080, "qhd": 1440, "4k": 2160}
@@ -52,7 +54,13 @@ FILE_TYPES = {"jpg": {"quality": 92, "subsampling": 0}, "png": {"compress_level"
 SRC_BG = (".jpg", {"quality": 95, "subsampling": 0})
 SRC_CHAT = (".webp", {"lossless": True, "quality": 0, "method": 1})
 CHAT_POSITIONS = ("top-left", "top-right", "bottom-left", "bottom-right")
-LAYOUT_KEYS = ("format", "zoom", "center", "pos", "size", "file", "text_scale", "outline", "margin")
+LAYOUT_KEYS = ("format", "zoom", "center", "pos", "places", "size", "file", "text_scale", "outline", "margin",
+               "overlays")
+MAX_OVERLAYS = 4
+MARKS = (("hide", "hidden"), ("drop", "dropped"))
+MAX_PARTS = 3
+SPARE_PLACES = {"top-left": ("bottom-left", "top-right"), "top-right": ("bottom-right", "top-left"),
+                "bottom-left": ("top-left", "bottom-right"), "bottom-right": ("top-right", "bottom-left")}
 KEYS = {f"F{i}": 0x6F + i for i in range(1, 25)}
 KEYS.update(PAUSE=0x13, SCROLLLOCK=0x91, INSERT=0x2D, HOME=0x24, END=0x23, PAGEUP=0x21, PAGEDOWN=0x22)
 EXTENDED_KEYS = {0x2D, 0x24, 0x23, 0x21, 0x22}
@@ -232,6 +240,7 @@ def parse_config(raw):
         "outline": _num(raw, "outline", int, 0, 10),
         "keep": tuple(kinds[k] for k in keep),
         "sound": _bool(raw, "sound"),
+        "hide_names": _bool(raw, "hide_names"),
         "chatlog": _bool(raw, "chatlog"),
     }
 
@@ -251,6 +260,11 @@ def new_edit(cfg, rows):
         "zoom": 1.0,
         "center": [0.5, 0.5],
         "pos": cfg["chat_pos"],
+        "breaks": [],
+        "places": [],
+        "hidden": spans_of(rows, "hide"),
+        "dropped": spans_of(rows, "drop"),
+        "overlays": [],
         "size": cfg["size"],
         "file": cfg["file"],
         "text_scale": cfg["text_scale"],
@@ -265,6 +279,43 @@ def apply_keep(rows, edit):
             r["keep"] = k
     else:
         edit["keep"] = [bool(r["keep"]) for r in rows]
+    edit["breaks"] = cuts(rows, edit)
+    for key, field in MARKS:
+        spans = {}
+        for i, a, b in edit.get(field, []):
+            if 0 <= i < len(rows):
+                spans.setdefault(int(i), []).append((int(a), int(b)))
+        for i, r in enumerate(rows):
+            r[key] = spans.get(i, [])
+        edit[field] = spans_of(rows, key)
+
+
+def spans_of(rows, key):
+    return [[i, int(a), int(b)] for i, r in enumerate(rows) for a, b in r.get(key, [])]
+
+
+def auto_hide(rows, only_new=False):
+    for r, spans in zip(rows, chat.nick_spans(rows)):
+        if not only_new or "hide" not in r:
+            r["hide"] = spans
+
+
+def cuts(rows, edit):
+    return sorted({int(i) for i in edit.get("breaks", []) if 0 < int(i) < len(rows)})[:MAX_PARTS - 1]
+
+
+def places(edit, count):
+    first, extra = edit["pos"], list(edit.get("places", []))
+    spare = SPARE_PLACES.get(first, SPARE_PLACES["top-left"]) if isinstance(first, str) else SPARE_PLACES["top-left"]
+    while len(extra) < count - 1:
+        extra.append(spare[len(extra) % len(spare)])
+    return [first] + extra[:count - 1]
+
+
+def parts(rows, edit):
+    bounds = [0] + cuts(rows, edit) + [len(rows)]
+    spans = list(zip(bounds, bounds[1:]))
+    return [(rows[a:b], pos) for (a, b), pos in zip(spans, places(edit, len(spans)))]
 
 
 def plan(bg, edit):
@@ -285,7 +336,86 @@ def plan(bg, edit):
     }
 
 
-def render(bg, rows, edit):
+@lru_cache(maxsize=16)
+def _overlay(path, stamp):
+    with Image.open(path) as im:
+        return im.convert("RGBA")
+
+
+def overlay_image(path):
+    return _overlay(str(path), path.stat().st_mtime_ns)
+
+
+def add_overlay(out, name, image):
+    src = out / "src"
+    src.mkdir(parents=True, exist_ok=True)
+    taken = {int(m[1]) for p in src.glob(f"{name}_ov*.png") if (m := re.search(r"_ov(\d+)$", p.stem))}
+    file = f"{name}_ov{max(taken, default=0) + 1}.png"
+    image = image.copy()
+    image.thumbnail((2560, 2560), Image.LANCZOS)
+    image.save(src / file, compress_level=3)
+    return {"file": file, "x": 0.7, "y": 0.68, "w": 0.4, "crop": [0.0, 0.0, 1.0, 1.0], "cut": "free"}
+
+
+def lock_ratio(cut):
+    exact = exact_of(cut)
+    if exact:
+        return exact[0] / exact[1] if exact[1] else None
+    m = re.fullmatch(r"(\d+):(\d+)", str(cut))
+    return int(m[1]) / int(m[2]) if m and int(m[2]) else None
+
+
+def crop_for(size, ratio, within=(0.0, 0.0, 1.0, 1.0)):
+    W, H = size
+    l, t, r, b = within
+    rw, rh = (r - l) * W, (b - t) * H
+    if ratio is None:
+        return [0.0, 0.0, 1.0, 1.0]
+    cw, ch = (rw, rw / ratio) if rw / rh < ratio else (rh * ratio, rh)
+    cx, cy = (l + r) / 2 * W, (t + b) / 2 * H
+    return [round((cx - cw / 2) / W, 4), round((cy - ch / 2) / H, 4), round((cx + cw / 2) / W, 4),
+            round((cy + ch / 2) / H, 4)]
+
+
+def crop_exact(size, w, h, within):
+    W, H = size
+    w, h = min(max(1, w), W), min(max(1, h), H)
+    l, t, r, b = within
+    cx = min(max((l + r) / 2 * W, w / 2), W - w / 2)
+    cy = min(max((t + b) / 2 * H, h / 2), H - h / 2)
+    return [round((cx - w / 2) / W, 4), round((cy - h / 2) / H, 4), round((cx + w / 2) / W, 4),
+            round((cy + h / 2) / H, 4)]
+
+
+def overlay_box(ov, out_size, src_size):
+    l, t, r, b = ov["crop"]
+    cw, ch = max(1.0, (r - l) * src_size[0]), max(1.0, (b - t) * src_size[1])
+    w = max(1, round(ov["w"] * out_size[0]))
+    h = max(1, round(w * ch / cw))
+    return round(ov["x"] * out_size[0] - w / 2), round(ov["y"] * out_size[1] - h / 2), w, h
+
+
+def overlay_piece(src, ov, size):
+    l, t, r, b = ov["crop"]
+    W, H = src.size
+    return src.crop((round(l * W), round(t * H), max(round(l * W) + 1, round(r * W)),
+                     max(round(t * H) + 1, round(b * H)))).resize(size, Image.LANCZOS)
+
+
+def paste_overlays(frame, overlays, src):
+    img = Image.fromarray(frame).convert("RGBA")
+    for ov in overlays:
+        try:
+            source = overlay_image(src / ov["file"])
+        except OSError:
+            continue
+        x, y, w, h = overlay_box(ov, img.size, source.size)
+        piece = overlay_piece(source, ov, (w, h))
+        img.paste(piece, (x, y), piece)
+    return np.asarray(img.convert("RGB"))
+
+
+def render(bg, rows, edit, src=None):
     if rows and bg.shape[1] != rows[0]["screen_w"]:
         raise ValueError(f"фон шириной {bg.shape[1]} px, а чат снят на экране {rows[0]['screen_w']} px")
     p = plan(bg, edit)
@@ -294,8 +424,14 @@ def render(bg, rows, edit):
     if (frame.shape[1], frame.shape[0]) != p["size"]:
         method = Image.LANCZOS if p["size"][0] < frame.shape[1] else Image.BICUBIC
         frame = np.asarray(Image.fromarray(frame).resize(p["size"], method))
-    img, painted, _ = chat.compose(frame, rows, p["outline"], edit["pos"], p["margin"], p["scale"])
-    return (frame.copy() if img is None else img), painted
+    if src is not None and edit.get("overlays"):
+        frame = paste_overlays(frame, edit["overlays"], src)
+    img, painted = frame, 0
+    for part, pos in parts(rows, edit):
+        done, n, _ = chat.compose(img, part, p["outline"], pos, p["margin"], p["scale"])
+        if done is not None:
+            img, painted = done, painted + n
+    return (frame.copy() if img is frame else img), painted
 
 
 def watermark(chat_img):
@@ -439,7 +575,7 @@ def load_shot(out, name, cfg):
 
 
 def save_shot(shot):
-    img, painted = render(shot["bg"], shot["rows"], shot["edit"])
+    img, painted = render(shot["bg"], shot["rows"], shot["edit"], shot["out"] / "src")
     out, name, file = shot["out"], shot["name"], shot["edit"]["file"]
     _, _, meta = shot_files(out, name)
     with FILES:
@@ -572,6 +708,7 @@ def handle(img, state, cfg):
         s.chats += 1
         save_src(img, cfg, f"{s.name}_chat{s.chats}", SRC_CHAT)
         s.mark = s.mark or watermark(img)
+        restore_marks(s.rows, saved_edit(cfg["out"], s.name))
         s.rows = chat.merge(s.rows, rows)
         log(f"Чат #{s.chats}: строк {len(rows)}, из них в СС {sum(r['keep'] for r in rows)}.")
     else:
@@ -591,13 +728,13 @@ def handle(img, state, cfg):
         log("В чате нет реплик для СС: только системные строки и OOC.", "fail")
         return TONE_FAIL
     edit = new_edit(cfg, s.rows)
-    _, _, meta = shot_files(cfg["out"], s.name)
-    if meta.exists():
-        try:
-            old = json.loads(meta.read_text(encoding="utf-8"))
-            edit.update({k: old[k] for k in LAYOUT_KEYS if k in old})
-        except (ValueError, OSError):
-            pass
+    old = saved_edit(cfg["out"], s.name)
+    edit.update({k: old[k] for k in LAYOUT_KEYS if k in old})
+    edit["breaks"] = [i for i, r in enumerate(s.rows) if r.get("cut") and i]
+    if cfg["hide_names"]:
+        auto_hide(s.rows, only_new=True)
+    for key, field in MARKS:
+        edit[field] = spans_of(s.rows, key)
     bg = clean_bg(s.bg, s.mark)
     img, painted = save_shot({"name": s.name, "out": cfg["out"], "bg": bg, "rows": s.rows, "edit": edit})
     kept = sum(r["keep"] for r in s.rows)
@@ -605,6 +742,30 @@ def handle(img, state, cfg):
     log(f"СС готова: {s.name}.{edit['file']}, {img.shape[1]}×{img.shape[0]}.{tail}", "ok")
     EVENTS.put(("ss", s.name))
     return TONE_SS
+
+
+def saved_edit(out, name):
+    _, _, meta = shot_files(out, name)
+    try:
+        return json.loads(meta.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def restore_marks(rows, old):
+    for i, r in enumerate(rows):
+        r["cut"] = i in old.get("breaks", [])
+    keep = old.get("keep", [])
+    if len(keep) != len(rows):
+        return
+    for r, k in zip(rows, keep):
+        r["keep"] = bool(k)
+    for key, field in MARKS:
+        spans = {}
+        for i, a, b in old.get(field, []):
+            spans.setdefault(i, []).append((a, b))
+        for i, r in enumerate(rows):
+            r[key] = spans.get(i, [])
 
 
 def wait_dark():
