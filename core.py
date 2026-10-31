@@ -20,7 +20,7 @@ from PIL import Image, ImageGrab
 
 import chat
 
-VERSION = "1.2"
+VERSION = "1.2.1"
 RELEASES = "https://api.github.com/repos/dohliy-inc/Snapline/releases/latest"
 APP_DIR = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent
 RES_DIR = Path(getattr(sys, "_MEIPASS", APP_DIR))
@@ -304,9 +304,16 @@ def cuts(rows, edit):
     return sorted({int(i) for i in edit.get("breaks", []) if 0 < int(i) < len(rows)})[:MAX_PARTS - 1]
 
 
+def corner_of(pos):
+    if isinstance(pos, str):
+        return pos if pos in SPARE_PLACES else "top-left"
+    x, y = pos
+    return ("top" if y < 0.5 else "bottom") + "-" + ("left" if x < 0.5 else "right")
+
+
 def places(edit, count):
     first, extra = edit["pos"], list(edit.get("places", []))
-    spare = SPARE_PLACES.get(first, SPARE_PLACES["top-left"]) if isinstance(first, str) else SPARE_PLACES["top-left"]
+    spare = SPARE_PLACES[corner_of(first)]
     while len(extra) < count - 1:
         extra.append(spare[len(extra) % len(spare)])
     return [first] + extra[:count - 1]

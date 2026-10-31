@@ -1169,7 +1169,7 @@ class Feed:
         else:
             k = sorted(breaks + [i]).index(i)
             used = [edit["pos"]] + spots
-            order = list(core.SPARE_PLACES.get(edit["pos"], core.SPARE_PLACES["top-left"])) + list(core.CHAT_POSITIONS)
+            order = list(core.SPARE_PLACES[core.corner_of(edit["pos"])]) + list(core.CHAT_POSITIONS)
             free = [c for c in order if c not in used]
             breaks.insert(k, i)
             spots.insert(k, free[0] if free else core.places(edit, len(breaks) + 1)[-1])
@@ -2002,6 +2002,18 @@ class App:
         self.settings.draw_example()
         return True
 
+    def crash(self, kind, value, tb):
+        try:
+            with open(core.ERROR_LOG, "a", encoding="utf-8") as f:
+                f.write(f"{datetime.now()}\n{''.join(traceback.format_exception(kind, value, tb))}\n")
+        except OSError:
+            pass
+        self.feed.note = f"ошибка, подробности в {core.ERROR_LOG.name}"
+        try:
+            self.feed.update_meta()
+        except tk.TclError:
+            pass
+
     def check_update(self):
         found = core.latest_release()
         if found:
@@ -2252,6 +2264,7 @@ def main():
         return 1
     root = tk.Tk()
     app = App(root)
+    root.report_callback_exception = app.crash
     app.hwnd = dark_title(root)
     app.frame = Frameless(app, app.hwnd)
     stop = threading.Event()

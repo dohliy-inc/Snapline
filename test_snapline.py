@@ -290,6 +290,8 @@ def check_parts():
     edit = core.new_edit(make_cfg("."), rows)
     edit["keep"] = [True] * len(rows)
     assert core.places(edit, 3) == ["top-left", "bottom-left", "top-right"]
+    assert core.corner_of([0.22, 0.84]) == "bottom-left"
+    assert core.places(dict(edit, pos=[0.8, 0.1]), 2) == [[0.8, 0.1], "bottom-right"]
     assert core.cuts(rows, dict(edit, breaks=[0, 99, 9, 5, 5, 7])) == [5, 7]
     bg = load("real_bg.webp")
     one, n1 = core.render(bg, rows, edit)
