@@ -884,7 +884,8 @@ def final_url(url, timeout_ms=5000):
         limit = wintypes.DWORD(timeout_ms)
         for option in (2, 5, 6):
             net.InternetSetOptionW(session, option, ctypes.byref(limit), ctypes.sizeof(limit))
-        handle = net.InternetOpenUrlW(session, url, None, 0, 0x84000000, 0)
+        fresh = "Cache-Control: no-cache\r\n"
+        handle = net.InternetOpenUrlW(session, url, fresh, len(fresh), 0x84080000, 0)
         if not handle:
             raise OSError(f"{url} не открылся: {ctypes.WinError(ctypes.get_last_error())}")
         try:
