@@ -1,10 +1,12 @@
 import ctypes
+import io
 import json
 import os
 import queue
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -34,7 +36,7 @@ WHITE = "#f4f4f5"
 SUB = "#a3a8b3"
 ERR = "#ff7a70"
 
-ICONS = {"images": "", "cut": "", "lines": "", "crop": "", "text": "", "copy": "", "folder": "",
+ICONS = {"file": "", "images": "", "cut": "", "lines": "", "crop": "", "text": "", "copy": "", "folder": "",
          "up": "", "down": "", "close": ""}
 CHROME = {"min": "", "max": "", "restore": "", "close": ""}
 CHROME_TEXT = {"min": "–", "max": "□", "restore": "❐", "close": "×"}
@@ -45,11 +47,14 @@ NICKS = {"no": "Показывать", "yes": "Прятать"}
 CLICKS = {"rows": "Убрать строку", "hide": "Скрыть слово", "drop": "Удалить слово"}
 CROPS = {"free": "Свободно", "1:1": "Квадрат", "4:3": "4:3", "3:4": "3:4", "16:9": "16:9", "9:16": "9:16"}
 HANDLES = ("l", "r", "t", "b", "lt", "rt", "lb", "rb")
-OV_SIZES = {"0.25": "25%", "0.4": "40%", "0.6": "60%", "1": "100%"}
-TOOLS = ("lines", "crop", "text", "images")
+TOOLS = ("lines", "crop", "text", "images", "file")
+SIDES = {"none": "Нет", "left": "Слева", "right": "Справа", "top": "Сверху", "bottom": "Снизу"}
+FIELD_DEFAULT = {"size": 0.5, "fade": 0.3}
+CLICK_HINTS = {"rows": "Клик убирает строку из СС или возвращает её.",
+               "hide": "Клик закрывает слово плашкой под цвет реплики. Повторный клик возвращает его.",
+               "drop": "Клик убирает слово вместе с пробелом, текст подтягивается. Повторный клик возвращает его."}
 SCALES = {"1": "×1", "1.25": "×1.25", "1.5": "×1.5", "1.75": "×1.75", "2": "×2"}
 OUTLINES = {"0": "Нет", "1": "1 px", "2": "2 px", "3": "3 px"}
-ZOOMS = {"1": "1×", "1.25": "1.25×", "1.5": "1.5×", "2": "2×"}
 POSITIONS = {"top-left": "Сверху слева", "top-right": "Сверху справа",
              "bottom-left": "Снизу слева", "bottom-right": "Снизу справа"}
 DISCORD = "https://discord.com/users/320909791826280452"
@@ -406,9 +411,104 @@ class SizePick(tk.Frame):
         (self.note if core.exact_of(fmt) else self.choice).pack(anchor="w")
 
 
+class Slider(tk.Canvas):
+    def __init__(self, parent, lo, hi, value, on_move, on_done=None, width=None, step=1, fmt=None):
+        self.w, self.h = width or px(260), px(30)
+        super().__init__(parent, width=self.w, height=self.h, bg=parent["bg"], highlightthickness=0, bd=0,
+                         cursor="hand2", takefocus=1)
+        self.lo, self.hi, self.step = lo, hi, step
+        self.fmt = fmt or (lambda v: f"{v:g}")
+        self.on_move, self.on_done = on_move, on_done or on_move
+        self.value = self.snap(value)
+        self.focused = False
+        self.bind("<ButtonPress-1>", self.press)
+        self.bind("<B1-Motion>", self.press)
+        self.bind("<ButtonRelease-1>", lambda _: self.on_done(self.value))
+        self.bind("<MouseWheel>", lambda e: self.nudge(1 if e.delta > 0 else -1))
+        self.bind("<Key-Left>", lambda _: self.nudge(-1))
+        self.bind("<Key-Right>", lambda _: self.nudge(1))
+        self.bind("<FocusIn>", lambda _: self.focus_to(True))
+        self.bind("<FocusOut>", lambda _: self.focus_to(False))
+        self.draw()
+
+    def snap(self, v):
+        v = round(round((v - self.lo) / self.step) * self.step + self.lo, 4)
+        return min(max(v, self.lo), self.hi)
+
+    def track(self):
+        return px(9), self.w - px(64)
+
+    def press(self, e):
+        self.focus_set()
+        a, b = self.track()
+        self.move_to(self.lo + (e.x - a) / (b - a) * (self.hi - self.lo), self.on_move)
+
+    def nudge(self, k):
+        self.move_to(self.value + k * self.step, self.on_done)
+
+    def move_to(self, v, notify):
+        v = self.snap(v)
+        if v != self.value:
+            self.value = v
+            self.draw()
+            notify(v)
+
+    def set(self, v):
+        v = self.snap(v)
+        if v != self.value:
+            self.value = v
+            self.draw()
+
+    def focus_to(self, on):
+        self.focused = on
+        self.draw()
+
+    def draw(self):
+        a, b = self.track()
+        y, r = self.h // 2, px(8)
+        x = a + (self.value - self.lo) / (self.hi - self.lo) * (b - a)
+        self.delete("all")
+        self.create_line(a, y, b, y, fill=MIST, width=px(4), capstyle="round")
+        self.create_line(a, y, x, y, fill=WHITE, width=px(4), capstyle="round")
+        self.knob = ImageTk.PhotoImage(rounded(2 * r, 2 * r, r, WHITE, SUB if self.focused else VOID, 2.0))
+        self.create_image(x, y, image=self.knob)
+        self.create_text(self.w, y, anchor="e", text=self.fmt(self.value), fill=WHITE, font=(FONT["semi"], 10))
+
+
+class Loupe:
+    def __init__(self, canvas):
+        self.c = canvas
+        self.photo = None
+
+    def show(self, x, y, rect, arr):
+        ix, iy, dw, dh = rect
+        H, W = arr.shape[:2]
+        side = px(240)
+        cx, cy = (x - ix) * W / dw, (y - iy) * H / dh
+        x0 = int(min(max(cx - side / 2, 0), max(W - side, 0)))
+        y0 = int(min(max(cy - side / 2, 0), max(H - side, 0)))
+        crop = arr[y0:y0 + side, x0:x0 + side]
+        h, w = crop.shape[:2]
+        self.photo = ImageTk.PhotoImage(Image.fromarray(crop))
+        gap = px(28)
+        lx = x + gap if x + gap + w < self.c.winfo_width() else x - gap - w
+        ly = min(max(y - h / 2, px(4)), self.c.winfo_height() - h - px(4))
+        self.c.delete("loupe")
+        self.c.create_rectangle(lx - 2, ly - 2, lx + w + 1, ly + h + 1, outline=WHITE, fill=VOID, tags=("loupe",))
+        self.c.create_image(lx, ly, anchor="nw", image=self.photo, tags=("loupe",))
+        self.c.create_rectangle(lx, ly, lx + px(34), ly + px(20), outline="", fill=VOID, tags=("loupe",))
+        self.c.create_text(lx + px(17), ly + px(10), text="1:1", fill=WHITE, font=(FONT["semi"], 9), tags=("loupe",))
+
+    def hide(self):
+        self.c.delete("loupe")
+        self.photo = None
+
+
 class Painter:
     def __init__(self, canvas):
         self.c = canvas
+        self.join_key = None
+        self.join_img = None
         self.key = None
         self.layer = None
         self.photos = []
@@ -417,6 +517,7 @@ class Painter:
         self.small = {}
         self.layers = []
         self.pieces = {}
+        self.soft = {}
 
     def frame(self, bg, rect, size):
         x0, y0, x1, y1 = rect
@@ -439,7 +540,10 @@ class Painter:
         d = min(aw / out_w, ah / out_h)
         dw, dh = max(1, round(out_w * d)), max(1, round(out_h * d))
         ix, iy = ax + (aw - dw) // 2, ay + (ah - dh) // 2
-        frame = self.frame(bg, p["rect"], (dw, dh))
+        if p["size"] == p["base"]:
+            frame = self.frame(bg, p["rect"], (dw, dh))
+        else:
+            frame = self.joined(shot, p, d, (dw, dh))
         groups = core.parts(rows, edit)
         key = (id(shot), shot.get("name"), id(rows), len(rows), tuple(r["keep"] for r in rows),
                tuple((tuple(map(tuple, r.get("hide", []))), tuple(map(tuple, r.get("drop", [])))) for r in rows),
@@ -454,7 +558,10 @@ class Painter:
         self.c.create_image(ix, iy, anchor="nw", image=self.photos[0], tags=(tag,))
         pad = p["outline"] + 2
         geo = {"img": (ix, iy, dw, dh), "d": d, "out": (out_w, out_h), "plan": p, "pad": pad, "chats": [],
-               "painted": sum(n for _, n, _ in self.layers), "overlays": []}
+               "painted": sum(n for _, n, _ in self.layers), "overlays": [], "join": None}
+        if p["ext_box"]:
+            l, t, r, b = p["ext_box"]
+            geo["join"] = (ix + l * d, iy + t * d, ix + r * d, iy + b * d)
         self.draw_overlays(shot, geo, tag)
         for k, ((layer, _, _), (_, pos)) in enumerate(zip(self.layers, groups)):
             if layer is None:
@@ -473,6 +580,16 @@ class Painter:
         self.geo = geo
         return geo
 
+    def joined(self, shot, p, d, size):
+        join = shot["edit"]["join"]
+        key = (id(shot["bg"]), p["rect"], size, json.dumps(join, sort_keys=True))
+        if key != self.join_key:
+            bw, bh = p["base"]
+            base = self.frame(shot["bg"], p["rect"], (max(1, round(bw * d)), max(1, round(bh * d))))
+            img = core.join_canvas(base, join)
+            self.join_key, self.join_img = key, img if img.size == size else img.resize(size, Image.BILINEAR)
+        return self.join_img
+
     def draw_overlays(self, shot, geo, tag):
         out, overlays = shot.get("out"), shot["edit"].get("overlays", [])
         ix, iy, dw, dh = geo["img"]
@@ -488,15 +605,21 @@ class Painter:
             x, y, w, h = core.overlay_box(ov, (out_w, out_h), source.size)
             dx, dy = round(ix + x * d), round(iy + y * d)
             size = (max(1, round(w * d)), max(1, round(h * d)))
-            key = (ov["file"], tuple(ov["crop"]), size)
-            if key not in self.pieces:
-                self.pieces[key] = core.overlay_piece(source, ov, size)
+            edges = core.soft_edges((x, y, w, h), (out_w, out_h))
+            base = (ov["file"], tuple(ov["crop"]), size)
+            key = base + (ov.get("soft", 0.0), ov.get("alpha", 1.0), edges)
+            if base not in self.pieces:
+                self.pieces[base] = core.overlay_piece(source, ov, size)
+            if key not in self.soft:
+                if len(self.soft) > 24:
+                    self.soft.clear()
+                self.soft[key] = core.soften(self.pieces[base], ov, edges)
             l, t = max(ix, dx), max(iy, dy)
             r, b = min(ix + dw, dx + size[0]), min(iy + dh, dy + size[1])
             if r <= l or b <= t:
                 geo["overlays"].append(None)
                 continue
-            photo = ImageTk.PhotoImage(self.pieces[key].crop((l - dx, t - dy, r - dx, b - dy)))
+            photo = ImageTk.PhotoImage(self.soft[key].crop((l - dx, t - dy, r - dx, b - dy)))
             self.photos.append(photo)
             self.c.create_image(l, t, anchor="nw", image=photo, tags=(tag, tag + "-ov", f"{tag}-ov{k}"))
             geo["overlays"].append({"x": dx, "y": dy, "w": size[0], "h": size[1], "box": (l, t, r, b)})
@@ -529,6 +652,17 @@ class Feed:
         self.pending_media = False
         self.media_src = None
         self.resize_job = None
+        self.thumbs = {}
+        self.sliders = {}
+        self.sheet_tool = None
+        self.sheet_offset = 0
+        self.preview = None
+        self.preview_info = None
+        self.preview_rev = 0
+        self.preview_job = None
+        self.preview_photo = None
+        self.loupe = Loupe(self.c)
+        self.c.bind("<Leave>", lambda _: self.loupe.hide())
         self.c.bind("<Configure>", lambda _: self.settle())
         self.c.bind("<ButtonPress-1>", self.press)
         self.c.bind("<B1-Motion>", self.motion)
@@ -560,6 +694,8 @@ class Feed:
         self.flush_save()
         name = self.name
         self.shot = None
+        self.preview = self.preview_info = None
+        self.loupe.hide()
         if name is None:
             self.redraw()
             return
@@ -739,26 +875,36 @@ class Feed:
             self.draw_saved(area, name)
         elif self.tool == "lines":
             self.draw_lines(area)
+        elif self.tool in ("carry", "photopick"):
+            self.draw_donors(area)
         else:
-            geo = self.painter.draw(self.shot, area)
-            if self.tool == "crop":
-                ix, iy, dw, dh = geo["img"]
-                self.c.create_rectangle(ix - 1, iy - 1, ix + dw, iy + dh, outline=WHITE, width=1, tags=("shot",))
-            self.mark_overlay(geo)
+            self.decorate(self.painter.draw(self.shot, area))
         if self.tool:
             self.build_sheet(H)
         else:
             self.caption(H, name, view_only)
         tools = [] if self.shot is None else [
-            ("lines", "Строки", lambda: self.toggle_tool("lines"), self.tool == "lines"),
+            ("lines", "Строки", lambda: self.toggle_tool("lines"), self.tool in ("lines", "carry")),
             ("crop", "Кадр", lambda: self.toggle_tool("crop"), self.tool == "crop"),
             ("text", "Текст", lambda: self.toggle_tool("text"), self.tool == "text"),
-            ("images", "Картинки", lambda: self.toggle_tool("images"), self.tool == "images"),
+            ("images", "Картинки", lambda: self.toggle_tool("images"), self.tool in ("images", "photopick")),
+            ("file", "Файл", lambda: self.toggle_tool("file"), self.tool == "file"),
         ]
         if self.shot is not None or view_only:
             tools.append(("copy", "Копировать", self.copy, False))
         tools.append(("folder", "В папке", self.open_folder, False))
         self.rail(W, H, tools)
+
+    def decorate(self, geo):
+        ix, iy, dw, dh = geo["img"]
+        if self.tool == "crop":
+            self.c.create_rectangle(ix - 1, iy - 1, ix + dw, iy + dh, outline=WHITE, width=1, tags=("shot",))
+            if geo["join"]:
+                l, t, r, b = geo["join"]
+                self.c.create_rectangle(l, t, r - 1, b - 1, outline=WHITE, width=1, dash=(4, 3), tags=("shot",))
+        elif self.tool == "file":
+            self.draw_preview(geo)
+        self.mark_overlay(geo)
 
     def draw_saved(self, area, name):
         ax, ay, aw, ah = area
@@ -778,7 +924,7 @@ class Feed:
         parts = [f"{w} × {h}"]
         geo = self.painter.geo
         kept = sum(r["keep"] for r in self.shot["rows"])
-        if geo and self.tool != "lines" and geo["painted"] < kept:
+        if geo and self.tool not in ("lines", "carry", "photopick") and geo["painted"] < kept:
             parts.append(f"влезло {geo['painted']} из {kept} строк")
         if self.note:
             parts.append(self.note)
@@ -794,14 +940,15 @@ class Feed:
             hint = "Исходные кадры этой СС не найдены, её можно только посмотреть и скопировать."
         else:
             hint = ("Чат можно перетащить мышью, у краёв он прилипает к углам. "
-                    "Строки, кадр, текст и картинки — справа или клавишами 1–4. Колесо мыши листает СС.")
+                    "Строки, кадр, текст, картинки и файл — справа или клавишами 1–5. Колесо мыши листает СС.")
         self.text(x, y, hint, (FONT["ui"], 10), SUB, width)
         self.lift_block("cap", H - PAD - px(12))
 
     def rail(self, W, H, items):
         cx = W - RAIL_W / 2
-        step = px(76)
-        y = H / 2 - (len(items) * step) / 2 + px(20)
+        top, bottom = PAD, H - PAD - (px(86) if self.names else 0)
+        step = min(px(76), (bottom - top) / max(1, len(items)))
+        y = (top + bottom) / 2 - step * (len(items) - 1) / 2 - px(9)
         for key, label, command, active in items:
             tag = f"rail-{key}"
             if active:
@@ -839,16 +986,21 @@ class Feed:
     def toggle_tool(self, tool):
         self.tool = None if self.tool == tool else tool
         self.offset = 0
+        self.loupe.hide()
+        if self.tool == "file":
+            self.preview = self.preview_info = None
+            self.want_preview()
         self.redraw()
 
     def build_sheet(self, H):
         sheet = tk.Frame(self.c, bg=VOID)
         self.sheet_w = SIDE_W - 2 * PAD - px(12)
-        sheet.place(x=PAD + px(12), y=PAD, width=self.sheet_w, height=H - 2 * PAD)
+        sheet.place(x=PAD + px(12), y=PAD, width=self.sheet_w + px(12), height=H - 2 * PAD)
         self.sheet = sheet
         head = tk.Frame(sheet, bg=VOID)
-        head.pack(fill="x")
-        title = {"lines": "Строки чата", "crop": "Кадр", "text": "Текст", "images": "Картинки"}[self.tool]
+        head.pack(fill="x", padx=(0, px(12)))
+        title = {"lines": "Строки чата", "crop": "Кадр", "text": "Текст", "images": "Картинки", "file": "Файл",
+                 "carry": "Чат из другой СС", "photopick": "Фото из другой СС"}[self.tool]
         tk.Label(head, text=title, bg=VOID, fg=WHITE, font=(FONT["display"], 20)).pack(side="left")
         close = tk.Label(head, text=ICONS["close"] if FONT["icon"] else "Закрыть", bg=VOID, fg=SUB, cursor="hand2",
                          font=(FONT["icon"], 12) if FONT["icon"] else (FONT["ui"], 10))
@@ -856,71 +1008,168 @@ class Feed:
         close.bind("<Button-1>", lambda _: self.toggle_tool(self.tool))
         close.bind("<Enter>", lambda _: close.config(fg=WHITE))
         close.bind("<Leave>", lambda _: close.config(fg=SUB))
-        body = tk.Frame(sheet, bg=VOID)
-        body.pack(fill="both", expand=True, pady=(px(18), 0))
+        holder = tk.Frame(sheet, bg=VOID)
+        holder.pack(fill="both", expand=True, pady=(px(18), px(8)))
+        body = tk.Frame(holder, bg=VOID)
+        body.place(x=0, y=0, width=self.sheet_w)
+        self.sheet_holder, self.sheet_body = holder, body
+        self.sheet_thumb = tk.Frame(holder, bg=LINE)
+        if self.tool != self.sheet_tool:
+            self.sheet_tool, self.sheet_offset = self.tool, 0
+        self.sliders = {}
         getattr(self, "sheet_" + self.tool)(body)
         self.sheet_meta = tk.Label(sheet, text=self.meta(), bg=VOID, fg=SUB, font=(FONT["ui"], 10), anchor="w",
                                    justify="left", wraplength=self.sheet_w)
-        self.sheet_meta.pack(fill="x")
+        self.sheet_meta.pack(fill="x", padx=(0, px(12)))
+        self.bind_sheet_wheel(holder)
+        holder.bind("<Configure>", lambda _: self.scroll_sheet(0))
+        body.bind("<Configure>", lambda _: self.scroll_sheet(0))
+
+    def bind_sheet_wheel(self, widget):
+        if not isinstance(widget, Slider):
+            widget.bind("<MouseWheel>", lambda e: self.scroll_sheet(-px(60) if e.delta > 0 else px(60)), add="+")
+        for child in widget.winfo_children():
+            self.bind_sheet_wheel(child)
+
+    def scroll_sheet(self, delta):
+        holder, body = self.sheet_holder, self.sheet_body
+        if not holder.winfo_exists():
+            return
+        seen, full = holder.winfo_height(), body.winfo_reqheight()
+        self.sheet_offset = max(0, min(self.sheet_offset + delta, full - seen))
+        body.place_configure(y=-self.sheet_offset)
+        if full > seen > 1:
+            h = max(px(24), seen * seen / full)
+            self.sheet_thumb.place(x=self.sheet_w + px(6), y=(seen - h) * self.sheet_offset / (full - seen),
+                                   width=px(3), height=h)
+        else:
+            self.sheet_thumb.place_forget()
 
     def label(self, parent, text, top=0):
         tk.Label(parent, text=text, bg=VOID, fg=SUB, font=(FONT["ui"], 10), anchor="w", justify="left",
                  wraplength=self.sheet_w).pack(fill="x", pady=(px(top), px(8)))
 
+    def field(self, parent, text, top=14):
+        tk.Label(parent, text=text, bg=VOID, fg=WHITE, font=(FONT["semi"], 10), anchor="w").pack(
+            fill="x", pady=(px(top), px(6)))
+
     def choice(self, body, options, value, on_pick, **kw):
         Choice(body, options, value, on_pick, wrap=self.sheet_w, **kw).pack(anchor="w")
 
+    def slider(self, body, lo, hi, value, on_change, **kw):
+        bar = Slider(body, lo, hi, value, on_change, width=self.sheet_w, **kw)
+        bar.pack(anchor="w")
+        return bar
+
+    def buttons(self, body, items, top=0):
+        line = tk.Frame(body, bg=VOID)
+        line.pack(anchor="w", pady=(px(top), 0))
+        for text, command in items:
+            Pill(line, text, command, kind="ghost").pack(side="left", padx=(0, px(6)))
+
     def sheet_lines(self, body):
-        self.label(body, "Нажимай на строки справа: белая галочка — строка в СС, пустой квадрат — убрана. "
-                         "Колесо мыши прокручивает список.")
-        self.label(body, "Ножницы у строки делят чат на части, до трёх. Каждую часть можно поставить в свой угол "
-                         "или перетащить на картинке.", 6)
-        self.label(body, "Клик по строке", 6)
+        self.field(body, "Клик по строке", 0)
         self.choice(body, CLICKS, self.click_mode, self.set_click)
-        self.label(body, "Скрытое слово закрывается плашкой под цвет реплики, удалённое пропадает вместе с "
-                         "пробелом. Повторный клик возвращает слово.", 6)
+        self.click_hint = tk.Label(body, text=CLICK_HINTS[self.click_mode], bg=VOID, fg=SUB, font=(FONT["ui"], 10),
+                                   anchor="w", justify="left", wraplength=self.sheet_w)
+        self.click_hint.pack(fill="x", pady=(px(2), 0))
         self.count = tk.Label(body, text=self.count_text(), bg=VOID, fg=WHITE, font=(FONT["semi"], 12), anchor="w")
-        self.count.pack(fill="x", pady=(px(6), px(14)))
-        Pill(body, "Как после съёмки", self.reset_lines, kind="ghost").pack(anchor="w")
+        self.count.pack(fill="x", pady=(px(18), px(10)))
+        self.buttons(body, (("Как после съёмки", self.reset_lines), ("Чат из другой СС", lambda: self.toggle_tool("carry"))))
+        self.label(body, "Галочка — строка в СС. Зажми и веди мышью, чтобы отметить несколько строк подряд. Ножницы "
+                         "у строки делят чат на части, до трёх. Колесо прокручивает список.", 18)
+
+    def sheet_carry(self, body):
+        self.label(body, "Нажми на СС справа: её чат добавится к этой. Повторы склеятся сами, лишние строки "
+                         "убираются в «Строках» как обычно.")
+        self.label(body, "Так можно снять сцену с разных ракурсов и собрать реплики на одном кадре. Здесь "
+                         "ближайшие по времени СС, у которых сохранились исходные кадры.", 6)
+        Pill(body, "Назад к строкам", lambda: self.toggle_tool("lines"), kind="ghost").pack(anchor="w", pady=(px(8), 0))
 
     def sheet_crop(self, body):
         edit = self.shot["edit"]
-        self.label(body, "Формат")
-        FramePick(body, edit["format"], self.set_frame, lambda: core.plan(self.shot["bg"], self.shot["edit"])["size"],
+        self.field(body, "Формат", 0)
+        FramePick(body, edit["format"], self.set_frame, lambda: core.plan(self.shot["bg"], self.shot["edit"])["base"],
                   self.sheet_w).pack(anchor="w")
-        self.label(body, "Приближение", 12)
-        self.choice(body, ZOOMS, edit["zoom"], lambda v: self.change(zoom=float(v)))
-        self.label(body, "Размер файла", 12)
-        self.size_pick = SizePick(body, edit["size"], lambda v: self.change(size=v), self.sheet_w)
-        self.size_pick.pack(fill="x")
-        self.size_pick.show(edit["format"])
-        self.label(body, "Файл", 12)
-        self.choice(body, FILES, edit["file"], lambda v: self.change(file=v))
-        self.label(body, "Тяни картинку мышью, чтобы выбрать, что попадёт в кадр. Ctrl + колесо — приближение.", 12)
-        Pill(body, "По центру", lambda: self.change(center=[0.5, 0.5]), kind="ghost").pack(anchor="w")
+        self.field(body, "Приближение")
+        zoom = self.slider(body, 1.0, 3.0, edit["zoom"], lambda v: self.change(zoom=v), step=0.05,
+                           fmt=lambda v: f"{v:.2f}×")
+        self.sliders["zoom"] = (zoom, lambda: self.shot["edit"]["zoom"])
+        self.buttons(body, (("По центру", lambda: self.change(center=[0.5, 0.5])),), 12)
+        self.label(body, "Тяни картинку мышью, чтобы выбрать, что попадёт в кадр. Ctrl + колесо — приближение.", 10)
+        join = edit.get("join") or {}
+        side = join.get("side") if join.get("side") in core.JOIN_SIDES else "none"
+        self.field(body, "Расширить поле кадра", 8)
+        self.choice(body, SIDES, side, self.set_field_side)
+        if side == "none":
+            self.label(body, "Кадр станет больше, а СС останется своего размера: место для второго ракурса или чата.",
+                       4)
+            return
+        pct = lambda v: f"{v:.0f}%"
+        self.field(body, "Насколько")
+        self.slider(body, 10, 100, round(join["size"] * 100), lambda v: self.change_field(size=v / 100), fmt=pct)
+        self.field(body, "Мягкий край СС")
+        self.slider(body, 0, 100, round(join["fade"] * 100), lambda v: self.change_field(fade=v / 100), fmt=pct)
+        self.label(body, "Новое место заполнено размытым продолжением СС. Положи туда второй ракурс из «Картинок» "
+                         "или отнеси чат.", 10)
+
+    def set_field_side(self, side):
+        edit = self.shot["edit"]
+        edit["join"] = dict(edit.get("join") or FIELD_DEFAULT, side=side)
+        self.redraw()
+        self.schedule_save()
+
+    def change_field(self, **values):
+        self.shot["edit"]["join"].update(values)
+        self.media_redraw()
+        self.schedule_save()
 
     def set_frame(self, value):
         self.change(format=value, center=[0.5, 0.5])
-        self.size_pick.show(value)
 
     def sheet_text(self, body):
         edit = self.shot["edit"]
-        self.label(body, "Размер текста")
+        self.field(body, "Размер текста", 0)
         self.choice(body, SCALES, edit["text_scale"], lambda v: self.change(text_scale=float(v)))
-        self.label(body, "Обводка", 12)
+        self.field(body, "Обводка")
         self.choice(body, OUTLINES, edit["outline"], lambda v: self.change(outline=int(v)))
         spots = [pos for _, pos in core.parts(self.shot["rows"], edit)]
         for k, pos in enumerate(spots):
-            self.label(body, "Угол" if len(spots) == 1 else f"Угол, часть {k + 1}", 12)
+            self.field(body, "Угол" if len(spots) == 1 else f"Угол, часть {k + 1}")
             self.choice(body, POSITIONS, pos if isinstance(pos, str) else None,
                         lambda v, k=k: self.pick_place(k, v), cols=2)
         self.label(body, "Или перетащи чат прямо на картинке.", 6)
+
+    def sheet_file(self, body):
+        edit = self.shot["edit"]
+        self.field(body, "Размер", 0)
+        pick = SizePick(body, edit["size"], lambda v: self.change(size=v), self.sheet_w)
+        pick.pack(fill="x")
+        pick.show(edit["format"])
+        self.field(body, "Формат")
+        self.choice(body, FILES, edit["file"], self.set_file)
+        if edit["file"] == "jpg":
+            self.field(body, "Качество фона")
+            quality = self.slider(body, 10, 100, edit.get("quality", core.TEXT_QUALITY),
+                                  lambda v: self.change(quality=int(v)), fmt=lambda v: f"{v:.0f}")
+            self.sliders["quality"] = (quality, lambda: self.shot["edit"].get("quality", core.TEXT_QUALITY))
+            self.label(body, "Сжимается только фон, текст чата всегда остаётся чётким. 92 — как раньше.", 4)
+        self.file_info = tk.Label(body, text=self.preview_info or "считаю размер…", bg=VOID, fg=WHITE,
+                                  font=(FONT["semi"], 12), anchor="w")
+        self.file_info.pack(fill="x", pady=(px(18), px(2)))
+        self.label(body, "Картинка справа — точно как будет в файле. Наведи на неё: лупа покажет пиксели 1:1.")
+
+    def set_file(self, value):
+        self.change(file=value)
+        self.redraw()
 
     def change(self, **values):
         if self.shot is None:
             return
         self.shot["edit"].update(values)
         self.media_redraw()
+        if self.tool == "file":
+            self.want_preview()
         self.schedule_save()
 
     def media_redraw(self):
@@ -928,15 +1177,58 @@ class Feed:
             return
         if self.tool == "lines":
             self.draw_lines(self.area())
-        else:
+        elif self.tool not in ("carry", "photopick"):
             self.c.delete("shot")
-            geo = self.painter.draw(self.shot, self.area())
-            if self.tool == "crop":
-                ix, iy, dw, dh = geo["img"]
-                self.c.create_rectangle(ix - 1, iy - 1, ix + dw, iy + dh, outline=WHITE, width=1, tags=("shot",))
-            self.mark_overlay(geo)
+            self.decorate(self.painter.draw(self.shot, self.area()))
             self.c.tag_lower("shot")
+        for bar, value in self.sliders.values():
+            if bar.winfo_exists():
+                bar.set(value())
         self.update_meta()
+
+    def want_preview(self):
+        self.preview_rev += 1
+        if self.preview_job:
+            self.c.after_cancel(self.preview_job)
+        self.preview_job = self.c.after(150, self.encode_preview)
+
+    def encode_preview(self):
+        self.preview_job = None
+        if self.shot is None or self.tool != "file":
+            return
+        snap, key = self.snapshot(), (self.name, self.preview_rev)
+
+        def work():
+            try:
+                img, _, data = core.encoded(snap)
+                arr = core.decoded(data) if snap["edit"]["file"] == "jpg" else img
+                self.app.inbox.put(("previewed", key, (arr, len(data))))
+            except Exception as e:
+                self.app.inbox.put(("previewed", key, str(e)))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def previewed(self, key, value):
+        if key != (self.name, self.preview_rev) or self.tool != "file":
+            return
+        if isinstance(value, str):
+            self.preview_info = f"размер не посчитался: {value}"
+        else:
+            self.preview, size = value
+            self.preview_info = f"≈ {megabytes(size)} · {self.preview.shape[1]} × {self.preview.shape[0]}"
+            self.media_redraw()
+        if self.sheet is not None and self.file_info.winfo_exists():
+            self.file_info.config(text=self.preview_info)
+
+    def draw_preview(self, geo):
+        if self.preview is None:
+            return
+        ix, iy, dw, dh = geo["img"]
+        key = (id(self.preview), dw, dh)
+        if self.preview_photo is None or self.preview_photo[0] != key:
+            img = Image.fromarray(self.preview).resize((dw, dh), Image.BILINEAR, reducing_gap=2.0)
+            self.preview_photo = (key, ImageTk.PhotoImage(img))
+        self.c.create_image(ix, iy, anchor="nw", image=self.preview_photo[1], tags=("shot",))
 
     def update_meta(self):
         if self.sheet is not None:
@@ -956,6 +1248,7 @@ class Feed:
         self.offset = max(0, min(self.offset, max(0, slot * len(rows) + px(24) - ah)))
         self.c.create_rectangle(ax, ay, ax + aw, ay + ah, fill=BLACK, outline="", tags=("shot",))
         y = ay + px(12) - self.offset
+        self.lines_top, self.lines_slot = y, slot
         self.row_photos = []
         on, off = ImageTk.PhotoImage(tick(px(18), True)), ImageTk.PhotoImage(tick(px(18), False))
         self.row_photos += [on, off]
@@ -1001,6 +1294,7 @@ class Feed:
 
     def set_click(self, value):
         self.click_mode = value
+        self.click_hint.config(text=CLICK_HINTS[value])
 
     def toggle_word(self, i, x, key):
         r = self.shot["rows"][i]
@@ -1041,40 +1335,54 @@ class Feed:
 
     def sheet_images(self, body):
         overlays = self.shot["edit"].setdefault("overlays", [])
-        self.label(body, "Картинки поверх СС: коллажи, вставки, стикеры. Тяни картинку мышью, колесо меняет "
-                         "размер. Белые метки по краям обрезают картинку, Shift + тяни внутри — сдвигает обрезку.")
-        line = tk.Frame(body, bg=VOID)
-        line.pack(anchor="w", pady=(px(4), 0))
-        Pill(line, "Из файла", self.add_file, kind="ghost").pack(side="left", padx=(0, px(6)))
-        Pill(line, "Из буфера", self.add_clipboard, kind="ghost").pack(side="left")
-        if not overlays:
-            return
-        self.active_ov = min(self.active_ov, len(overlays) - 1)
-        ov = overlays[self.active_ov]
-        if len(overlays) > 1:
-            self.label(body, "Картинка", 12)
-            self.choice(body, {str(i): str(i + 1) for i in range(len(overlays))}, str(self.active_ov),
-                        lambda v: self.select_ov(int(v)))
-        self.label(body, "Обрезка", 12)
-        FramePick(body, ov.get("cut", "free"), self.crop_ov, self.crop_size, self.sheet_w, CROPS, (16, 20000)).pack(
-            anchor="w")
-        Pill(body, "Сбросить обрезку", lambda: self.crop_ov("reset"), kind="ghost").pack(anchor="w", pady=(px(8), 0))
-        self.label(body, "Размер по ширине кадра", 12)
-        self.choice(body, OV_SIZES, ov["w"], lambda v: self.change_ov(w=float(v)))
-        Pill(body, "Убрать картинку", self.remove_ov, kind="ghost").pack(anchor="w", pady=(px(16), 0))
+        self.label(body, "Второй ракурс, коллаж или стикер поверх кадра. С мягкими краями фото растворяется в СС, как "
+                         "двойная экспозиция. Если в «Кадре» расширено поле, фото само встанет на новое место.")
+        self.buttons(body, (("Из файла", self.add_file), ("Из буфера", self.add_clipboard)))
+        self.buttons(body, (("Из другой СС", lambda: self.toggle_tool("photopick")),), 6)
+        if overlays:
+            self.active_ov = min(self.active_ov, len(overlays) - 1)
+            ov = overlays[self.active_ov]
+            pct = lambda v: f"{v:.0f}%"
+            if len(overlays) > 1:
+                self.field(body, "Картинка")
+                self.choice(body, {str(i): str(i + 1) for i in range(len(overlays))}, str(self.active_ov),
+                            lambda v: self.select_ov(int(v)))
+            self.field(body, "Размер по ширине кадра")
+            size = self.slider(body, 5, 200, round(ov["w"] * 100), lambda v: self.change_ov(w=round(v / 100, 4)),
+                               fmt=pct)
+            self.sliders["ov"] = (size, lambda: round(self.shot["edit"]["overlays"][self.active_ov]["w"] * 100))
+            self.field(body, "Мягкие края")
+            self.slider(body, 0, 100, round(ov.get("soft", 0.0) * 100), lambda v: self.change_ov(soft=v / 100),
+                        fmt=pct)
+            self.field(body, "Прозрачность")
+            self.slider(body, 0, 90, round((1 - ov.get("alpha", 1.0)) * 100),
+                        lambda v: self.change_ov(alpha=round(1 - v / 100, 2)), fmt=pct)
+            self.field(body, "Обрезка")
+            FramePick(body, ov.get("cut", "free"), self.crop_ov, self.crop_size, self.sheet_w, CROPS,
+                      (16, 20000)).pack(anchor="w")
+            self.buttons(body, (("Сбросить обрезку", lambda: self.crop_ov("reset")), ("Убрать", self.remove_ov)), 8)
+        self.label(body, "Тяни картинку мышью, колесо меняет размер. У границы кадра картинка прилипает, и этот край "
+                         "остаётся чётким. Белые метки обрезают её, Shift + тяни внутри — сдвигает обрезку.", 16)
 
-    def add_file(self):
-        path = filedialog.askopenfilename(title="Картинка поверх СС", filetypes=[
+    def sheet_photopick(self, body):
+        self.label(body, "Нажми на СС справа: её фон ляжет поверх этой с мягкими краями. Чат той СС не переносится, "
+                         "для этого есть «Чат из другой СС» в «Строках».")
+        Pill(body, "Назад", lambda: self.toggle_tool("images"), kind="ghost").pack(anchor="w", pady=(px(8), 0))
+
+    def pick_file(self, title):
+        path = filedialog.askopenfilename(title=title, filetypes=[
             ("Картинки", "*.png *.jpg *.jpeg *.webp *.bmp *.gif"), ("Все файлы", "*.*")])
-        if path:
-            try:
-                with Image.open(path) as im:
-                    self.add_image(im.copy())
-            except OSError as e:
-                self.note = f"картинка не открылась: {e}"
-                self.update_meta()
+        if not path:
+            return None
+        try:
+            with Image.open(path) as im:
+                return im.copy()
+        except OSError as e:
+            self.note = f"картинка не открылась: {e}"
+            self.update_meta()
+            return None
 
-    def add_clipboard(self):
+    def clipboard_image(self):
         try:
             data = ImageGrab.grabclipboard()
             if isinstance(data, list):
@@ -1085,8 +1393,18 @@ class Feed:
         if not isinstance(data, Image.Image):
             self.note = "в буфере обмена нет картинки"
             self.update_meta()
-            return
-        self.add_image(data)
+            return None
+        return data
+
+    def add_file(self):
+        image = self.pick_file("Картинка поверх СС")
+        if image is not None:
+            self.add_image(image)
+
+    def add_clipboard(self):
+        image = self.clipboard_image()
+        if image is not None:
+            self.add_image(image)
 
     def add_image(self, image):
         overlays = self.shot["edit"].setdefault("overlays", [])
@@ -1095,11 +1413,15 @@ class Feed:
             self.update_meta()
             return
         try:
-            overlays.append(core.add_overlay(self.shot["out"], self.shot["name"], image))
+            ov = core.add_overlay(self.shot["out"], self.shot["name"], image)
         except OSError as e:
             self.note = f"картинка не сохранилась: {e}"
             self.update_meta()
             return
+        p = core.plan(self.shot["bg"], self.shot["edit"])
+        if p["ext_box"] and ov["soft"]:
+            core.fit_field(ov, p, image.size)
+        overlays.append(ov)
         self.active_ov = len(overlays) - 1
         self.redraw()
         self.schedule_save()
@@ -1199,13 +1521,104 @@ class Feed:
         self.media_redraw()
         self.schedule_save()
 
-    def toggle_row(self, i):
+    def row_at(self, y):
+        return min(max(int((y - self.lines_top) // self.lines_slot), 0), len(self.shot["rows"]) - 1)
+
+    def mark_rows(self, a, b):
         rows = self.shot["rows"]
-        rows[i]["keep"] = not rows[i]["keep"]
+        for r in rows[min(a, b):max(a, b) + 1]:
+            r["keep"] = self.drag["keep"]
         self.shot["edit"]["keep"] = [r["keep"] for r in rows]
         self.draw_lines(self.area())
         self.count.config(text=self.count_text())
-        self.schedule_save()
+
+    def draw_donors(self, area):
+        self.c.delete("shot")
+        ax, ay, aw, ah = area
+        out = self.shot["out"]
+        names = core.donors(out, self.name, self.names)
+        if not names:
+            self.c.create_text(ax + aw // 2, ay + ah // 2, text="Других СС с исходными кадрами нет", fill=SUB,
+                               font=(FONT["ui"], 12), tags=("shot",))
+            return
+        cols = 2 if len(names) <= 4 else 3 if len(names) <= 9 else 4
+        lines = -(-len(names) // cols)
+        gap, cap = px(16), px(28)
+        cw = (aw - gap * (cols - 1)) / cols
+        ch = min(cw * 0.75, (ah - gap * (lines - 1)) / lines - cap)
+        top = ay + (ah - lines * (ch + cap) - gap * (lines - 1)) / 2
+        for k, name in enumerate(names):
+            x, y = ax + (k % cols) * (cw + gap), top + (k // cols) * (ch + cap + gap)
+            tag = f"donor{k}"
+            photo = self.thumb(out, name, (max(1, round(cw)), max(1, round(ch))))
+            w, h = (photo.width(), photo.height()) if photo else (round(cw), round(ch))
+            left, up = x + (cw - w) / 2, y + (ch - h) / 2
+            if photo:
+                self.c.create_image(left, up, anchor="nw", image=photo, tags=("shot", tag))
+            self.c.create_rectangle(left - 1, up - 1, left + w, up + h, outline=HAIR, fill="" if photo else ROW,
+                                    tags=("shot", tag, tag + "-box"))
+            self.c.create_text(left, up + h + px(8), text=when(name), anchor="nw", fill=SUB, font=(FONT["ui"], 10),
+                               tags=("shot", tag, tag + "-label"))
+            self.c.tag_bind(tag, "<Button-1>", lambda _, n=name: self.donor_pick(n))
+            self.c.tag_bind(tag, "<Enter>", lambda _, t=tag: (self.c.itemconfig(t + "-box", outline=WHITE),
+                                                              self.c.itemconfig(t + "-label", fill=WHITE),
+                                                              self.c.config(cursor="hand2")))
+            self.c.tag_bind(tag, "<Leave>", lambda _, t=tag: (self.c.itemconfig(t + "-box", outline=HAIR),
+                                                              self.c.itemconfig(t + "-label", fill=SUB),
+                                                              self.c.config(cursor="")))
+
+    def thumb(self, out, name, size):
+        path = core.shot_image(out, name)
+        try:
+            key = (path, path.stat().st_mtime_ns, size)
+            if key not in self.thumbs:
+                with Image.open(path) as im:
+                    im.draft("RGB", size)
+                    im = im.convert("RGB")
+                    im.thumbnail(size, Image.BILINEAR)
+                if len(self.thumbs) > 48:
+                    self.thumbs.clear()
+                self.thumbs[key] = ImageTk.PhotoImage(im)
+        except OSError:
+            return None
+        return self.thumbs[key]
+
+    def donor_pick(self, name):
+        if self.tool == "carry":
+            self.carry(name)
+            return
+        self.c.config(cursor="watch")
+        self.c.update_idletasks()
+        try:
+            shot = core.load_shot(self.shot["out"], name, self.app.cfg)
+        except (OSError, ValueError):
+            shot = None
+        self.c.config(cursor="")
+        if shot is None:
+            self.note = "фон той СС не открылся"
+            self.update_meta()
+            return
+        self.tool = "images"
+        self.add_image(Image.fromarray(shot["bg"]))
+
+    def carry(self, name):
+        self.c.config(cursor="watch")
+        self.c.update_idletasks()
+        try:
+            added = core.carry_chat(self.shot, name, self.app.cfg)
+        except (OSError, ValueError) as e:
+            self.c.config(cursor="")
+            self.note = f"чат не перенёсся: {e}"
+            self.update_meta()
+            return
+        self.c.config(cursor="")
+        self.tool = "lines"
+        self.redraw()
+        if added:
+            self.schedule_save()
+        self.note = (f"из СС от {when(name)} добавлено строк: {added}" if added
+                     else "все строки той СС уже есть в этой")
+        self.update_meta()
 
     def reset_lines(self):
         keep = self.app.cfg["keep"]
@@ -1230,10 +1643,15 @@ class Feed:
             elif row and self.click_mode != "rows":
                 self.toggle_word(int(row[3:]), (e.x - self.lines_x0) / self.lines_s, self.click_mode)
             elif row:
-                self.toggle_row(int(row[3:]))
+                i = int(row[3:])
+                self.drag = {"kind": "rows", "keep": not self.shot["rows"][i]["keep"], "last": i}
+                self.mark_rows(i, i)
             return
+        if self.tool in ("carry", "photopick", "file"):
+            return
+        over = self.tool == "images"
         handle = next((t[7:] for t in tags if t.startswith("handle-")), None)
-        if self.tool == "images" and handle and self.painter.geo:
+        if over and handle and self.painter.geo:
             item = self.shot["edit"]["overlays"][self.active_ov]
             box = self.painter.geo["overlays"][self.active_ov]
             size = self.source_size(item)
@@ -1242,7 +1660,7 @@ class Feed:
                              "crop": list(item["crop"]), "box": dict(box), "size": size}
             return
         ov = next((int(t[7:]) for t in tags if re.fullmatch(r"shot-ov\d+", t)), None)
-        if self.tool == "images" and ov is not None:
+        if over and ov is not None:
             self.active_ov = ov
             item = self.shot["edit"]["overlays"][ov]
             kind = "ovpan" if e.state & 0x1 else "ov"
@@ -1266,7 +1684,12 @@ class Feed:
         if not self.drag:
             return
         geo = self.painter.geo
-        if self.drag["kind"] == "chat":
+        if self.drag["kind"] == "rows":
+            i = self.row_at(e.y)
+            if i != self.drag["last"]:
+                self.mark_rows(self.drag["last"], i)
+                self.drag["last"] = i
+        elif self.drag["kind"] == "chat":
             ix, iy, dw, dh = geo["img"]
             ch = geo["chats"][self.drag["part"]]
             slack = geo["pad"] * geo["d"]
@@ -1275,12 +1698,14 @@ class Feed:
             self.c.coords(f"shot-chat{self.drag['part']}", x, y)
         elif self.drag["kind"] == "crop":
             self.drag_crop(e, geo)
+
         elif self.drag["kind"] in ("ov", "ovpan"):
             ov = self.shot["edit"]["overlays"][self.drag["part"]]
             (out_w, out_h), d = geo["out"], geo["d"]
             if self.drag["kind"] == "ov":
                 ov["x"] = round(min(max(self.drag["at"][0] + (e.x - self.drag["x"]) / d / out_w, 0.0), 1.0), 4)
                 ov["y"] = round(min(max(self.drag["at"][1] + (e.y - self.drag["y"]) / d / out_h, 0.0), 1.0), 4)
+                self.snap_ov(ov, geo["overlays"][self.drag["part"]], geo)
             elif geo["overlays"][self.drag["part"]]:
                 box = geo["overlays"][self.drag["part"]]
                 l, t, r, b = self.drag["crop"]
@@ -1295,13 +1720,25 @@ class Feed:
             bg = self.shot["bg"]
             H, W = bg.shape[:2]
             x0, y0, x1, y1 = geo["plan"]["rect"]
-            k = (x1 - x0) / geo["img"][2]
+            k = (x1 - x0) / (geo["plan"]["base"][0] * geo["d"])
             cx = self.drag["center"][0] - (e.x - self.drag["x"]) * k / W
             cy = self.drag["center"][1] - (e.y - self.drag["y"]) * k / H
             self.shot["edit"]["center"] = [cx, cy]
             if not self.pending_media:
                 self.pending_media = True
                 self.c.after(16, self.flush_media)
+
+    def snap_ov(self, ov, box, geo):
+        if not box:
+            return
+        (W, H), d = geo["out"], geo["d"]
+        near = 0.015 * min(W, H)
+        for key, size, half in (("x", W, box["w"] / d / 2), ("y", H, box["h"] / d / 2)):
+            c = ov[key] * size
+            if abs(c - half) < near:
+                ov[key] = round(half / size, 4)
+            elif abs(c + half - size) < near:
+                ov[key] = round((size - half) / size, 4)
 
     def drag_crop(self, e, geo):
         drag = self.drag
@@ -1357,6 +1794,9 @@ class Feed:
             return
         geo = self.painter.geo
         edit = self.shot["edit"]
+        if drag["kind"] == "rows":
+            self.schedule_save()
+            return
         if drag["kind"] == "chat":
             x, y = self.c.coords(f"shot-chat{drag['part']}")
             ix, iy = geo["img"][:2]
@@ -1387,6 +1827,13 @@ class Feed:
 
     def hover(self, e):
         if self.drag or self.index == 0 or self.shot is None or self.tool == "lines":
+            return
+        if self.tool == "file":
+            geo = self.painter.geo
+            if self.preview is not None and geo and self.inside(e, geo):
+                self.loupe.show(e.x, e.y, geo["img"], self.preview)
+            else:
+                self.loupe.hide()
             return
         tags = self.tags_here()
         if "shot-chat" in tags or (self.tool == "images" and "shot-ov" in tags):
@@ -1508,7 +1955,7 @@ class Feed:
             self.toggle_tool(self.tool)
         elif e.keycode == 67 and e.state & 0x4 and self.index > 0:
             self.copy()
-        elif e.keycode in (49, 50, 51, 52) and self.shot is not None and self.index > 0:
+        elif e.keycode in (49, 50, 51, 52, 53) and self.shot is not None and self.index > 0:
             self.toggle_tool(TOOLS[e.keycode - 49])
 
 
@@ -1538,7 +1985,15 @@ class Settings:
         self.example.pack(fill="both", expand=True)
         self.example_job = None
         self.example.bind("<Configure>", lambda _: self.settle())
+        self.example.bind("<Motion>", self.example_hover)
+        self.example.bind("<Leave>", lambda _: self.loupe.hide())
         self.painter = Painter(self.example)
+        self.loupe = Loupe(self.example)
+        self.example_geo = None
+        self.encoded_arr = None
+        self.encoded_photo = None
+        self.estimate_job = None
+        self.estimate_rev = 0
         self.sample = None
         self.sample_loading = False
         self.sample_missing = False
@@ -1637,7 +2092,9 @@ class Settings:
             subl.pack(fill="x", pady=(px(2), 0))
         control = tk.Frame(line, bg=VOID)
         control.grid(row=0, column=1, sticky="w", pady=px(10))
-        tk.Frame(parent, bg=HAIR, height=1).pack(fill="x")
+        hair = tk.Frame(parent, bg=HAIR, height=1)
+        hair.pack(fill="x")
+        self.last_row = (line, hair)
         return control, subl, text
 
     def choice(self, control, options, value, on_pick, **kw):
@@ -1660,6 +2117,8 @@ class Settings:
         self.choice(control, MODES, "yes" if cfg["auto"] else "no", self.set_mode)
         control, _, _ = self.row(f, "Звук", "Сигнал, когда СС готова")
         self.choice(control, SOUND, "yes" if cfg["sound"] else "no", lambda v: self.app.set("sound", v))
+        control, _, _ = self.row(f, "Трей", "Крестик прячет окно в трей, съёмка работает. Выход — через значок")
+        self.choice(control, SOUND, "yes" if cfg["tray"] else "no", self.app.set_tray)
         self.section(f, "Кадр и файл")
         control, _, _ = self.row(f, "Кадр", "Свой — ширина и высота в пикселях")
         FramePick(control, cfg["format"], self.set_frame, self.frame_now, self.list_w - self.label_w).pack(anchor="w")
@@ -1668,7 +2127,16 @@ class Settings:
         self.size_pick.pack(anchor="w")
         self.size_pick.show(cfg["format"])
         control, _, _ = self.row(f, "Файл", "JPG весит примерно втрое меньше PNG, чат остаётся чётким")
-        self.choice(control, FILES, cfg["file"], lambda v: self.app.set("file", v))
+        self.choice(control, FILES, cfg["file"], self.set_file)
+        self.file_row = self.last_row
+        control, _, _ = self.row(f, "Качество JPG", "Сжимается только фон, чат всегда чёткий. Наведи на пример — "
+                                                    "лупа покажет пиксели 1:1")
+        self.quality = Slider(control, 10, 100, cfg["quality"], lambda v: self.estimate(),
+                              lambda v: self.app.set("quality", str(int(v))), width=self.list_w - self.label_w - px(20),
+                              fmt=lambda v: f"{v:.0f}")
+        self.quality.pack(anchor="w")
+        self.quality_row = self.last_row
+        self.show_quality()
         self.section(f, "Чат на СС")
         control, _, _ = self.row(f, "Текст чата")
         self.choice(control, SCALES, raw["text_scale"], lambda v: self.app.set("text_scale", v))
@@ -1738,9 +2206,22 @@ class Settings:
         self.app.set("format", value)
         self.size_pick.show(value)
 
+    def set_file(self, value):
+        self.app.set("file", value)
+        self.show_quality()
+
+    def show_quality(self):
+        line, hair = self.quality_row
+        if self.app.cfg["file"] == "jpg":
+            line.pack(fill="x", after=self.file_row[1])
+            hair.pack(fill="x", after=line)
+        else:
+            line.pack_forget()
+            hair.pack_forget()
+
     def frame_now(self):
         shot = self.sample or core.sample_shot(self.app.cfg)
-        return core.plan(shot["bg"], core.new_edit(self.app.cfg, shot["rows"]))["size"]
+        return core.plan(shot["bg"], core.new_edit(self.app.cfg, shot["rows"]))["base"]
 
     def update_src(self):
         try:
@@ -1878,11 +2359,66 @@ class Settings:
         out_w, out_h = core.plan(shot["bg"], shot["edit"])["size"]
         d = min(W / out_w, (H - px(72)) / out_h)
         geo = self.painter.draw(shot, (0, 0, round(out_w * d), round(out_h * d)))
-        ix, iy, dw, dh = geo["img"]
+        self.example_geo, self.encoded_arr = geo, None
+        self.loupe.hide()
+        self.example.create_text(geo["img"][0], geo["img"][1] + geo["img"][3] + px(14), anchor="nw", fill=SUB,
+                                 font=(FONT["ui"], 10), width=geo["img"][2], text=self.caption(), tags=("caption",))
+        self.estimate()
+
+    def caption(self, size=None):
+        shot = self.sample
+        out_w, out_h = core.plan(shot["bg"], shot["edit"])["size"]
+        weight = f", ≈ {megabytes(size)}" if size else ""
         source = f"твоя СС от {when(shot['name'])}" if shot["name"] else "встроенный кадр"
-        self.example.create_text(ix, iy + dh + px(14), anchor="nw", fill=SUB, font=(FONT["ui"], 10), width=dw,
-                                 text=f"Так будет выглядеть новая СС: {out_w} × {out_h}. Пример — {source}. "
-                                      f"Каждую готовую СС можно поправить в редакторе.")
+        return (f"Так будет выглядеть новая СС: {out_w} × {out_h}{weight}. Пример — {source}. "
+                f"Каждую готовую СС можно поправить в редакторе.")
+
+    def estimate(self):
+        if self.estimate_job:
+            self.example.after_cancel(self.estimate_job)
+        self.estimate_job = self.example.after(150, self.run_estimate)
+
+    def run_estimate(self):
+        self.estimate_job = None
+        if self.sample is None or self.example_geo is None:
+            return
+        shot = self.sample
+        edit = dict(shot["edit"], quality=int(self.quality.value))
+        snap = {**shot, "rows": [dict(r) for r in shot["rows"]], "edit": edit,
+                "out": shot.get("out") or self.app.cfg["out"]}
+        self.estimate_rev += 1
+        rev = self.estimate_rev
+
+        def work():
+            try:
+                img, _, data = core.encoded(snap)
+                arr = core.decoded(data) if edit["file"] == "jpg" else img
+                self.app.inbox.put(("estimated", rev, (arr, len(data))))
+            except Exception:
+                self.app.inbox.put(("estimated", rev, None))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def estimated(self, rev, value):
+        if rev != self.estimate_rev or value is None or self.example_geo is None:
+            return
+        self.encoded_arr, size = value
+        ix, iy, dw, dh = self.example_geo["img"]
+        img = Image.fromarray(self.encoded_arr).resize((dw, dh), Image.BILINEAR, reducing_gap=2.0)
+        self.encoded_photo = ImageTk.PhotoImage(img)
+        self.example.delete("encoded")
+        self.example.create_image(ix, iy, anchor="nw", image=self.encoded_photo, tags=("encoded",))
+        self.example.itemconfig("caption", text=self.caption(size))
+
+    def example_hover(self, e):
+        geo = self.example_geo
+        if self.encoded_arr is None or geo is None:
+            return
+        ix, iy, dw, dh = geo["img"]
+        if ix <= e.x <= ix + dw and iy <= e.y <= iy + dh:
+            self.loupe.show(e.x, e.y, geo["img"], self.encoded_arr)
+        else:
+            self.loupe.hide()
 
 
 class App:
@@ -1924,6 +2460,8 @@ class App:
         threading.Thread(target=self.check_update, daemon=True).start()
         self.close = root.destroy
         self.frame = None
+        self.tray = None
+        self.zoomed = False
         root.bind("<Configure>", self.on_configure, add="+")
         root.after(100, self.pump)
 
@@ -1937,7 +2475,7 @@ class App:
         self.chrome = tk.Frame(bar, bg=VOID)
         self.chrome.place(relx=1.0, x=-px(10), rely=0.5, anchor="e")
         self.btn_max = None
-        for key, command in (("min", self.minimize), ("max", self.toggle_max), ("close", lambda: self.close())):
+        for key, command in (("min", self.minimize), ("max", self.toggle_max), ("close", lambda: self.close_window())):
             button = CaptionButton(self.chrome, key, command, danger=key == "close")
             button.pack(side="left", padx=(px(2), 0))
             if key == "max":
@@ -1960,6 +2498,51 @@ class App:
 
     def minimize(self):
         self.root.iconify()
+
+    def close_window(self):
+        if self.tray and self.tray.on and self.cfg["tray"]:
+            self.to_tray()
+        else:
+            self.close()
+
+    def to_tray(self):
+        self.feed.flush_save()
+        self.zoomed = self.root.state() == "zoomed"
+        self.root.withdraw()
+        if self.cfg["tray_hint"]:
+            self.tray.tell("Snapline работает в трее", f"{self.cfg['key']} в игре снимает СС и так. "
+                                                       "Открыть окно или выйти — через этот значок.")
+            self.set("tray_hint", "no")
+
+    def reveal(self):
+        self.root.deiconify()
+        if self.zoomed:
+            self.root.state("zoomed")
+        self.root.lift()
+        self.root.focus_force()
+        ctypes.windll.user32.SetForegroundWindow(self.hwnd)
+
+    def tray_event(self, msg, lp):
+        event = lp & 0xFFFF
+        if msg == TASKBAR_CREATED:
+            if self.tray and self.cfg["tray"]:
+                self.tray.on = False
+                self.tray.add()
+        elif msg == SHOW_MSG or event in (WM_LBUTTONUP, WM_LBUTTONDBLCLK):
+            self.reveal()
+        elif event == WM_RBUTTONUP and self.tray:
+            pick = self.tray.menu(("Открыть Snapline", "Папка со СС", None, "Выход"))
+            if pick == 1:
+                self.reveal()
+            elif pick == 2:
+                self.feed.open_folder()
+            elif pick == 4:
+                self.root.after_idle(self.close)
+
+    def set_tray(self, value):
+        self.set("tray", value)
+        if self.tray:
+            (self.tray.add if value == "yes" else self.tray.remove)()
 
     def toggle_max(self):
         self.root.state("normal" if self.root.state() == "zoomed" else "zoomed")
@@ -2059,13 +2642,16 @@ class App:
         try:
             while True:
                 kind, name, value = self.inbox.get_nowait()
+                if kind == "tray":
+                    self.tray_event(name, value)
+                    continue
                 if kind == "update":
                     self.update = (name, value)
                     self.settings.show_update()
                     if feed.index == 0:
                         feed.redraw()
                     continue
-                getattr(self.settings if kind == "sample_loaded" else feed, kind)(name, value)
+                getattr(self.settings if kind in ("sample_loaded", "estimated") else feed, kind)(name, value)
         except queue.Empty:
             pass
         self.root.after(100, self.pump)
@@ -2074,6 +2660,9 @@ class App:
 LRESULT = ctypes.c_ssize_t
 WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
 WM_NCCALCSIZE, WM_NCACTIVATE, WM_NCLBUTTONDOWN = 0x0083, 0x0086, 0x00A1
+WM_TRAY, WM_LBUTTONUP, WM_LBUTTONDBLCLK, WM_RBUTTONUP = 0x8001, 0x0202, 0x0203, 0x0205
+SHOW_MSG = ctypes.windll.user32.RegisterWindowMessageW("Snapline.Show")
+TASKBAR_CREATED = ctypes.windll.user32.RegisterWindowMessageW("TaskbarCreated")
 HT_CAPTION = 2
 GRIPS = (
     ("left", 10, "size_we"), ("right", 11, "size_we"), ("top", 12, "size_ns"), ("bottom", 15, "size_ns"),
@@ -2088,6 +2677,82 @@ class NCCALCSIZE_PARAMS(ctypes.Structure):
 
 class MARGINS(ctypes.Structure):
     _fields_ = [("left", ctypes.c_int), ("right", ctypes.c_int), ("top", ctypes.c_int), ("bottom", ctypes.c_int)]
+
+
+class NOTIFYICONDATAW(ctypes.Structure):
+    _fields_ = [("cbSize", wintypes.DWORD), ("hWnd", wintypes.HWND), ("uID", wintypes.UINT),
+                ("uFlags", wintypes.UINT), ("uCallbackMessage", wintypes.UINT), ("hIcon", wintypes.HICON),
+                ("szTip", wintypes.WCHAR * 128), ("dwState", wintypes.DWORD), ("dwStateMask", wintypes.DWORD),
+                ("szInfo", wintypes.WCHAR * 256), ("uVersion", wintypes.UINT), ("szInfoTitle", wintypes.WCHAR * 64),
+                ("dwInfoFlags", wintypes.DWORD), ("guidItem", ctypes.c_byte * 16), ("hBalloonIcon", wintypes.HICON)]
+
+
+class Tray:
+    def __init__(self, hwnd):
+        self.hwnd, self.on = hwnd, False
+        u = ctypes.WinDLL("user32", use_last_error=True)
+        u.CreateIconFromResourceEx.argtypes = [ctypes.c_char_p, wintypes.DWORD, wintypes.BOOL, wintypes.DWORD,
+                                               ctypes.c_int, ctypes.c_int, wintypes.UINT]
+        u.CreateIconFromResourceEx.restype = wintypes.HICON
+        u.DestroyIcon.argtypes = [wintypes.HICON]
+        u.CreatePopupMenu.restype = wintypes.HMENU
+        u.AppendMenuW.argtypes = [wintypes.HMENU, wintypes.UINT, ctypes.c_size_t, wintypes.LPCWSTR]
+        u.TrackPopupMenu.argtypes = [wintypes.HMENU, wintypes.UINT, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                     wintypes.HWND, ctypes.c_void_p]
+        u.DestroyMenu.argtypes = [wintypes.HMENU]
+        u.SetForegroundWindow.argtypes = [wintypes.HWND]
+        u.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        self.u = u
+        self.shell = ctypes.WinDLL("shell32", use_last_error=True)
+        self.shell.Shell_NotifyIconW.argtypes = [wintypes.DWORD, ctypes.POINTER(NOTIFYICONDATAW)]
+        size = u.GetSystemMetrics(49)
+        buf = io.BytesIO()
+        make_icon(size).save(buf, "PNG")
+        data = buf.getvalue()
+        self.icon = u.CreateIconFromResourceEx(data, len(data), True, 0x00030000, size, size, 0)
+        for msg in (SHOW_MSG, TASKBAR_CREATED):
+            try:
+                u.ChangeWindowMessageFilterEx(wintypes.HWND(hwnd), msg, 1, None)
+            except AttributeError:
+                pass
+
+    def notify(self, message, flags=0, info=None):
+        data = NOTIFYICONDATAW(cbSize=ctypes.sizeof(NOTIFYICONDATAW), hWnd=self.hwnd, uID=1, uFlags=0x7 | flags,
+                               uCallbackMessage=WM_TRAY, hIcon=self.icon, szTip="Snapline")
+        if info:
+            data.szInfoTitle, data.szInfo = info
+        return bool(self.shell.Shell_NotifyIconW(message, ctypes.byref(data)))
+
+    def add(self):
+        if not self.on:
+            self.on = self.notify(0)
+
+    def remove(self):
+        if self.on:
+            self.notify(2)
+            self.on = False
+
+    def tell(self, title, text):
+        if self.on:
+            self.notify(1, 0x10, (title, text))
+
+    def menu(self, items):
+        handle = self.u.CreatePopupMenu()
+        for k, label in enumerate(items, 1):
+            self.u.AppendMenuW(handle, 0x800 if label is None else 0, k, label)
+        point = wintypes.POINT()
+        self.u.GetCursorPos(ctypes.byref(point))
+        self.u.SetForegroundWindow(self.hwnd)
+        pick = self.u.TrackPopupMenu(handle, 0x0182, point.x, point.y, 0, self.hwnd, None)
+        self.u.PostMessageW(self.hwnd, 0, 0, 0)
+        self.u.DestroyMenu(handle)
+        return pick
+
+    def close(self):
+        self.remove()
+        if self.icon:
+            self.u.DestroyIcon(self.icon)
+            self.icon = None
 
 
 class Frameless:
@@ -2165,6 +2830,10 @@ class Frameless:
 
     def wndproc(self, hwnd, msg, wp, lp):
         try:
+            if msg in (WM_TRAY, SHOW_MSG, TASKBAR_CREATED):
+                self.app.inbox.put(("tray", msg, lp))
+                if msg != TASKBAR_CREATED:
+                    return 0
             if msg == WM_NCCALCSIZE and wp:
                 if self.u.IsZoomed(hwnd):
                     rect = ctypes.cast(lp, ctypes.POINTER(NCCALCSIZE_PARAMS)).contents.rgrc[0]
@@ -2201,14 +2870,16 @@ def selftest():
     root.attributes("-toolwindow", True)
     root.attributes("-alpha", 0.0)
     errors = []
-    root.report_callback_exception = lambda *a: errors.append(a[1])
+    root.report_callback_exception = lambda *a: errors.append("".join(traceback.format_exception(*a)))
     app = App(root)
     app.hwnd = dark_title(root)
     app.frame = Frameless(app, app.hwnd)
     result = {}
 
-    calls = []
+    calls, routed = [], []
     app.frame.native = calls.append
+    app.tray_event = lambda msg, lp: routed.append((msg, lp))
+    ctypes.windll.user32.PostMessageW(wintypes.HWND(app.hwnd), WM_TRAY, 0, 0x0200)
     app.toggle_max = lambda: calls.append("max")
 
     def press(widget, double=False):
@@ -2226,6 +2897,13 @@ def selftest():
     def check():
         sample = core.RES_DIR / "samples"
         rows = chat.classify(chat.extract_rows(core.read_image(sample / "example_chat.png")))
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = dict(app.cfg, out=Path(tmp))
+            core.save_src(core.read_image(sample / "example_bg.webp"), cfg, "SS_selftest_bg", core.SRC_BG)
+            core.save_src(core.read_image(sample / "example_chat.png"), cfg, "SS_selftest_chat1", core.SRC_CHAT)
+            shot = core.load_shot(Path(tmp), "SS_selftest", cfg)
+            core.save_shot(shot)
+            saved = core.shot_image(Path(tmp), "SS_selftest").exists() and any(r["keep"] for r in shot["rows"])
         W, H = root.winfo_width(), root.winfo_height()
         grips = dict(zip((name for name, _, _ in GRIPS), (grip for grip, _ in app.frame.grips)))
         order = root.winfo_children()
@@ -2234,17 +2912,19 @@ def selftest():
         placed = (boxes["left"][0] == 0 and boxes["right"][0] + boxes["right"][2] == W
                   and boxes["bottom"][1] + boxes["bottom"][3] == H and boxes["topleft"][:2] == (0, 0)
                   and all(b[2] > 0 and b[3] > 0 for b in boxes.values()))
-        wiring = calls == [HT_CAPTION, "max", HT_CAPTION, 10, 11, 12, 15, 13, 14, 16, 17]
+        wiring = calls == [HT_CAPTION, "max", HT_CAPTION, 10, 11, 12, 15, 13, 14, 16, 17] and routed == [(WM_TRAY, 0x0200)]
         result["ok"] = ((sample / "example_bg.webp").exists() and any(r["keep"] for r in rows) and FONT["icon"] is not None
+                        and saved
                         and app.settings.logo is not None
                         and not errors and app.feed.c.winfo_width() > 100 and wiring and on_top and placed)
-        result["detail"] = (calls, on_top, boxes, (W, H))
+        result["detail"] = (calls, routed, on_top, boxes, (W, H))
         root.destroy()
 
     root.after(800, clicks)
     root.mainloop()
     if not result.get("ok"):
-        print(result.get("detail"), errors)
+        with open(core.ERROR_LOG, "a", encoding="utf-8") as f:
+            f.write(f"{datetime.now()} selftest\n{result.get('detail')}\n{''.join(errors)}\n")
     return 0 if result.get("ok") else 2
 
 
@@ -2257,26 +2937,27 @@ def main():
         return selftest()
     running, mutex = already_running()
     if running:
-        root = tk.Tk()
-        root.withdraw()
-        messagebox.showinfo("Snapline", "Snapline уже запущена — её окно на панели задач.")
-        root.destroy()
+        ctypes.windll.user32.PostMessageW(wintypes.HWND(0xFFFF), SHOW_MSG, 0, 0)
         return 1
     root = tk.Tk()
     app = App(root)
     root.report_callback_exception = app.crash
     app.hwnd = dark_title(root)
     app.frame = Frameless(app, app.hwnd)
+    app.tray = Tray(app.hwnd)
+    if app.cfg["tray"]:
+        app.tray.add()
     stop = threading.Event()
     threading.Thread(target=core.run, args=(lambda: app.cfg, stop, app.foreground), daemon=True).start()
 
     def close():
         stop.set()
         app.feed.save_sync()
+        app.tray.close()
         root.destroy()
 
     app.close = close
-    root.protocol("WM_DELETE_WINDOW", close)
+    root.protocol("WM_DELETE_WINDOW", app.close_window)
     root.mainloop()
     return 0
 

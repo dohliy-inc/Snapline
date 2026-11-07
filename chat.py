@@ -255,21 +255,21 @@ def masked(row, preview=False):
     return out
 
 
-def _same(a, b):
+def same_row(a, b):
     pa, pb = a["profile"], b["profile"]
     return len(pa) == len(pb) and np.abs(pa - pb).sum() / max(pa.sum() + pb.sum(), 1.0) < SAME_ROW
 
 
 def _overlap(a, b):
     for k in range(min(len(a), len(b)), 0, -1):
-        if all(_same(a[len(a) - k + i], b[i]) for i in range(k)):
+        if all(same_row(a[len(a) - k + i], b[i]) for i in range(k)):
             return k
     return 0
 
 
 def merge(rows, new):
     n = len(new)
-    if n == 0 or any(all(_same(rows[i + j], new[j]) for j in range(n)) for i in range(len(rows) - n + 1)):
+    if n == 0 or any(all(same_row(rows[i + j], new[j]) for j in range(n)) for i in range(len(rows) - n + 1)):
         return rows
     after, before = _overlap(rows, new), _overlap(new, rows)
     return new[:n - before] + rows if before > after else rows + new[after:]
@@ -286,35 +286,84 @@ def frame_rect(width, height, ratio=None, zoom=1.0, center=(0.5, 0.5)):
     return x0, y0, x0 + w, y0 + h
 
 
-def _strip(kept, scale, max_h):
-    pitch = kept[0]["pitch"]
+def messages(rows):
+    groups = []
+    for r in rows:
+        if r.get("cont") and groups:
+            groups[-1].append(r)
+        else:
+            groups.append([r])
+    return groups
+
+
+def _pieces(row, space):
+    rgb = masked(dict(row, drop=[]))
+    gone = {tuple(span) for span in row.get("drop", [])}
+    spans = words(row)
+    out = []
+    for j, (a, b) in enumerate(spans):
+        if (a, b) not in gone:
+            gap = spans[j + 1][0] - b - 1 if j + 1 < len(spans) else space
+            out.append((rgb[:, a:b + 1], row["base"], gap))
+    return out
+
+
+def _flow(group, limit):
+    kept = [r for r in group if r["keep"]]
+    if len(kept) < 2 or not any(r.get("drop") for r in kept):
+        return [(masked(r), r["base"], 1) for r in kept]
     head = max(r["base"] for r in kept)
-    slots = []
-    for i, r in enumerate(kept):
-        y0 = head + round(i * pitch) - r["base"]
-        if (y0 + len(r["rgb"])) * scale > max_h and slots:
+    tall = head + max(len(r["rgb"]) - r["base"] for r in kept)
+    width = kept[0]["rgb"].shape[1]
+    x0 = min(r["glyphs"][0][0] for r in kept)
+    spans = [words(r) for r in kept]
+    gaps = [c - b - 1 for w in spans for (_, b), (c, _) in zip(w, w[1:])]
+    space = int(np.median(gaps)) if gaps else round(0.3 * kept[0]["pitch"])
+    lines, x = [], 0
+    for cols, base, gap in (p for r in kept for p in _pieces(r, space)):
+        w = cols.shape[1]
+        if not lines or x + w > limit:
+            lines.append(np.zeros((tall, width, 3), np.float32))
+            x = x0
+        lines[-1][head - base:head - base + len(cols), x:x + w] = cols
+        x += w + gap
+    return [(rgb, head, 1 + (len(kept) - len(lines)) * (i + 1 == len(lines))) for i, rgb in enumerate(lines)]
+
+
+def _strip(lines, pitch, scale, max_h):
+    head = max(base for _, base, _ in lines)
+    slots, painted = [], 0
+    for i, (rgb, base, n) in enumerate(lines):
+        y0 = head + round(i * pitch) - base
+        if (y0 + len(rgb)) * scale > max_h and slots:
             break
-        slots.append((y0, r))
-    h = max(y0 + len(r["rgb"]) for y0, r in slots)
-    rgb = np.zeros((h, kept[0]["rgb"].shape[1], 3), np.float32)
-    for y0, r in slots:
-        np.maximum(rgb[y0:y0 + len(r["rgb"])], masked(r), out=rgb[y0:y0 + len(r["rgb"])])
-    ink = rgb.max(axis=2) > 0
+        slots.append((y0, rgb))
+        painted += n
+    h = max(y0 + len(rgb) for y0, rgb in slots)
+    out = np.zeros((h, lines[0][0].shape[1], 3), np.float32)
+    for y0, rgb in slots:
+        np.maximum(out[y0:y0 + len(rgb)], rgb, out=out[y0:y0 + len(rgb)])
+    ink = out.max(axis=2) > 0
+    if not ink.any():
+        return None, painted
     ys, xs = np.flatnonzero(ink.any(axis=1)), np.flatnonzero(ink.any(axis=0))
-    rgb = rgb[ys[0]:ys[-1] + 1, xs[0]:xs[-1] + 1]
+    out = out[ys[0]:ys[-1] + 1, xs[0]:xs[-1] + 1]
     if scale != 1:
-        img = Image.fromarray(rgb.round().astype(np.uint8))
+        img = Image.fromarray(out.round().astype(np.uint8))
         img = img.resize((max(1, round(img.width * scale)), max(1, round(img.height * scale))), Image.LANCZOS)
-        rgb = np.asarray(img).astype(np.float32)
-    return rgb, len(slots)
+        out = np.asarray(img).astype(np.float32)
+    return out, painted
 
 
 def chat_layer(rows, outline=1, scale=1.0, max_h=None):
-    kept = [r for r in rows if r["keep"]]
-    if not kept:
+    limit = max((r["glyphs"][-1][1] + 1 for r in rows), default=0)
+    lines = [line for group in messages(rows) for line in _flow(group, limit)]
+    if not lines:
         return None, 0, 0
     pad = outline + 2
-    rgb, painted = _strip(kept, scale, (max_h - 2 * pad) if max_h else float("inf"))
+    rgb, painted = _strip(lines, rows[0]["pitch"], scale, (max_h - 2 * pad) if max_h else float("inf"))
+    if rgb is None:
+        return None, 0, 0
     rgb = np.pad(rgb, ((pad, pad), (pad, pad), (0, 0)))
     lum = rgb.max(axis=2)
     peak = _grow(lum, 2)
@@ -339,16 +388,17 @@ def place(width, height, layer_w, layer_h, pad, pos, margin):
 
 
 def blend(frame, layer, left, top):
-    out = frame.astype(np.float32)
+    out = frame.copy()
     H, W = out.shape[:2]
     h, w = layer.shape[:2]
     x0, y0, x1, y1 = max(left, 0), max(top, 0), min(left + w, W), min(top + h, H)
     if x0 >= x1 or y0 >= y1:
-        return frame.copy()
+        return out
     part = layer[y0 - top:y1 - top, x0 - left:x1 - left].astype(np.float32)
     a = part[..., 3:4] / 255.0
-    out[y0:y1, x0:x1] = out[y0:y1, x0:x1] * (1 - a) + part[..., :3] * a
-    return np.clip(out.round(), 0, 255).astype(np.uint8)
+    mixed = frame[y0:y1, x0:x1] * (1 - a) + part[..., :3] * a
+    out[y0:y1, x0:x1] = np.clip(mixed.round(), 0, 255).astype(np.uint8)
+    return out
 
 
 def compose(frame, rows, outline=1, pos="top-left", margin=24, scale=1.0):

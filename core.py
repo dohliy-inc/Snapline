@@ -8,7 +8,6 @@ import sys
 import threading
 import time
 import traceback
-import urllib.request
 import winsound
 from ctypes import wintypes
 from datetime import datetime
@@ -16,12 +15,12 @@ from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
-from PIL import Image, ImageGrab
+from PIL import Image, ImageFilter, ImageGrab
 
 import chat
 
-VERSION = "1.2.1"
-RELEASES = "https://api.github.com/repos/dohliy-inc/Snapline/releases/latest"
+VERSION = "1.3"
+RELEASES = "https://github.com/dohliy-inc/Snapline/releases/latest"
 APP_DIR = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent
 RES_DIR = Path(getattr(sys, "_MEIPASS", APP_DIR))
 CONFIG_PATH = APP_DIR / "config.ini"
@@ -38,6 +37,7 @@ DEFAULTS = {
     "format": "square",
     "size": "native",
     "file": "jpg",
+    "quality": "92",
     "chat_pos": "top-left",
     "margin": "24",
     "text_scale": "1.5",
@@ -46,16 +46,22 @@ DEFAULTS = {
     "sound": "yes",
     "hide_names": "no",
     "chatlog": "no",
+    "tray": "yes",
+    "tray_hint": "yes",
 }
 SIZES = {"native": None, "hd": 720, "fhd": 1080, "qhd": 1440, "4k": 2160}
 SIDE_RANGE = (360, 4320)
 FRAME_RANGE = (200, 7680)
-FILE_TYPES = {"jpg": {"quality": 92, "subsampling": 0}, "png": {"compress_level": 6}}
+FILE_TYPES = {"jpg": {"quality": 92, "subsampling": 0, "optimize": True, "progressive": True},
+              "png": {"compress_level": 6}}
+TEXT_QUALITY = 92
 SRC_BG = (".jpg", {"quality": 95, "subsampling": 0})
 SRC_CHAT = (".webp", {"lossless": True, "quality": 0, "method": 1})
 CHAT_POSITIONS = ("top-left", "top-right", "bottom-left", "bottom-right")
-LAYOUT_KEYS = ("format", "zoom", "center", "pos", "places", "size", "file", "text_scale", "outline", "margin",
-               "overlays")
+LAYOUT_KEYS = ("format", "zoom", "center", "pos", "places", "size", "file", "quality", "text_scale", "outline",
+               "margin", "overlays", "join")
+JOIN_SIDES = {"left": Image.Transpose.FLIP_LEFT_RIGHT, "right": None, "top": Image.Transpose.TRANSVERSE,
+              "bottom": Image.Transpose.TRANSPOSE}
 MAX_OVERLAYS = 4
 MARKS = (("hide", "hidden"), ("drop", "dropped"))
 MAX_PARTS = 3
@@ -234,6 +240,7 @@ def parse_config(raw):
         "ratio": ratio,
         "size": size,
         "file": file,
+        "quality": _num(raw, "quality", int, 10, 100),
         "chat_pos": pos,
         "margin": _num(raw, "margin", int, 0, 400),
         "text_scale": _num(raw, "text_scale", float, 0.5, 3),
@@ -242,6 +249,8 @@ def parse_config(raw):
         "sound": _bool(raw, "sound"),
         "hide_names": _bool(raw, "hide_names"),
         "chatlog": _bool(raw, "chatlog"),
+        "tray": _bool(raw, "tray"),
+        "tray_hint": _bool(raw, "tray_hint"),
     }
 
 
@@ -265,8 +274,10 @@ def new_edit(cfg, rows):
         "hidden": spans_of(rows, "hide"),
         "dropped": spans_of(rows, "drop"),
         "overlays": [],
+        "join": None,
         "size": cfg["size"],
         "file": cfg["file"],
+        "quality": cfg["quality"],
         "text_scale": cfg["text_scale"],
         "outline": cfg["outline"],
         "margin": cfg["margin"],
@@ -334,9 +345,20 @@ def plan(bg, edit):
     side = min(exact) if exact else side_of(edit["size"]) or short
     f = side / short
     k = side / REFERENCE_SIDE
+    base = exact or (max(1, round(cw * f)), max(1, round(ch * f)))
+    join = edit.get("join")
+    edge = join["side"] if join and join.get("side") in JOIN_SIDES else None
+    wide = edge in ("left", "right")
+    ext, fade = join_sizes(join, base[0] if wide else base[1]) if edge else (0, 0)
+    size = (base[0] + ext, base[1]) if wide else (base[0], base[1] + ext)
+    box = {"left": (0, 0, ext, base[1]), "right": (base[0], 0, base[0] + ext, base[1]),
+           "top": (0, 0, base[0], ext), "bottom": (0, base[1], base[0], base[1] + ext)}.get(edge)
     return {
         "rect": rect,
-        "size": exact or (max(1, round(cw * f)), max(1, round(ch * f))),
+        "base": base,
+        "size": size,
+        "at": (ext if edge == "left" else 0, ext if edge == "top" else 0),
+        "ext_box": box,
         "outline": max(1, round(edit["outline"] * k)) if edit["outline"] else 0,
         "margin": round(edit["margin"] * k),
         "scale": edit["text_scale"] * side / min(H, W),
@@ -344,24 +366,89 @@ def plan(bg, edit):
 
 
 @lru_cache(maxsize=16)
-def _overlay(path, stamp):
+def _overlay(path, stamp, mode):
     with Image.open(path) as im:
-        return im.convert("RGBA")
+        return im.convert(mode)
 
 
-def overlay_image(path):
-    return _overlay(str(path), path.stat().st_mtime_ns)
+def overlay_image(path, mode="RGBA"):
+    return _overlay(str(path), path.stat().st_mtime_ns, mode)
 
 
 def add_overlay(out, name, image):
     src = out / "src"
     src.mkdir(parents=True, exist_ok=True)
-    taken = {int(m[1]) for p in src.glob(f"{name}_ov*.png") if (m := re.search(r"_ov(\d+)$", p.stem))}
-    file = f"{name}_ov{max(taken, default=0) + 1}.png"
-    image = image.copy()
+    taken = {int(m[1]) for p in src.glob(f"{name}_ov*.*") if (m := re.search(r"_ov(\d+)$", p.stem))}
+    image = image.convert("RGBA")
     image.thumbnail((2560, 2560), Image.LANCZOS)
-    image.save(src / file, compress_level=3)
-    return {"file": file, "x": 0.7, "y": 0.68, "w": 0.4, "crop": [0.0, 0.0, 1.0, 1.0], "cut": "free"}
+    sticker = image.getchannel("A").getextrema()[0] < 255
+    file = f"{name}_ov{max(taken, default=0) + 1}.{'png' if sticker else 'jpg'}"
+    if sticker:
+        image.save(src / file, compress_level=3)
+    else:
+        image.convert("RGB").save(src / file, quality=95)
+    return {"file": file, "x": 0.7 if sticker else 0.72, "y": 0.68, "w": 0.4 if sticker else 0.6,
+            "crop": [0.0, 0.0, 1.0, 1.0], "cut": "free", "soft": 0.0 if sticker else 0.4, "alpha": 1.0}
+
+
+def fit_field(ov, p, src):
+    W, H = p["size"]
+    l, t, r, b = p["ext_box"]
+    if r - l == W:
+        lap = round((b - t) * 0.5)
+        t, b = (t, b + lap) if t == 0 else (t - lap, b)
+    else:
+        lap = round((r - l) * 0.5)
+        l, r = (l, r + lap) if l == 0 else (l - lap, r)
+    w, h = r - l, b - t
+    ov.update(crop=crop_for(src, w / h), cut="free", w=round(w / W, 4), x=round((l + r) / 2 / W, 4),
+              y=round((t + b) / 2 / H, 4), soft=round(min(1.0, 2 * lap / min(w, h)), 3))
+    return ov
+
+
+def join_sizes(join, along):
+    ext = max(1, round(join["size"] * along))
+    return ext, min(round(join["fade"] * min(ext, along / 2)), along)
+
+
+def cover_box(src, size, cx=0.5, cy=0.5):
+    SW, SH = src
+    w, h = size
+    s = min(SW / w, SH / h)
+    cw, ch = w * s, h * s
+    x0 = min(max(cx * SW - cw / 2, 0), SW - cw)
+    y0 = min(max(cy * SH - ch / 2, 0), SH - ch)
+    return x0, y0, x0 + cw, y0 + ch
+
+
+def join_canvas(frame, join):
+    op = JOIN_SIDES[join["side"]]
+    base = frame if op is None else frame.transpose(op)
+    bw, bh = base.size
+    ext, fade = join_sizes(join, bw)
+    pw = ext + fade
+    small = base.transpose(Image.Transpose.FLIP_LEFT_RIGHT).resize(
+        (max(1, bw // 8), max(1, bh // 8)), Image.BILINEAR, reducing_gap=2.0)
+    soft = small.filter(ImageFilter.GaussianBlur(max(2.0, min(small.size) * 0.04)))
+    cover = np.asarray(soft.resize((pw, bh), Image.BICUBIC, box=cover_box(soft.size, (pw, bh), 0.0, 0.5)))
+    dim = 1 - 0.55 * np.clip((np.arange(pw, dtype=np.float32) - fade) / max(ext, 1), 0, 1) ** 1.5
+    cover = (cover * dim[None, :, None]).astype(np.uint8)
+    canvas = np.empty((bh, bw + ext, 3), np.uint8)
+    canvas[:, :bw] = np.asarray(base)
+    canvas[:, bw:] = cover[:, fade:]
+    if fade:
+        t = (np.arange(fade, dtype=np.float32) + 0.5) / fade
+        a = (t * t * (3 - 2 * t))[None, :, None]
+        under = canvas[:, bw - fade:bw].astype(np.float32)
+        canvas[:, bw - fade:bw] = np.clip((under + (cover[:, :fade] - under) * a).round(), 0, 255).astype(np.uint8)
+    out = Image.fromarray(canvas)
+    return out if op is None else out.transpose(op)
+
+
+def jpeg_pass(arr, quality):
+    buf = io.BytesIO()
+    Image.fromarray(arr).save(buf, "JPEG", quality=quality, subsampling=2)
+    return np.asarray(Image.open(buf).convert("RGB"))
 
 
 def lock_ratio(cut):
@@ -402,11 +489,37 @@ def overlay_box(ov, out_size, src_size):
     return round(ov["x"] * out_size[0] - w / 2), round(ov["y"] * out_size[1] - h / 2), w, h
 
 
+def edge_ramp(n, f, near=True, far=True):
+    i = np.arange(n) + 0.5
+    d = np.minimum(i if near else np.inf, n - i if far else np.inf)
+    t = np.clip(d / f, 0, 1) if f >= 1 else np.ones(n)
+    return (t * t * (3 - 2 * t)).astype(np.float32)
+
+
+def soft_edges(box, out_size):
+    x, y, w, h = box
+    return x > 0, y > 0, x + w < out_size[0], y + h < out_size[1]
+
+
 def overlay_piece(src, ov, size):
     l, t, r, b = ov["crop"]
     W, H = src.size
     return src.crop((round(l * W), round(t * H), max(round(l * W) + 1, round(r * W)),
                      max(round(t * H) + 1, round(b * H)))).resize(size, Image.LANCZOS)
+
+
+def soften(piece, ov, edges):
+    soft, alpha = ov.get("soft", 0.0), ov.get("alpha", 1.0)
+    if soft <= 0 and alpha >= 1:
+        return piece
+    w, h = piece.size
+    left, top, right, bottom = edges
+    f = soft * min(w, h) / 2
+    mask = np.outer(edge_ramp(h, f, top, bottom), edge_ramp(w, f, left, right)) * alpha
+    out = piece.copy()
+    out.putalpha(Image.fromarray(np.clip((np.asarray(piece.getchannel("A"), np.float32) * mask).round(), 0, 255)
+                                 .astype(np.uint8)))
+    return out
 
 
 def paste_overlays(frame, overlays, src):
@@ -417,22 +530,26 @@ def paste_overlays(frame, overlays, src):
         except OSError:
             continue
         x, y, w, h = overlay_box(ov, img.size, source.size)
-        piece = overlay_piece(source, ov, (w, h))
+        piece = soften(overlay_piece(source, ov, (w, h)), ov, soft_edges((x, y, w, h), img.size))
         img.paste(piece, (x, y), piece)
     return np.asarray(img.convert("RGB"))
 
 
-def render(bg, rows, edit, src=None):
+def render(bg, rows, edit, src=None, rough=None):
     if rows and bg.shape[1] != rows[0]["screen_w"]:
         raise ValueError(f"фон шириной {bg.shape[1]} px, а чат снят на экране {rows[0]['screen_w']} px")
     p = plan(bg, edit)
     x0, y0, x1, y1 = p["rect"]
     frame = bg[y0:y1, x0:x1]
-    if (frame.shape[1], frame.shape[0]) != p["size"]:
-        method = Image.LANCZOS if p["size"][0] < frame.shape[1] else Image.BICUBIC
-        frame = np.asarray(Image.fromarray(frame).resize(p["size"], method))
+    if (frame.shape[1], frame.shape[0]) != p["base"]:
+        method = Image.LANCZOS if p["base"][0] < frame.shape[1] else Image.BICUBIC
+        frame = np.asarray(Image.fromarray(frame).resize(p["base"], method))
+    if p["size"] != p["base"]:
+        frame = np.asarray(join_canvas(Image.fromarray(frame), edit["join"]))
     if src is not None and edit.get("overlays"):
         frame = paste_overlays(frame, edit["overlays"], src)
+    if rough:
+        frame = jpeg_pass(frame, rough)
     img, painted = frame, 0
     for part, pos in parts(rows, edit):
         done, n, _ = chat.compose(img, part, p["outline"], pos, p["margin"], p["scale"])
@@ -480,8 +597,9 @@ def clean_bg(bg, mark, threshold=0.5):
             best, at = score, y
     if at is None:
         return bg
-    out = bg.astype(np.float32)
-    region = out[at:at + h, x:x + w]
+    by, bx = max(at - 3, 0), max(x - 3, 0)
+    box = bg[by:at + h + 3, bx:x + w + 3].astype(np.float32)
+    region = box[at - by:at - by + h, x - bx:x - bx + w]
     lum = t.max(axis=2)
     solid = (lum > 0.7 * 255).any(axis=0)
     text = ~solid
@@ -502,8 +620,10 @@ def clean_bg(bg, mark, threshold=0.5):
                 region[:, text] = fixed
     cols = np.flatnonzero(solid)
     if len(cols):
-        _fill(out, at, at + h, x + max(cols[0] - 4, 0), x + min(cols[-1] + 5, w))
-    return np.clip(out.round(), 0, 255).astype(np.uint8)
+        _fill(box, at - by, at - by + h, x - bx + max(cols[0] - 4, 0), x - bx + min(cols[-1] + 5, w))
+    out = bg.copy()
+    out[by:by + box.shape[0], bx:bx + box.shape[1]] = np.clip(box.round(), 0, 255).astype(np.uint8)
+    return out
 
 
 def _fill(out, y0, y1, x0, x1, margin=3, steps=150):
@@ -538,7 +658,12 @@ def list_shots(out):
     if not out.is_dir():
         return []
     shots = {p.stem: p for p in out.glob("SS_*.*") if p.suffix[1:].lower() in FILE_TYPES}
-    return sorted(shots, key=lambda n: shots[n].stat().st_mtime, reverse=True)
+
+    def taken(name):
+        m = re.match(r"SS_(\d{4}-\d\d-\d\d_\d\d-\d\d-\d\d)", name)
+        return m[1] if m else datetime.fromtimestamp(shots[name].stat().st_mtime).strftime("%Y-%m-%d_%H-%M-%S")
+
+    return sorted(shots, key=lambda n: (taken(n), n), reverse=True)
 
 
 def src_size(out):
@@ -560,10 +685,8 @@ def read_image(path):
         return np.asarray(im.convert("RGB"))
 
 
-def load_shot(out, name, cfg):
-    bg_path, chat_paths, meta = shot_files(out, name)
-    if not bg_path.exists() or not chat_paths:
-        return None
+def load_rows(out, name, cfg):
+    _, chat_paths, meta = shot_files(out, name)
     rows, mark = [], None
     for p in chat_paths:
         img = read_image(p)
@@ -577,17 +700,81 @@ def load_shot(out, name, cfg):
         except (ValueError, OSError):
             pass
     apply_keep(rows, edit)
+    return rows, edit, mark, legacy
+
+
+def load_shot(out, name, cfg):
+    bg_path, chat_paths, _ = shot_files(out, name)
+    if not bg_path.exists() or not chat_paths:
+        return None
+    rows, edit, mark, legacy = load_rows(out, name, cfg)
     return {"name": name, "out": out, "bg": clean_bg(read_image(bg_path), mark), "rows": rows, "edit": edit,
             "legacy": legacy}
 
 
+def donors(out, name, names, limit=12):
+    at = names.index(name) if name in names else 0
+    near = sorted((k for k in range(len(names)) if k != at), key=lambda k: abs(k - at))
+    found = [k for k in near if shot_files(out, names[k])[1]][:limit]
+    return [names[k] for k in sorted(found)]
+
+
+def carry_chat(shot, donor, cfg):
+    out, name, rows, edit = shot["out"], shot["name"], shot["rows"], shot["edit"]
+    _, files, _ = shot_files(out, donor)
+    if not files:
+        raise ValueError("у этой СС нет исходных кадров чата")
+    theirs = load_rows(out, donor, cfg)[0]
+    if theirs and rows and theirs[0]["screen_w"] != rows[0]["screen_w"]:
+        raise ValueError("та СС снята при другом разрешении экрана")
+    merged = rows
+    for src in files:
+        merged = chat.merge(merged, chat.classify(chat.extract_rows(read_image(src)), cfg["keep"]))
+    if len(merged) == len(rows):
+        return 0
+    first = max((chat_number(p) for p in shot_files(out, name)[1]), default=0) + 1
+    with FILES:
+        for k, src in enumerate(files):
+            (out / "src" / f"{name}_chat{first + k}{src.suffix}").write_bytes(src.read_bytes())
+    cut = [rows[i] for i in cuts(rows, edit)]
+    old = {id(r) for r in rows}
+    for r in merged:
+        twin = None if id(r) in old else next((t for t in theirs if chat.same_row(t, r)), None)
+        if twin:
+            r.update(keep=twin["keep"], hide=list(twin.get("hide", [])), drop=list(twin.get("drop", [])))
+    where = {id(r): i for i, r in enumerate(merged)}
+    shot["rows"] = merged
+    edit["keep"] = [bool(r["keep"]) for r in merged]
+    edit["breaks"] = [where[id(r)] for r in cut]
+    for key, field in MARKS:
+        edit[field] = spans_of(merged, key)
+    return len(merged) - len(rows)
+
+
+def encoded(shot):
+    edit = shot["edit"]
+    file, params, rough = edit["file"], dict(FILE_TYPES[edit["file"]]), None
+    if file == "jpg":
+        quality = int(edit.get("quality", TEXT_QUALITY))
+        params["quality"] = max(quality, TEXT_QUALITY)
+        rough = quality if quality < TEXT_QUALITY else None
+    img, painted = render(shot["bg"], shot["rows"], edit, shot["out"] / "src", rough)
+    buf = io.BytesIO()
+    Image.fromarray(img).save(buf, "JPEG" if file == "jpg" else "PNG", **params)
+    return img, painted, buf.getvalue()
+
+
+def decoded(data):
+    return np.asarray(Image.open(io.BytesIO(data)).convert("RGB"))
+
+
 def save_shot(shot):
-    img, painted = render(shot["bg"], shot["rows"], shot["edit"], shot["out"] / "src")
+    img, painted, data = encoded(shot)
     out, name, file = shot["out"], shot["name"], shot["edit"]["file"]
     _, _, meta = shot_files(out, name)
     with FILES:
         meta.parent.mkdir(parents=True, exist_ok=True)
-        save(img, out / f"{name}.{file}", **FILE_TYPES[file])
+        (out / f"{name}.{file}").write_bytes(data)
         for other in FILE_TYPES.keys() - {file}:
             (out / f"{name}.{other}").unlink(missing_ok=True)
         meta.write_text(json.dumps(shot["edit"], ensure_ascii=False), encoding="utf-8")
@@ -680,15 +867,44 @@ def version_key(version):
     return tuple(int(n) for n in re.findall(r"\d+", version))
 
 
-def latest_release():
-    request = urllib.request.Request(RELEASES, headers={"User-Agent": f"Snapline/{VERSION}"})
+def final_url(url, timeout_ms=5000):
+    net = ctypes.WinDLL("wininet", use_last_error=True)
+    net.InternetOpenW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD]
+    net.InternetOpenW.restype = ctypes.c_void_p
+    net.InternetOpenUrlW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+                                     wintypes.DWORD, ctypes.c_size_t]
+    net.InternetOpenUrlW.restype = ctypes.c_void_p
+    net.InternetSetOptionW.argtypes = [ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
+    net.InternetQueryOptionW.argtypes = [ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD)]
+    net.InternetCloseHandle.argtypes = [ctypes.c_void_p]
+    session = net.InternetOpenW(f"Snapline/{VERSION}", 0, None, None, 0)
+    if not session:
+        raise OSError(f"WinINet не открылся: {ctypes.WinError(ctypes.get_last_error())}")
     try:
-        with urllib.request.urlopen(request, timeout=5) as r:
-            data = json.load(r)
-        tag = data["tag_name"].lstrip("v")
-        return (tag, data["html_url"]) if version_key(tag) > version_key(VERSION) else None
-    except (OSError, ValueError, KeyError, TypeError):
+        limit = wintypes.DWORD(timeout_ms)
+        for option in (2, 5, 6):
+            net.InternetSetOptionW(session, option, ctypes.byref(limit), ctypes.sizeof(limit))
+        handle = net.InternetOpenUrlW(session, url, None, 0, 0x84000000, 0)
+        if not handle:
+            raise OSError(f"{url} не открылся: {ctypes.WinError(ctypes.get_last_error())}")
+        try:
+            buf, size = ctypes.create_unicode_buffer(2048), wintypes.DWORD(2048 * 2)
+            if not net.InternetQueryOptionW(handle, 34, buf, ctypes.byref(size)):
+                raise OSError(f"адрес ответа не прочитан: {ctypes.WinError(ctypes.get_last_error())}")
+            return buf.value
+        finally:
+            net.InternetCloseHandle(handle)
+    finally:
+        net.InternetCloseHandle(session)
+
+
+def latest_release():
+    try:
+        url = final_url(RELEASES)
+    except OSError:
         return None
+    m = re.search(r"/releases/tag/v?(\d+(?:\.\d+)*)$", url)
+    return (m[1], url) if m and version_key(m[1]) > version_key(VERSION) else None
 
 
 def check_out(cfg):
@@ -712,10 +928,14 @@ def handle(img, state, cfg):
             log("Экран чёрный, но чата на нём нет. Если ты не на F2, значит захват не видит игру: "
                 "поставь в настройках графики GTA режим «Оконный без рамки».", "fail")
             return TONE_FAIL
+        _, files, meta = shot_files(cfg["out"], s.name)
+        if meta.exists():
+            s.rows, saved, _, _ = load_rows(cfg["out"], s.name, cfg)
+            for i, r in enumerate(s.rows):
+                r["cut"] = i in saved["breaks"]
         s.chats += 1
-        save_src(img, cfg, f"{s.name}_chat{s.chats}", SRC_CHAT)
+        save_src(img, cfg, f"{s.name}_chat{max(map(chat_number, files), default=0) + 1}", SRC_CHAT)
         s.mark = s.mark or watermark(img)
-        restore_marks(s.rows, saved_edit(cfg["out"], s.name))
         s.rows = chat.merge(s.rows, rows)
         log(f"Чат #{s.chats}: строк {len(rows)}, из них в СС {sum(r['keep'] for r in rows)}.")
     else:
@@ -757,22 +977,6 @@ def saved_edit(out, name):
         return json.loads(meta.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
-
-
-def restore_marks(rows, old):
-    for i, r in enumerate(rows):
-        r["cut"] = i in old.get("breaks", [])
-    keep = old.get("keep", [])
-    if len(keep) != len(rows):
-        return
-    for r, k in zip(rows, keep):
-        r["keep"] = bool(k)
-    for key, field in MARKS:
-        spans = {}
-        for i, a, b in old.get(field, []):
-            spans.setdefault(i, []).append((a, b))
-        for i, r in enumerate(rows):
-            r[key] = spans.get(i, [])
 
 
 def wait_dark():
