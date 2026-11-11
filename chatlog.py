@@ -2,9 +2,11 @@ import argparse
 import base64
 import json
 import os
+import re
 import socket
 import sys
 import threading
+import time
 import urllib.parse
 import urllib.request
 from collections import deque
@@ -17,13 +19,29 @@ RESOURCE = "lspr"
 POLL_S = 0.5
 RETRY_S = 3.0
 TIMEOUT_S = 5.0
-RECENT = 300
+RECENT = 1000
+RESCAN_S = 10.0
+STATUS_MAX = 512 * 1024
+TAIL_BYTES = 1024 * 1024
+MATCH = 200
 
 INJECT = r"""
 (() => {
-  if (window.__snapline) return "ready";
+  if (window.__snaplog && window.__snaplog.v === 3) return "ready";
   const talk = /говорит|кричит|шепч|^\s*\*|^\s*>|\(\(/;
   const flat = s => s.replace(/\s*\n\s*/g, " ").trim();
+  const runs = el => {
+    const out = [];
+    const walk = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+    for (let n = walk.nextNode(); n; n = walk.nextNode()) {
+      const s = n.nodeValue.replace(/\s+/g, " ");
+      if (!s || !n.parentElement) continue;
+      const c = getComputedStyle(n.parentElement).color;
+      if (out.length && out[out.length - 1][1] === c) out[out.length - 1][0] += s;
+      else out.push([s, c]);
+    }
+    return out;
+  };
   const score = el => {
     let n = 0;
     for (const c of el.children) if (talk.test(c.textContent || "")) n++;
@@ -37,10 +55,13 @@ INJECT = r"""
     }
     return parts.join(" > ");
   };
-  window.__snapline = {
+  window.__snaplog = {
+    v: 3,
     box: null,
     looked: 0,
-    seen: new WeakSet(),
+    token: null,
+    nodes: [],
+    texts: new WeakMap(),
     find() {
       if (this.box && this.box.isConnected) return this.box;
       if (Date.now() - this.looked < 3000) return null;
@@ -54,17 +75,27 @@ INJECT = r"""
       this.box = best;
       return best;
     },
-    drain() {
+    drain(token, have) {
       const box = this.find();
       if (!box) return null;
-      const out = [];
+      const nodes = [], old = this.nodes;
+      let same = token === this.token && have === old.length;
       for (const c of box.children) {
-        if (this.seen.has(c)) continue;
-        this.seen.add(c);
-        const text = flat(c.innerText || c.textContent || "");
-        if (text) out.push(text);
+        const raw = c.textContent || "";
+        let hit = this.texts.get(c);
+        if (!hit || hit.raw !== raw) {
+          hit = {raw, text: flat(c.innerText || raw)};
+          this.texts.set(c, hit);
+          if (nodes.length < have) same = false;
+        }
+        if (!hit.text) continue;
+        if (nodes.length < have && old[nodes.length] !== c) same = false;
+        nodes.push(c);
       }
-      return out;
+      const base = same && nodes.length >= have ? have : 0;
+      this.token = token;
+      this.nodes = nodes;
+      return {base, lines: nodes.slice(base).map(c => ({text: this.texts.get(c).text, parts: runs(c)}))};
     },
     dump() {
       this.looked = 0;
@@ -204,48 +235,105 @@ def targets(port):
 
 def attach(port, mark):
     found = [t for t in targets(port) if t.get("webSocketDebuggerUrl")]
-    direct = [t for t in found if mark in t.get("url", "")]
-    if direct:
-        return Page(direct[0]["webSocketDebuggerUrl"]), None, direct[0]["url"]
-    for t in found:
-        page = Page(t["webSocketDebuggerUrl"])
+    pages = []
+    for t in sorted(found, key=lambda t: mark in t.get("url", "")):
         try:
-            context = page.find_context(mark)
-        except (RuntimeError, KeyError):
-            context = None
-        if context is not None:
-            return page, context, t["url"]
-        page.ws.close()
-    raise LookupError(f"FiveM запущен, но страницы {mark} нет: зайди на сервер")
+            page = Page(t["webSocketDebuggerUrl"])
+        except OSError:
+            continue
+        try:
+            context = None if mark in t.get("url", "") else page.find_context(mark)
+        except (OSError, RuntimeError, KeyError, ValueError):
+            page.ws.close()
+            continue
+        if context is None and mark not in t.get("url", ""):
+            page.ws.close()
+            continue
+        pages.append((page, context, t["url"]))
+    if not pages:
+        raise LookupError(f"FiveM запущен, но страницы {mark} нет: зайди на сервер")
+    return pages
 
 
-def fresh(batch, recent):
-    if len(batch) < 3:
-        return batch
-    tail = list(recent)
-    for k in range(min(len(batch), len(tail)), 0, -1):
-        if batch[:k] == tail[-k:]:
-            return batch[k:]
+def drain(target, token, have=0):
+    page, context, _ = target
+    expr = (f"window.__snaplog && window.__snaplog.v === 3 ? "
+            f"window.__snaplog.drain({json.dumps(token)}, {int(have)}) : false")
+    got = page.evaluate(expr, context)
+    if got is False:
+        page.evaluate(INJECT, context)
+        got = page.evaluate(expr, context)
+    return got
+
+
+def fresh(batch, known):
+    tail = list(known)[-MATCH:]
+    for j in range(len(batch) - 1, -1, -1) if tail else ():
+        k = min(j + 1, len(tail))
+        if batch[j] == tail[-1] and batch[j + 1 - k:j + 1] == tail[-k:]:
+            return batch[j + 1:]
     return batch
+
+
+def grown(prev, cur):
+    return cur[len(prev):] if cur[:len(prev)] == prev else fresh(cur, prev)
 
 
 class Log:
     def __init__(self, folder):
         self.folder = folder
         self.folder.mkdir(parents=True, exist_ok=True)
+        self.status_path = folder / "status.log"
+        try:
+            if self.status_path.stat().st_size > STATUS_MAX:
+                keep = self.status_path.read_text(encoding="utf-8", errors="replace").splitlines()[-2000:]
+                self.status_path.write_text("\n".join(keep) + "\n", encoding="utf-8")
+        except OSError:
+            pass
+
+    def tail(self, n):
+        days = sorted(self.folder.glob("????-??-??.txt"))
+        try:
+            with open(days[-1], "rb") as f:
+                f.seek(0, os.SEEK_END)
+                f.seek(max(0, f.tell() - TAIL_BYTES))
+                lines = f.read().decode("utf-8", errors="replace").splitlines()[-n:]
+        except (OSError, IndexError):
+            return []
+        return [m[1] for m in (re.fullmatch(r"\[\d\d:\d\d:\d\d\] (.*)", line) for line in lines) if m]
 
     def write(self, lines):
         now = datetime.now()
-        path = self.folder / f"{now:%Y-%m-%d}.txt"
-        with open(path, "a", encoding="utf-8") as f:
+        stamp = f"{now:%H:%M:%S}"
+        with open(self.folder / f"{now:%Y-%m-%d}.txt", "a", encoding="utf-8", errors="replace") as f:
             for line in lines:
-                f.write(f"[{now:%H:%M:%S}] {line}\n")
-                print(f"[{now:%H:%M:%S}] {line}", flush=True)
+                f.write(f"[{stamp}] {line['text']}\n")
+                print(f"[{stamp}] {line['text']}", flush=True)
+        with open(self.folder / f"{now:%Y-%m-%d}.jsonl", "a", encoding="utf-8", errors="replace") as f:
+            for line in lines:
+                f.write(json.dumps({"time": stamp, "parts": parts(line)}, ensure_ascii=False) + "\n")
+
+    def status(self, msg):
+        try:
+            with open(self.status_path, "a", encoding="utf-8", errors="replace") as f:
+                f.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}\n")
+        except OSError:
+            pass
 
     def dump(self, info, url):
         path = self.folder / "dom.html"
-        path.write_text(f"<!-- {url}\n{info.get('path')} -->\n{info.get('html') or ''}", encoding="utf-8")
+        path.write_text(f"<!-- {url}\n{info.get('path')} -->\n{info.get('html') or ''}", encoding="utf-8",
+                        errors="replace")
         return path
+
+
+def parts(line):
+    out = [[text, core.hex_color(str(color))] for text, color in line.get("parts") or [] if text]
+    flat = lambda text: re.sub(r"\s+", " ", text).strip()
+    if not out or flat("".join(t for t, _ in out)) != flat(line["text"]):
+        return core.guess_parts(line["text"])
+    out[0][0], out[-1][0] = out[0][0].lstrip(), out[-1][0].rstrip()
+    return [p for p in out if p[0]]
 
 
 def say(msg):
@@ -254,50 +342,71 @@ def say(msg):
 
 def run(port, mark, folder, stop, report=say):
     log = Log(folder)
-    recent = deque(maxlen=RECENT)
+    recent = deque(log.tail(RECENT), maxlen=RECENT)
     total, last = 0, None
+
+    def note(status):
+        nonlocal last
+        if status != last:
+            report(status)
+            log.status(status)
+            last = status
+
     while not stop.is_set():
         try:
-            page, context, url = attach(port, mark)
+            pages = attach(port, mark)
         except (OSError, ConnectionError, RuntimeError, ValueError, LookupError) as e:
-            status = str(e) if isinstance(e, LookupError) else "Жду FiveM: зайди в игру"
-            if status != last:
-                report(status)
-                last = status
+            note(str(e) if isinstance(e, LookupError) else "Жду FiveM: зайди в игру")
             stop.wait(RETRY_S)
             continue
-        report(f"Подключился к {mark}, ищу чат")
-        last, found = None, False
+        token, chat, since, seen = os.urandom(6).hex(), None, time.monotonic(), None
         try:
             while not stop.is_set():
-                lines = page.evaluate("window.__snapline ? window.__snapline.drain() : false", context)
-                if lines is False:
-                    page.evaluate(INJECT, context)
-                    found = False
+                if chat is None:
+                    for target in pages:
+                        got = drain(target, token)
+                        if got is not None:
+                            chat = target
+                            break
+                    if chat is None:
+                        note("Чат пока не найден: напиши что-нибудь в игре, чтобы появились строки")
+                        if time.monotonic() - since > RESCAN_S:
+                            break
+                        stop.wait(POLL_S)
+                        continue
+                    for page, _, _ in pages:
+                        if page is not chat[0]:
+                            page.ws.close()
+                    log.dump(chat[0].evaluate("window.__snaplog.dump()", chat[1]), chat[2])
+                    log.status(f"Страница чата: {chat[2]}")
+                    note(f"Чат найден, пишу. Строк в логе: {total}")
+                else:
+                    got = drain(chat, token, len(seen))
+                if got is None:
+                    stop.wait(POLL_S)
                     continue
-                if lines is None:
-                    if last != "box":
-                        report("Чат пока не найден: напиши что-нибудь в игре, чтобы появились строки")
-                        last = "box"
-                elif not found:
-                    found = True
-                    info = page.evaluate("window.__snapline.dump()", context)
-                    log.dump(info, url)
-                    report(f"Чат найден, пишу. Строк в логе: {total}")
-                if lines:
-                    new = fresh(lines, recent)
+                lines, texts = got["lines"], [line["text"] for line in got["lines"]]
+                if seen is None:
+                    new = fresh(texts, recent)
+                    seen = texts
+                elif got["base"]:
+                    new = texts
+                    seen = seen + texts
+                else:
+                    new = grown(seen, texts)
+                    seen = texts
+                if new:
+                    log.write(lines[len(lines) - len(new):])
                     recent.extend(new)
-                    if new:
-                        log.write(new)
-                        total += len(new)
-                        report(f"Чат найден, пишу. Строк в логе: {total}")
+                    total += len(new)
+                    report(f"Чат найден, пишу. Строк в логе: {total}")
                 stop.wait(POLL_S)
         except (OSError, ConnectionError, RuntimeError, ValueError) as e:
-            report(f"Связь потеряна ({e}), переподключаюсь")
-            last = None
+            note(f"Связь потеряна ({e}), переподключаюсь")
             stop.wait(RETRY_S)
         finally:
-            page.ws.close()
+            for page, _, _ in pages:
+                page.ws.close()
 
 
 def main():

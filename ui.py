@@ -1,3 +1,4 @@
+import bisect
 import ctypes
 import io
 import json
@@ -32,11 +33,12 @@ SLATE = "#1e2026"
 MIST = "#2a2f39"
 HAIR = "#202329"
 LINE = "#454b57"
+DIM = "#6b7180"
 WHITE = "#f4f4f5"
 SUB = "#a3a8b3"
 ERR = "#ff7a70"
 
-ICONS = {"file": "", "images": "", "cut": "", "lines": "", "crop": "", "text": "", "copy": "", "folder": "",
+ICONS = {"file": "", "scene": "", "images": "", "cut": "", "lines": "", "crop": "", "text": "", "copy": "", "folder": "",
          "up": "", "down": "", "close": ""}
 CHROME = {"min": "", "max": "", "restore": "", "close": ""}
 CHROME_TEXT = {"min": "–", "max": "□", "restore": "❐", "close": "×"}
@@ -44,15 +46,24 @@ FORMATS = {"square": "Квадрат", "full": "Экран", "16:9": "16:9", "4:
 SIZES = {"native": "Как снято", "hd": "720", "fhd": "1080", "qhd": "1440", "4k": "2160"}
 FILES = {"jpg": "JPG", "png": "PNG"}
 NICKS = {"no": "Показывать", "yes": "Прятать"}
-CLICKS = {"rows": "Убрать строку", "hide": "Скрыть слово", "drop": "Удалить слово"}
 CROPS = {"free": "Свободно", "1:1": "Квадрат", "4:3": "4:3", "3:4": "3:4", "16:9": "16:9", "9:16": "9:16"}
 HANDLES = ("l", "r", "t", "b", "lt", "rt", "lb", "rb")
-TOOLS = ("lines", "crop", "text", "images", "file")
+TOOLS = ("lines", "crop", "text", "images", "scene", "file")
+PREVIEWS = ("scene", "file")
+DONORS = ("carry", "photopick", "scenepick")
+EDITS = ("lines", "carry", "logpick", "crop", "text", "images", "photopick")
+FRAMED = ("crop", "text", "images")
 SIDES = {"none": "Нет", "left": "Слева", "right": "Справа", "top": "Сверху", "bottom": "Снизу"}
 FIELD_DEFAULT = {"size": 0.5, "fade": 0.3}
-CLICK_HINTS = {"rows": "Клик убирает строку из СС или возвращает её.",
-               "hide": "Клик закрывает слово плашкой под цвет реплики. Повторный клик возвращает его.",
-               "drop": "Клик убирает слово вместе с пробелом, текст подтягивается. Повторный клик возвращает его."}
+RAIL_HINTS = {"lines": "Какие строки чата попадут в СС · клавиша 1",
+              "crop": "Что попадёт в кадр и какого он размера · клавиша 2",
+              "text": "Размер текста, обводка и где стоит чат · клавиша 3",
+              "images": "Второй ракурс или стикер поверх СС · клавиша 4",
+              "scene": "Несколько СС одна под другой · клавиша 5",
+              "file": "JPG или PNG, качество и вес файла · клавиша 6",
+              "copy": "Скопировать СС в буфер (Ctrl+C), вставлять через Ctrl+V",
+              "folder": "Показать файл в папке"}
+EDGES = {"left": "у левого края", "right": "у правого края", "top": "у верхнего края", "bottom": "у нижнего края"}
 SCALES = {"1": "×1", "1.25": "×1.25", "1.5": "×1.5", "1.75": "×1.75", "2": "×2"}
 OUTLINES = {"0": "Нет", "1": "1 px", "2": "2 px", "3": "3 px"}
 POSITIONS = {"top-left": "Сверху слева", "top-right": "Сверху справа",
@@ -60,6 +71,10 @@ POSITIONS = {"top-left": "Сверху слева", "top-right": "Сверху �
 DISCORD = "https://discord.com/users/320909791826280452"
 SITE = "https://ls-project.com/"
 MODES = {"yes": "Одна кнопка", "no": "Две кнопки"}
+SOURCES = {"screen": "С экрана", "log": "Из чатлога"}
+VIEWS = {"one": "Эту СС", "all": "Всю сцену"}
+LOG_SHOW = {"rp": "Отыгровка", "all": "Все строки"}
+LOG_NAMES = 14
 SOUND = {"yes": "Вкл", "no": "Выкл"}
 KINDS = {chat.SPEECH: "Речь", chat.ACTION: "Действия", chat.AME: "Над головой",
          chat.SYSTEM: "Система", chat.OOC: "OOC и ЛС"}
@@ -125,6 +140,12 @@ def when(name):
     return f"{t.day} {MONTHS[t.month - 1]}, {t:%H:%M}"
 
 
+def place_name(pos):
+    if isinstance(pos, str):
+        return POSITIONS[core.corner_of(pos)].lower()
+    return next((EDGES[v] for v in pos if isinstance(v, str) and v in EDGES), "своё место")
+
+
 @lru_cache(maxsize=256)
 def rounded(w, h, r, fill=None, outline=None, width=1.0):
     k = 4
@@ -145,7 +166,7 @@ def tick(size, on):
         d.line([(s * 0.26, s * 0.52), (s * 0.43, s * 0.68), (s * 0.75, s * 0.33)], fill=VOID, width=round(2.2 * k),
                joint="curve")
     else:
-        d.rounded_rectangle((k, k, s - 1 - k, s - 1 - k), radius=5 * k, outline=LINE, width=round(1.5 * k))
+        d.rounded_rectangle((k, k, s - 1 - k, s - 1 - k), radius=5 * k, outline=DIM, width=round(1.5 * k))
     return img.resize((size, size), Image.LANCZOS)
 
 
@@ -169,6 +190,18 @@ def animations_on():
 
 def rgb(color):
     return np.array([int(color[i:i + 2], 16) for i in (1, 3, 5)], np.float32)
+
+
+def shade(frame, bands):
+    arr = np.asarray(frame, np.float32)
+    h = arr.shape[0]
+    k = np.ones(h, np.float32)
+    top, bottom = (min(h, round(b)) for b in bands)
+    if top:
+        k[:top] = 0.3 + 0.7 * core.ramp(top)
+    if bottom:
+        k[h - bottom:] = np.minimum(k[h - bottom:], 0.3 + 0.7 * core.ramp(bottom)[::-1])
+    return Image.fromarray((arr * k[:, None, None]).round().astype(np.uint8))
 
 
 class Wordmark(tk.Label):
@@ -336,6 +369,33 @@ class Choice(tk.Frame):
     def pick(self, value):
         self.set(value)
         self.on_pick(value)
+
+
+class Corners(tk.Canvas):
+    def __init__(self, parent, value, on_pick):
+        self.w, self.h, self.value = px(48), px(32), value
+        super().__init__(parent, width=self.w, height=self.h, bg=parent["bg"], highlightthickness=0, bd=0,
+                         cursor="hand2")
+        self.frame = ImageTk.PhotoImage(rounded(self.w, self.h, px(6), None, LINE, 1.2))
+        self.create_image(0, 0, anchor="nw", image=self.frame)
+        r, inset, self.dots = px(4), px(9), {}
+        for corner in core.CHAT_POSITIONS:
+            v, side = corner.split("-")
+            x, y = inset if side == "left" else self.w - inset, inset if v == "top" else self.h - inset
+            on = corner == value
+            self.dots[corner] = self.create_oval(x - r, y - r, x + r, y + r, fill=WHITE if on else "",
+                                                 outline=WHITE if on else DIM)
+        self.bind("<Button-1>", lambda e: on_pick(self.spot(e)))
+        self.bind("<Motion>", lambda e: self.lit(self.spot(e)))
+        self.bind("<Leave>", lambda _: self.lit(None))
+
+    def spot(self, e):
+        return ("top" if e.y < self.h / 2 else "bottom") + "-" + ("left" if e.x < self.w / 2 else "right")
+
+    def lit(self, near):
+        for corner, dot in self.dots.items():
+            if corner != self.value:
+                self.itemconfig(dot, outline=WHITE if corner == near else DIM)
 
 
 class FramePick(tk.Frame):
@@ -532,8 +592,8 @@ class Painter:
         part = self.scaled[2].crop((round(x0 * d), round(y0 * d), round(x1 * d), round(y1 * d)))
         return part if part.size == size else part.resize(size, Image.BILINEAR)
 
-    def draw(self, shot, area, tag="shot"):
-        bg, rows, edit = shot["bg"], shot["rows"], shot["edit"]
+    def draw(self, shot, area, tag="shot", edit=None, laps=(0, 0)):
+        bg, rows, edit = shot["bg"], shot["rows"], edit or shot["edit"]
         p = core.plan(bg, edit)
         out_w, out_h = p["size"]
         ax, ay, aw, ah = area
@@ -544,12 +604,16 @@ class Painter:
             frame = self.frame(bg, p["rect"], (dw, dh))
         else:
             frame = self.joined(shot, p, d, (dw, dh))
+        if any(laps):
+            frame = shade(frame, [lap * d for lap in laps])
+        it, ib = laps[0] // 2, laps[1] // 2
+        inner = out_h - it - ib
         groups = core.parts(rows, edit)
         key = (id(shot), shot.get("name"), id(rows), len(rows), tuple(r["keep"] for r in rows),
                tuple((tuple(map(tuple, r.get("hide", []))), tuple(map(tuple, r.get("drop", [])))) for r in rows),
-               tuple(core.cuts(rows, edit)), p["outline"], round(p["scale"], 4), out_h, p["margin"])
+               tuple(core.cuts(rows, edit)), p["outline"], round(p["scale"], 4), inner, p["margin"])
         if key != self.key:
-            self.layers = [chat.chat_layer(part, p["outline"], p["scale"], out_h - 2 * p["margin"])
+            self.layers = [chat.chat_layer(part, p["outline"], p["scale"], inner - 2 * p["margin"])
                            for part, _ in groups]
             self.key = key
             self.small = {}
@@ -558,17 +622,19 @@ class Painter:
         self.c.create_image(ix, iy, anchor="nw", image=self.photos[0], tags=(tag,))
         pad = p["outline"] + 2
         geo = {"img": (ix, iy, dw, dh), "d": d, "out": (out_w, out_h), "plan": p, "pad": pad, "chats": [],
-               "painted": sum(n for _, n, _ in self.layers), "overlays": [], "join": None}
+               "painted": sum(n for _, n, _ in self.layers), "overlays": [], "join": None, "inset": (it, ib)}
         if p["ext_box"]:
             l, t, r, b = p["ext_box"]
             geo["join"] = (ix + l * d, iy + t * d, ix + r * d, iy + b * d)
         self.draw_overlays(shot, geo, tag)
-        for k, ((layer, _, _), (_, pos)) in enumerate(zip(self.layers, groups)):
+        spots = core.chat_spots((out_w, inner), [layer for layer, _, _ in self.layers], [pos for _, pos in groups],
+                                pad, p["margin"])
+        for k, ((layer, _, _), spot) in enumerate(zip(self.layers, spots)):
             if layer is None:
                 geo["chats"].append(None)
                 continue
             lh, lw = layer.shape[:2]
-            left, top = chat.place(out_w, out_h, lw, lh, pad, pos, p["margin"])
+            left, top = spot[0], spot[1] + it
             size = (max(1, round(lw * d)), max(1, round(lh * d)))
             if k not in self.small or self.small[k][0] != size:
                 small = Image.fromarray(layer, "RGBA").resize(size, Image.LANCZOS)
@@ -640,8 +706,16 @@ class Feed:
         self.message = None
         self.note = ""
         self.save_job = None
-        self.save_target = None
-        self.click_mode = "rows"
+        self.saves = {}
+        self.whole = False
+        self.save_queue = queue.Queue()
+        threading.Thread(target=self.save_loop, daemon=True).start()
+        self.part = None
+        self.items = []
+        self.added = set()
+        self.popup = None
+        self.hint_text = None
+        self.hint_photo = None
         self.active_ov = 0
         self.loading = set()
         self.offset = 0
@@ -661,8 +735,17 @@ class Feed:
         self.preview_rev = 0
         self.preview_job = None
         self.preview_photo = None
+        self.preview_rect = None
+        self.preview_view = None
+        self.preview_img = None
+        self.view_box = None
+        self.view = {"zoom": 1.0, "cx": 0.5, "cy": 0.5}
+        self.seam = "all"
+        self.layout = None
+        self.logview = None
+        self.log_font = None
         self.loupe = Loupe(self.c)
-        self.c.bind("<Leave>", lambda _: self.loupe.hide())
+        self.c.bind("<Leave>", lambda _: (self.loupe.hide(), self.hint(None)))
         self.c.bind("<Configure>", lambda _: self.settle())
         self.c.bind("<ButtonPress-1>", self.press)
         self.c.bind("<B1-Motion>", self.motion)
@@ -694,7 +777,8 @@ class Feed:
         self.flush_save()
         name = self.name
         self.shot = None
-        self.preview = self.preview_info = None
+        self.preview = self.preview_info = self.layout = self.part = None
+        self.view, self.seam = {"zoom": 1.0, "cx": 0.5, "cy": 0.5}, "all"
         self.loupe.hide()
         if name is None:
             self.redraw()
@@ -728,16 +812,25 @@ class Feed:
 
     def loaded(self, name, shot):
         self.loading.discard(name)
+        if self.cache.get(name):
+            return
         self.cache[name] = shot or False
-        if len(self.cache) > 6:
-            self.cache.pop(next(iter(self.cache)))
+        keep = set(self.scene_names()) | {self.name}
+        while len(self.cache) > 6 + len(keep):
+            old = next((n for n in self.cache if n not in keep), None)
+            if old is None:
+                break
+            self.cache.pop(old)
         if name == self.name:
             self.shot = shot
             self.redraw()
             self.fetch_next()
+        elif self.shot is not None and self.drag is None and name in self.scene_names() and self.tool in EDITS:
+            if self.tool == "lines" or name == self.part:
+                self.redraw()
 
     def new_shot(self, name):
-        if self.save_job and self.save_target and self.save_target.get("name") == name:
+        if self.saves.pop(name, None) and not self.saves and self.save_job:
             self.c.after_cancel(self.save_job)
             self.save_job = None
         self.cache.pop(name, None)
@@ -762,6 +855,7 @@ class Feed:
             return
         self.c.delete("all")
         self.photos = []
+        self.preview_rect = self.view_box = self.popup = self.hint_text = None
         if self.sheet:
             self.sheet.destroy()
             self.sheet = None
@@ -825,8 +919,14 @@ class Feed:
         elif self.message:
             level, body = self.message
             title = {"fail": "Не вышло", "step": "Половина есть"}.get(level, title)
+        log = cfg["source"] == "log"
         if body is None:
-            if cfg["auto"]:
+            if log:
+                first = (f"Нажми {key} в игре и программа сама спрячет интерфейс" if cfg["auto"]
+                         else f"В игре нажми {hud}, затем {key}")
+                body = (f"{first}: снимется только сцена, без затемнения. Строки потом отметишь в «Строках» "
+                        f"из чатлога. Готовая СС появится здесь или в папке скриншотов.")
+            elif cfg["auto"]:
                 body = (f"Нажми {key} в игре и программа сама спрячет интерфейс и затемнит экран, "
                         f"а готовая СС появится здесь или в папке скриншотов.")
             else:
@@ -840,8 +940,11 @@ class Feed:
         else:
             y = self.text(x, y, title, (FONT["display"], 30)) + px(12)
         y = self.text(x, y, body, (FONT["ui"], 13), SUB if level != "fail" else WHITE, width) + px(14)
-        y = self.text(x, y, f"Памятка: если диалог длинный, то нажми {dark} и вновь {key}. "
-                            f"Тогда в одной СС будет несколько чатбоксов.", (FONT["ui"], 10), SUB, width)
+        tip = ("Памятка: в чатлоге видны строки за час до и после СС, так что отыграть сцену можно и после "
+               "снимка." if log else
+               f"Памятка: если диалог длинный, то нажми {dark} и вновь {key}. "
+               f"Тогда в одной СС будет несколько чатбоксов.")
+        y = self.text(x, y, tip, (FONT["ui"], 10), SUB, width)
         if self.app.update:
             version, url = self.app.update
             self.c.create_text(x, y + px(10), text=f"Вышла Snapline {version} — скачать", fill=WHITE, anchor="nw",
@@ -873,27 +976,234 @@ class Feed:
         geo = None
         if self.shot is None:
             self.draw_saved(area, name)
-        elif self.tool == "lines":
-            self.draw_lines(area)
-        elif self.tool in ("carry", "photopick"):
-            self.draw_donors(area)
         else:
-            self.decorate(self.painter.draw(self.shot, area))
+            self.draw_media(area)
         if self.tool:
             self.build_sheet(H)
         else:
             self.caption(H, name, view_only)
         tools = [] if self.shot is None else [
-            ("lines", "Строки", lambda: self.toggle_tool("lines"), self.tool in ("lines", "carry")),
+            ("lines", "Строки", lambda: self.toggle_tool("lines"), self.tool in ("lines", "carry", "logpick")),
             ("crop", "Кадр", lambda: self.toggle_tool("crop"), self.tool == "crop"),
             ("text", "Текст", lambda: self.toggle_tool("text"), self.tool == "text"),
             ("images", "Картинки", lambda: self.toggle_tool("images"), self.tool in ("images", "photopick")),
+            ("scene", "Сцена", lambda: self.toggle_tool("scene"), self.tool in ("scene", "scenepick")),
             ("file", "Файл", lambda: self.toggle_tool("file"), self.tool == "file"),
         ]
+        tools.append(None)
         if self.shot is not None or view_only:
             tools.append(("copy", "Копировать", self.copy, False))
         tools.append(("folder", "В папке", self.open_folder, False))
         self.rail(W, H, tools)
+
+    def draw_media(self, area):
+        self.preview_rect = self.view_box = None
+        if self.tool == "lines":
+            self.draw_lines(area)
+        elif self.tool == "logpick":
+            self.draw_log(area)
+        elif self.tool in DONORS:
+            self.draw_donors(area)
+        elif (self.tool is None or self.previewing()) and self.scene_names():
+            self.draw_scene(area)
+        elif self.target is None:
+            ax, ay, aw, ah = area
+            self.painter.geo = None
+            text = "Исходники этой СС не найдены" if self.cache.get(self.part) is False else "Загружаю СС…"
+            self.c.create_text(ax + aw // 2, ay + ah // 2, text=text, fill=SUB, font=(FONT["ui"], 12), tags=("shot",))
+        else:
+            edit, laps = self.look(self.target)
+            self.decorate(self.painter.draw(self.target, area, edit=edit, laps=laps))
+
+    def scene_names(self):
+        scene = self.shot["edit"].get("scene") if self.shot else None
+        return list(scene["shots"]) if scene and self.shot["name"] in scene["shots"] else []
+
+    @property
+    def target(self):
+        if self.shot is None or self.tool not in EDITS or self.part in (None, self.name):
+            return self.shot
+        if self.part not in self.scene_names():
+            return self.shot
+        return self.cache.get(self.part) or None
+
+    def members(self):
+        return [(n, self.shot if n == self.name else self.cache.get(n) or None) for n in self.scene_names()]
+
+    def previewing(self):
+        return self.tool in PREVIEWS or self.tool == "text" and self.whole and bool(self.scene_names())
+
+    def member(self, name):
+        if name == self.name:
+            return self.shot
+        shot = self.cache.get(name)
+        if not shot:
+            try:
+                shot = core.load_shot(self.shot["out"], name, self.app.cfg)
+            except (OSError, ValueError):
+                shot = None
+            if shot:
+                self.cache[name] = shot
+        return shot or None
+
+    def fetch_scene(self):
+        for name in self.scene_names():
+            self.fetch(name)
+
+    def seams(self):
+        given = self.shot["edit"]["scene"].get("seams") or []
+        return [dict(core.SEAM, **(given[k] if k < len(given) else {})) for k in range(len(self.scene_names()) - 1)]
+
+    def scene_plan(self):
+        head = self.shot["edit"]
+        width = core.plan(self.shot["bg"], core.framed(head, head))["size"][0]
+        hs = [core.plan(s["bg"], core.framed(s["edit"], head), width)["size"][1] if s else None
+              for _, s in self.members()]
+        mine = hs[self.scene_names().index(self.name)]
+        hs = [h or mine for h in hs]
+        return width, hs, core.laps_of(hs, self.seams())
+
+    def scene_size(self):
+        width, hs, laps = self.scene_plan()
+        return width, sum(hs) - sum(laps)
+
+    def look(self, shot):
+        names = self.scene_names()
+        if not names or shot.get("name") not in names:
+            return shot["edit"], (0, 0)
+        edit = core.framed(shot["edit"], self.shot["edit"])
+        width, _, laps = self.scene_plan()
+        k = names.index(shot["name"])
+        f = core.plan(shot["bg"], edit)["size"][0] / width
+        return edit, (round(laps[k - 1] * f) if k else 0, round(laps[k] * f) if k < len(laps) else 0)
+
+    def current(self):
+        names = self.scene_names()
+        return self.part if self.part in names else self.name
+
+    def pick_part(self, name):
+        self.part = None if name == self.name else name
+        self.fetch(name)
+        self.active_ov = 0
+        self.redraw()
+
+    def frame_strip(self, body):
+        names, current = self.scene_names(), self.current()
+        self.field(body, "СС в сцене", 0)
+        box = tk.Frame(body, bg=VOID)
+        box.pack(anchor="w", pady=(0, px(10)))
+        per = max(1, self.sheet_w // (px(54) + px(12)))
+        for k, name in enumerate(names):
+            on = name == current
+            cell = tk.Frame(box, bg=VOID, cursor="hand2")
+            cell.grid(row=k // per, column=k % per, padx=(0, px(8)), pady=(0, px(6)), sticky="nw")
+            photo = self.frame_thumb(name)
+            pic = tk.Label(cell, image=photo, bg=VOID, bd=0, highlightthickness=px(2),
+                           highlightbackground=WHITE if on else VOID) if photo else None
+            if pic:
+                pic.pack(anchor="w")
+            text = f"{k + 1}" + (" · эта" if name == self.name else "")
+            tag = tk.Label(cell, text=text, bg=VOID, fg=WHITE if on else SUB, font=(FONT["ui"], 9), anchor="w")
+            tag.pack(anchor="w")
+            for w in (cell, pic, tag):
+                if w:
+                    w.bind("<Button-1>", lambda _, n=name: self.pick_part(n))
+
+    def draw_scene(self, area):
+        ax, ay, aw, ah = area
+        if self.tool is None:
+            self.draw_saved(area, self.name)
+            return
+        if self.preview is None:
+            self.c.create_text(ax + aw // 2, ay + ah // 2, text="Собираю сцену…", fill=SUB, font=(FONT["ui"], 12),
+                               tags=("shot",))
+            return
+        arr, view = self.preview, self.view
+        H, W = arr.shape[:2]
+        fit = min(aw / W, ah / H)
+        view["zoom"] = min(max(view["zoom"], 1.0), max(1.0, 4 / fit))
+        d = fit * view["zoom"]
+        vw, vh = max(1, min(aw, round(W * d))), max(1, min(ah, round(H * d)))
+        sw, sh = min(W, vw / d), min(H, vh / d)
+        x0 = max(0.0, min(view["cx"] * W - sw / 2, W - sw))
+        y0 = max(0.0, min(view["cy"] * H - sh / 2, H - sh))
+        view["cx"], view["cy"] = (x0 + sw / 2) / W, (y0 + sh / 2) / H
+        rect = (ax + (aw - vw) // 2, ay + (ah - vh) // 2, vw, vh)
+        self.view_box, self.preview_rect = (x0, y0, d), rect
+        self.preview_view = arr[int(y0):int(y0 + sh), int(x0):int(x0 + sw)]
+        key = (id(arr), rect, round(x0, 2), round(y0, 2))
+        if self.preview_photo is None or self.preview_photo[0] != key:
+            if self.preview_img is None or self.preview_img[0] is not arr:
+                self.preview_img = (arr, Image.fromarray(arr))
+            img = self.preview_img[1].resize((vw, vh), Image.NEAREST if d >= 2 else Image.BILINEAR,
+                                             box=(x0, y0, x0 + sw, y0 + sh), reducing_gap=None if d >= 1 else 2.0)
+            self.preview_photo = (key, ImageTk.PhotoImage(img))
+        self.c.create_image(rect[0], rect[1], anchor="nw", image=self.preview_photo[1], tags=("shot",))
+        if self.seam == "all" or not self.layout or int(self.seam) >= len(self.layout["laps"]):
+            return
+        k = int(self.seam)
+        top = self.layout["tops"][k + 1]
+        edges = sorted({top, top + self.layout["laps"][k]})
+        ix, iy = rect[:2]
+        if iy + (edges[-1] - y0) * d < iy or iy + (edges[0] - y0) * d > iy + vh:
+            return
+        for y in edges:
+            sy = iy + (y - y0) * d
+            if iy <= sy <= iy + vh:
+                self.c.create_line(ix, sy + 1, ix + vw, sy + 1, fill=VOID, width=2, tags=("shot",))
+                self.c.create_line(ix, sy, ix + vw, sy, fill=WHITE, width=2, dash=(6, 4), tags=("shot",))
+        label = f"переход {k + 1}–{k + 2}"
+        ly = min(max(iy + (edges[0] - y0) * d - px(24), iy + px(4)), iy + vh - px(24))
+        tw = tkfont.Font(family=FONT["semi"], size=9).measure(label) + px(16)
+        self.c.create_rectangle(ix + px(6), ly, ix + px(6) + tw, ly + px(20), fill=VOID, outline="", tags=("shot",))
+        self.c.create_text(ix + px(6) + tw / 2, ly + px(10), text=label, fill=WHITE, font=(FONT["semi"], 9),
+                           tags=("shot",))
+
+    def seam_at(self, y):
+        if not self.view_box or not self.layout:
+            return None
+        x0, y0, d = self.view_box
+        sy = y0 + (y - self.preview_rect[1]) / d
+        near = px(8) / d
+        for k, lap in enumerate(self.layout["laps"]):
+            top = self.layout["tops"][k + 1]
+            if top - near <= sy <= top + lap + near:
+                return k
+        return None
+
+    def zoom_view(self, zoom, at=None):
+        if self.preview is None or not self.view_box:
+            return
+        ax, ay, aw, ah = self.area()
+        x0, y0, d = self.view_box
+        H, W = self.preview.shape[:2]
+        fit = min(aw / W, ah / H)
+        zoom = min(max(zoom, 1.0), max(1.0, 4 / fit))
+        if at is not None:
+            rx, ry = self.preview_rect[:2]
+            sx, sy = x0 + (at[0] - rx) / d, y0 + (at[1] - ry) / d
+            nd = fit * zoom
+            self.view["cx"] = (sx - (at[0] - ax - aw / 2) / nd) / W
+            self.view["cy"] = (sy - (at[1] - ay - ah / 2) / nd) / H
+        self.view["zoom"] = zoom
+        self.media_redraw()
+
+    def view_fit(self, kind):
+        if self.preview is None:
+            return
+        ax, ay, aw, ah = self.area()
+        H, W = self.preview.shape[:2]
+        fit = min(aw / W, ah / H)
+        self.zoom_view({"all": 1.0, "width": aw / W / fit, "real": 1 / fit}[kind])
+
+    def focus_frame(self, k):
+        if self.preview is None or not self.layout or k >= len(self.layout["tops"]):
+            return
+        ax, ay, aw, ah = self.area()
+        H, W = self.preview.shape[:2]
+        top, h = self.layout["tops"][k], self.layout["heights"][k]
+        self.view.update(cx=0.5, cy=(top + h / 2) / H)
+        self.zoom_view(min(aw / W, ah / h) / min(aw / W, ah / H))
 
     def decorate(self, geo):
         ix, iy, dw, dh = geo["img"]
@@ -903,7 +1213,7 @@ class Feed:
                 l, t, r, b = geo["join"]
                 self.c.create_rectangle(l, t, r - 1, b - 1, outline=WHITE, width=1, dash=(4, 3), tags=("shot",))
         elif self.tool == "file":
-            self.draw_preview(geo)
+            self.draw_preview(geo["img"])
         self.mark_overlay(geo)
 
     def draw_saved(self, area, name):
@@ -920,11 +1230,24 @@ class Feed:
     def meta(self):
         if self.shot is None:
             return "загружаю…" if self.cache.get(self.name) is None else "только просмотр"
-        w, h = core.plan(self.shot["bg"], self.shot["edit"])["size"]
-        parts = [f"{w} × {h}"]
+        shot, scene = self.target, self.scene_names()
+        if not scene:
+            w, h = core.plan(self.shot["bg"], self.shot["edit"])["size"]
+            parts = [f"{w} × {h}"]
+        elif self.tool in FRAMED and shot is not None and not self.previewing():
+            w, h = core.plan(shot["bg"], self.look(shot)[0])["size"]
+            parts = [f"СС {scene.index(shot['name']) + 1} из {len(scene)}", f"кадр {w} × {h}",
+                     "сцена {} × {}".format(*self.scene_size())]
+        else:
+            parts = [f"сцена из {len(scene)} СС"]
+            if self.preview is not None and self.previewing():
+                parts.append(f"{self.preview.shape[1]} × {self.preview.shape[0]}")
+            if self.view_box:
+                parts.append(f"масштаб {round(self.view_box[2] * 100)}%")
         geo = self.painter.geo
-        kept = sum(r["keep"] for r in self.shot["rows"])
-        if geo and self.tool not in ("lines", "carry", "photopick") and geo["painted"] < kept:
+        kept = sum(r["keep"] for r in shot["rows"]) if shot else 0
+        drawn = self.tool in FRAMED or not scene and self.tool in (None, "file")
+        if geo and shot and drawn and geo["painted"] < kept:
             parts.append(f"влезло {geo['painted']} из {kept} строк")
         if self.note:
             parts.append(self.note)
@@ -938,35 +1261,48 @@ class Feed:
         y = self.text(x, y, self.meta(), (FONT["ui"], 11), SUB, width, tags=("cap", "meta")) + px(18)
         if view_only:
             hint = "Исходные кадры этой СС не найдены, её можно только посмотреть и скопировать."
+        elif self.empty_log():
+            hint = "Чат пока пустой: открой «Строки» клавишей 1 и отметь нужные строки чатлога."
+        elif self.scene_names():
+            hint = "Это сцена из нескольких СС. Инструменты — справа или клавишами 1–6, колесо листает СС."
         else:
-            hint = ("Чат можно перетащить мышью, у краёв он прилипает к углам. "
-                    "Строки, кадр, текст, картинки и файл — справа или клавишами 1–5. Колесо мыши листает СС.")
+            hint = "Инструменты — справа или клавишами 1–6. Колесо листает СС."
         self.text(x, y, hint, (FONT["ui"], 10), SUB, width)
         self.lift_block("cap", H - PAD - px(12))
 
     def rail(self, W, H, items):
         cx = W - RAIL_W / 2
         top, bottom = PAD, H - PAD - (px(86) if self.names else 0)
-        step = min(px(76), (bottom - top) / max(1, len(items)))
-        y = (top + bottom) / 2 - step * (len(items) - 1) / 2 - px(9)
-        for key, label, command, active in items:
-            tag = f"rail-{key}"
-            if active:
-                self.photos.append(ImageTk.PhotoImage(rounded(px(46), px(46), px(23), WHITE)))
+        slots = sum(0.5 if item is None else 1 for item in items)
+        step = min(px(76), (bottom - top) / max(1, slots))
+        ring, drop = min(px(46), round(step * 0.6)), min(px(34), round(step * 0.5))
+        y = (top + bottom) / 2 - step * (slots - 1) / 2 - px(9)
+        for item in items:
+            if item is None:
+                line = y - step + (drop + px(6) + step * 1.5 - ring / 2) / 2
+                self.c.create_line(cx - px(16), line, cx + px(16), line, fill=LINE, tags=("rail",))
+                y += step * 0.5
+                continue
+            key, label, command, active = item
+            tag, idle = f"rail-{key}", WHITE if key == "copy" else SUB
+            if active or key == "copy":
+                image = rounded(ring, ring, ring / 2, WHITE) if active else rounded(ring, ring, ring / 2, None, WHITE,
+                                                                                    1.4 * K)
+                self.photos.append(ImageTk.PhotoImage(image))
                 self.c.create_image(cx, y, image=self.photos[-1], tags=(tag, "rail"))
             if FONT["icon"]:
                 self.c.create_text(cx, y, text=ICONS[key], font=(FONT["icon"], 18), fill=VOID if active else WHITE,
                                    tags=(tag, "rail", tag + "-ink" if not active else tag + "-on"))
-            self.c.create_text(cx, y + px(34), text=label, font=(FONT["ui"], 9), fill=WHITE if active else SUB,
+            self.c.create_text(cx, y + drop, text=label, font=(FONT["ui"], 9), fill=WHITE if active else idle,
                                tags=(tag, "rail", tag + "-label"))
-            self.c.create_rectangle(cx - px(46), y - px(28), cx + px(46), y + px(46), outline="", fill="",
+            self.c.create_rectangle(cx - px(46), y - step * 0.4, cx + px(46), y + step * 0.6, outline="", fill="",
                                     tags=(tag, "rail"))
             self.c.tag_bind(tag, "<Button-1>", lambda _, f=command: f())
             if not active:
                 self.c.tag_bind(tag, "<Enter>", lambda _, t=tag: (self.c.itemconfig(t + "-label", fill=WHITE),
                                                                   self.c.config(cursor="hand2")))
-                self.c.tag_bind(tag, "<Leave>", lambda _, t=tag: (self.c.itemconfig(t + "-label", fill=SUB),
-                                                                  self.c.config(cursor="")))
+                self.c.tag_bind(tag, "<Leave>", lambda _, t=tag, c=idle: (self.c.itemconfig(t + "-label", fill=c),
+                                                                          self.c.config(cursor="")))
             y += step
         if self.names:
             total = len(self.names) + 1
@@ -984,13 +1320,31 @@ class Feed:
                         self.hover_link(tag)
 
     def toggle_tool(self, tool):
-        self.tool = None if self.tool == tool else tool
+        if tool == "scene" and self.tool != "scene" and self.shot is not None and not self.scene_names():
+            tool = "scenepick"
+        if tool == "lines" and self.tool not in ("lines", "logpick") and self.empty_log():
+            tool = "logpick"
+        was = self.previewing()
+        old, self.tool = self.tool, None if self.tool == tool else tool
         self.offset = 0
         self.loupe.hide()
-        if self.tool == "file":
-            self.preview = self.preview_info = None
+        if old == "scenepick" and self.added and self.scene_names():
+            self.drop_repeats()
+        self.added = set()
+        if self.tool in EDITS:
+            self.fetch_scene()
+        if self.previewing():
+            if not was:
+                self.preview = self.preview_info = None
             self.want_preview()
+        if self.tool == "logpick":
+            self.open_log()
         self.redraw()
+
+    def empty_log(self):
+        shot = self.shot
+        return (shot is not None and not shot["rows"] and not self.scene_names()
+                and core.log_path(shot["out"], shot["name"]).exists())
 
     def build_sheet(self, H):
         sheet = tk.Frame(self.c, bg=VOID)
@@ -1000,7 +1354,8 @@ class Feed:
         head = tk.Frame(sheet, bg=VOID)
         head.pack(fill="x", padx=(0, px(12)))
         title = {"lines": "Строки чата", "crop": "Кадр", "text": "Текст", "images": "Картинки", "file": "Файл",
-                 "carry": "Чат из другой СС", "photopick": "Фото из другой СС"}[self.tool]
+                 "carry": "Чат из другой СС", "logpick": "Чатлог", "photopick": "Фото из другой СС", "scene": "Сцена",
+                 "scenepick": "СС для сцены"}[self.tool]
         tk.Label(head, text=title, bg=VOID, fg=WHITE, font=(FONT["display"], 20)).pack(side="left")
         close = tk.Label(head, text=ICONS["close"] if FONT["icon"] else "Закрыть", bg=VOID, fg=SUB, cursor="hand2",
                          font=(FONT["icon"], 12) if FONT["icon"] else (FONT["ui"], 10))
@@ -1008,8 +1363,11 @@ class Feed:
         close.bind("<Button-1>", lambda _: self.toggle_tool(self.tool))
         close.bind("<Enter>", lambda _: close.config(fg=WHITE))
         close.bind("<Leave>", lambda _: close.config(fg=SUB))
+        scope = self.scope()
+        if scope:
+            tk.Label(sheet, text=scope, bg=VOID, fg=SUB, font=(FONT["ui"], 10), anchor="w").pack(fill="x")
         holder = tk.Frame(sheet, bg=VOID)
-        holder.pack(fill="both", expand=True, pady=(px(18), px(8)))
+        holder.pack(fill="both", expand=True, pady=(px(14) if scope else px(18), px(8)))
         body = tk.Frame(holder, bg=VOID)
         body.place(x=0, y=0, width=self.sheet_w)
         self.sheet_holder, self.sheet_body = holder, body
@@ -1017,13 +1375,47 @@ class Feed:
         if self.tool != self.sheet_tool:
             self.sheet_tool, self.sheet_offset = self.tool, 0
         self.sliders = {}
-        getattr(self, "sheet_" + self.tool)(body)
+        if self.tool in FRAMED and self.scene_names():
+            self.frame_strip(body)
+        if self.target is None:
+            self.label(body, "Загружаю эту СС…" if self.cache.get(self.part) is None else
+                       "Исходники этой СС не найдены, её не поправить.")
+        else:
+            getattr(self, "sheet_" + self.tool)(body)
         self.sheet_meta = tk.Label(sheet, text=self.meta(), bg=VOID, fg=SUB, font=(FONT["ui"], 10), anchor="w",
                                    justify="left", wraplength=self.sheet_w)
         self.sheet_meta.pack(fill="x", padx=(0, px(12)))
         self.bind_sheet_wheel(holder)
         holder.bind("<Configure>", lambda _: self.scroll_sheet(0))
         body.bind("<Configure>", lambda _: self.scroll_sheet(0))
+
+    def scope(self):
+        names = self.scene_names()
+        if self.tool == "scenepick" or not names and self.tool in ("scene", "carry", "logpick", "photopick"):
+            return None
+        if not names:
+            return "только эта СС"
+        if self.previewing():
+            return "вся сцена"
+        if self.tool == "lines":
+            return "все СС сцены"
+        return f"СС {names.index(self.current()) + 1} из {len(names)} сцены"
+
+    def hint(self, text):
+        if text == self.hint_text:
+            return
+        self.hint_text = text
+        self.c.delete("hint")
+        if not text or self.index == 0:
+            return
+        ax, ay, aw, ah = self.area()
+        w = min(aw - px(20), tkfont.Font(family=FONT["ui"], size=10).measure(text) + px(32))
+        h = px(32)
+        x, y = ax + (aw - w) // 2, ay + ah - h - px(12)
+        self.hint_photo = ImageTk.PhotoImage(rounded(w, h, h // 2, (10, 10, 10, 228), (69, 75, 87, 255)))
+        self.c.create_image(x, y, anchor="nw", image=self.hint_photo, state="disabled", tags=("hint",))
+        self.c.create_text(x + w / 2, y + h / 2, text=text, fill=WHITE, font=(FONT["ui"], 10), state="disabled",
+                           tags=("hint",))
 
     def bind_sheet_wheel(self, widget):
         if not isinstance(widget, Slider):
@@ -1068,50 +1460,307 @@ class Feed:
             Pill(line, text, command, kind="ghost").pack(side="left", padx=(0, px(6)))
 
     def sheet_lines(self, body):
-        self.field(body, "Клик по строке", 0)
-        self.choice(body, CLICKS, self.click_mode, self.set_click)
-        self.click_hint = tk.Label(body, text=CLICK_HINTS[self.click_mode], bg=VOID, fg=SUB, font=(FONT["ui"], 10),
-                                   anchor="w", justify="left", wraplength=self.sheet_w)
-        self.click_hint.pack(fill="x", pady=(px(2), 0))
+        names, shot = self.scene_names(), self.target
+        log = core.log_path(shot["out"], shot["name"]).exists()
         self.count = tk.Label(body, text=self.count_text(), bg=VOID, fg=WHITE, font=(FONT["semi"], 12), anchor="w")
-        self.count.pack(fill="x", pady=(px(18), px(10)))
-        self.buttons(body, (("Как после съёмки", self.reset_lines), ("Чат из другой СС", lambda: self.toggle_tool("carry"))))
-        self.label(body, "Галочка — строка в СС. Зажми и веди мышью, чтобы отметить несколько строк подряд. Ножницы "
-                         "у строки делят чат на части, до трёх. Колесо прокручивает список.", 18)
+        self.count.pack(fill="x", pady=(0, px(10)))
+        self.buttons(body, (("Как после съёмки", self.reset_lines),) +
+                     ((("Чат из другой СС", lambda: self.toggle_tool("carry")),) if not log else ()))
+        source = (("С экрана", self.from_screen),) if log and core.screen_chats(shot["out"], shot["name"]) else ()
+        self.buttons(body, (("Из чатлога", lambda: self.toggle_tool("logpick")),) + source +
+                     ((("Убрать повторы", self.drop_repeats),) if names else ()), 6)
+        self.label(body, ("Чат этой СС собран из чатлога. " if log else "") +
+                   "Галочка — строка в СС, мышью можно провести по нескольким. Клик по слову — закрыть его "
+                   "плашкой или удалить. Ножницы делят чат на части." +
+                   (" Здесь строки всех СС сцены, повторы из СС выше убираются сами." if names else ""), 16)
+
+    def sheet_logpick(self, body):
+        shot = self.target
+        self.log_count = tk.Label(body, text=self.log_count_text(), bg=VOID, fg=WHITE, font=(FONT["semi"], 12),
+                                  anchor="w")
+        self.log_count.pack(fill="x", pady=(0, px(10)))
+        line = tk.Frame(body, bg=VOID)
+        line.pack(anchor="w")
+        Pill(line, "На СС", self.apply_log, kind="primary").pack(side="left", padx=(0, px(6)))
+        Pill(line, "Назад к строкам", lambda: self.toggle_tool("lines"), kind="ghost").pack(side="left")
+        v = self.logview
+        if v and v["lines"]:
+            self.field(body, "Показывать")
+            self.choice(body, LOG_SHOW, "all" if v["all"] else "rp", self.log_show)
+            names = self.log_names()
+            if names:
+                self.field(body, "Чьи строки")
+                self.label(body, "Нажми на участников своей сцены — останется только их диалог. Ближе к моменту "
+                                 "съёмки — выше.")
+                measure = tkfont.Font(family=FONT["ui"], size=10).measure
+                line, used = None, 0
+                for name, count in names:
+                    text = f"{name} · {count}"
+                    w = measure(text) + px(13) * 2 + px(6)
+                    if line is None or used + w > self.sheet_w:
+                        line = tk.Frame(body, bg=VOID)
+                        line.pack(anchor="w", pady=(0, px(6)))
+                        used = 0
+                    pill = Pill(line, text, lambda n=name: self.log_name(n))
+                    pill.set_kind("on" if name in v["names"] else "chip")
+                    pill.pack(side="left", padx=(0, px(6)))
+                    used += w
+                if v["names"]:
+                    Pill(body, "Показать всех", lambda: self.log_name(None), kind="ghost").pack(anchor="w")
+        screen = not core.log_path(shot["out"], shot["name"]).exists()
+        self.label(body, "Строки чатлога за час до и после СС, пунктир — момент съёмки. Отметь нужные и нажми "
+                         "«На СС»: они встанут в чат тем же шрифтом и цветом, что в игре. Клик по заголовку куска "
+                         "отмечает его целиком." +
+                   (" Снятый с экрана чат заменится, вернуть его можно кнопкой «С экрана» в «Строках»."
+                    if screen else ""), 16)
+
+    def log_names(self):
+        v = self.logview
+        near, total = {}, {}
+        for (when, _), (kind, who, _) in zip(v["lines"], v["who"]):
+            if who and kind in (chat.SPEECH, chat.ACTION):
+                total[who] = total.get(who, 0) + 1
+                if abs((when - v["at"]).total_seconds()) <= core.LOG_NEAR_S:
+                    near[who] = near.get(who, 0) + 1
+        ranked = sorted(total, key=lambda n: (-near.get(n, 0), -total[n], n))
+        keep = [n for n in ranked[:LOG_NAMES]] + [n for n in ranked[LOG_NAMES:] if n in v["names"]]
+        return [(n, total[n]) for n in keep]
+
+    def log_show(self, value):
+        self.logview["all"] = value == "all"
+        self.log_refilter()
+        self.log_changed()
+
+    def log_name(self, name):
+        names = self.logview["names"]
+        if name is None:
+            names.clear()
+        else:
+            names.symmetric_difference_update({name})
+        self.log_refilter()
+        self.redraw()
+
+    def log_refilter(self):
+        v = self.logview
+        lines, at, keep = v["lines"], v["at"], self.app.cfg["keep"]
+        seen = [k for k, (kind, who, _) in enumerate(v["who"])
+                if (v["all"] or kind in keep) and (not v["names"] or who in v["names"])]
+        starts = set(core.log_chunks([lines[k] for k in seen]))
+        items, mark, bounds, chunk = [], None, {}, None
+        for n, k in enumerate(seen):
+            if mark is None and lines[k][0] > at:
+                mark = len(items)
+                items.append(("mark", k))
+            if n in starts:
+                chunk = k
+                bounds[k] = []
+                items.append(("head", k))
+            bounds[chunk].append(k)
+            items.append(("line", k))
+        if mark is None:
+            mark = len(items)
+            items.append(("mark", len(lines)))
+        v.update(items=items, mark=mark, bounds=bounds, width=None, offset=None)
+
+    def open_log(self):
+        shot, self.logview = self.target, None
+        if shot is None:
+            return
+        at = core.shot_time(shot["name"]) or datetime.now()
+        self.c.config(cursor="watch")
+        self.c.update_idletasks()
+        lines = core.read_log(shot["out"], at)
+        self.c.config(cursor="")
+        saved = {core.log_key(*line) for line in core.picked_log(shot["edit"])}
+        self.logview = {"name": shot["name"], "at": at, "lines": lines, "who": [core.log_who(p) for _, p in lines],
+                        "on": {k for k, line in enumerate(lines) if core.log_key(*line) in saved},
+                        "all": False, "names": set()}
+        self.log_refilter()
+
+    def log_count_text(self):
+        v = self.logview
+        return f"Отмечено {len(v['on'])} из {len(v['lines'])}" if v and v["lines"] else "Строк нет"
+
+    def chat_font(self):
+        if self.log_font is None:
+            self.log_font = tkfont.Font(family="Arial", size=-px(15), weight="bold")
+        return self.log_font
+
+    def log_layout(self, width):
+        v = self.logview
+        if v["width"] == width:
+            return
+        font = self.chat_font()
+        measure = lru_cache(maxsize=None)(font.measure)
+        lh = font.metrics("linespace") + px(1)
+        tops, wraps, y = [], {}, px(10)
+        for kind, k in v["items"]:
+            tops.append(y)
+            if kind == "line":
+                wraps[k] = [row for _, row in core.log_rows([v["lines"][k]], measure, width)] or [[]]
+                y += len(wraps[k]) * lh + px(10)
+            else:
+                y += px(40)
+        v.update(width=width, tops=tops, wraps=wraps, lh=lh, full=y + px(10))
+
+    def draw_log(self, area):
+        self.c.delete("shot")
+        ax, ay, aw, ah = area
+        self.c.create_rectangle(ax, ay, ax + aw, ay + ah, fill=BLACK, outline="", tags=("shot",))
+        v = self.logview
+        if v is None or not v["lines"]:
+            self.c.create_text(ax + aw // 2, ay + ah // 2, text="В чатлоге нет строк за час до и после этой СС. "
+                               "Строки пишутся, пока в настройках включён чатлог.", width=aw - px(80),
+                               justify="center", fill=SUB, font=(FONT["ui"], 12), tags=("shot",))
+            return
+        x0 = ax + px(120)
+        self.log_layout(max(px(200), aw - px(148)))
+        tops, items, lines, lh = v["tops"], v["items"], v["lines"], v["lh"]
+        if v["offset"] is None:
+            v["offset"] = tops[v["mark"]] - ah // 2
+        v["offset"] = max(0, min(v["offset"], v["full"] - ah))
+        v["top"] = top = ay - v["offset"]
+        font = self.chat_font()
+        ticks = self.row_photos = [ImageTk.PhotoImage(tick(px(18), on)) for on in (False, True)]
+        ends = tops[1:] + [v["full"] - px(10)]
+        for j in range(max(0, bisect.bisect_right(tops, v["offset"]) - 1), len(items)):
+            y, bottom = top + tops[j], top + ends[j]
+            if y > ay + ah:
+                break
+            kind, k = items[j]
+            if kind == "mark":
+                mid, label = (y + bottom) / 2, f"СС снята · {v['at']:%H:%M:%S}"
+                wide = tkfont.Font(family=FONT["semi"], size=9).measure(label) + px(16)
+                self.c.create_line(ax + px(16), mid, ax + aw - px(16), mid, fill=SUB, dash=(4, 3), tags=("shot",))
+                self.c.create_rectangle(x0 - px(8), mid - px(10), x0 - px(8) + wide, mid + px(10), fill=BLACK,
+                                        outline="", tags=("shot",))
+                self.c.create_text(x0, mid, text=label, anchor="w", fill=WHITE, font=(FONT["semi"], 9), tags=("shot",))
+                continue
+            on = k in v["on"]
+            if kind == "head":
+                span, tag = v["bounds"][k], f"lhead{j}"
+                picked = sum(i in v["on"] for i in span)
+                on = picked == len(span)
+                text = (f"{lines[k][0]:%H:%M}–{lines[span[-1]][0]:%H:%M} · строк: {len(span)}" +
+                        (f" · отмечено: {picked}" if picked else ""))
+                self.c.create_rectangle(ax, y, ax + aw, bottom, fill=BLACK, outline="", tags=("shot", tag, tag + "-bg"))
+                self.c.create_image(ax + px(16), y + px(24), anchor="w", image=ticks[on], tags=("shot", tag))
+                self.c.create_text(ax + px(48), y + px(24), text=text, anchor="w", fill=WHITE if picked else SUB,
+                                   font=(FONT["semi"], 10), tags=("shot", tag))
+                idle, hot = BLACK, ROW
+            else:
+                tag, first = f"lrow{j}", y + px(5) + lh / 2
+                self.c.create_rectangle(ax, y, ax + aw, bottom, fill=SLATE if on else BLACK, outline="",
+                                        tags=("shot", tag, tag + "-bg"))
+                self.c.create_image(ax + px(16), first, anchor="w", image=ticks[on], tags=("shot", tag))
+                self.c.create_text(ax + px(48), first, text=f"{lines[k][0]:%H:%M:%S}", anchor="w", fill=SUB,
+                                   font=(FONT["ui"], 9), tags=("shot", tag))
+                for n, row in enumerate(v["wraps"][k]):
+                    for x, text, color in row:
+                        self.c.create_text(x0 + x, y + px(5) + n * lh, text=text.rstrip(), anchor="nw", fill=color,
+                                           font=font, tags=("shot", tag))
+                idle, hot = (SLATE, MIST) if on else (BLACK, ROW)
+            self.c.tag_bind(tag, "<Enter>", lambda _, t=tag, c=hot: (self.c.itemconfig(t + "-bg", fill=c),
+                                                                  self.c.config(cursor="hand2")))
+            self.c.tag_bind(tag, "<Leave>", lambda _, t=tag, c=idle: (self.c.itemconfig(t + "-bg", fill=c),
+                                                                   self.c.config(cursor="")))
+        self.c.tag_lower("shot")
+
+    def log_item_at(self, y):
+        v = self.logview
+        return min(max(bisect.bisect_right(v["tops"], y - v["top"]) - 1, 0), len(v["items"]) - 1)
+
+    def mark_log(self, a, b, on):
+        v = self.logview
+        for kind, k in v["items"][min(a, b):max(a, b) + 1]:
+            if kind == "line":
+                (v["on"].add if on else v["on"].discard)(k)
+        self.log_changed()
+
+    def toggle_chunk(self, j):
+        v = self.logview
+        k = v["items"][j][1]
+        span = set(v["bounds"][k])
+        v["on"] = v["on"] - span if span <= v["on"] else v["on"] | span
+        self.log_changed()
+
+    def log_changed(self):
+        self.draw_log(self.area())
+        if self.sheet is not None and self.log_count.winfo_exists():
+            self.log_count.config(text=self.log_count_text())
+
+    def apply_log(self):
+        v, shot = self.logview, self.target
+        if shot is None or v is None or v["name"] != shot["name"]:
+            return
+        if not v["on"]:
+            self.note = "отметь хотя бы одну строку"
+            self.update_meta()
+            return
+        picked = [v["lines"][k] for k in sorted(v["on"])]
+        try:
+            core.use_log(shot, self.app.cfg, picked)
+        except (OSError, ValueError) as e:
+            self.note = f"строки не встали: {e}"
+            self.update_meta()
+            return
+        self.tool, self.offset = "lines", 0
+        self.switched(shot, f"строк из чатлога: {len(picked)}")
+
+    def from_screen(self):
+        shot = self.target
+        try:
+            core.use_screen(shot, self.app.cfg)
+        except (OSError, ValueError) as e:
+            self.note = f"кадры чата не открылись: {e}"
+            self.update_meta()
+            return
+        self.switched(shot, "чат снова с экрана")
+
+    def switched(self, shot, note):
+        self.schedule_save(shot)
+        self.redraw()
+        self.note = note
+        self.update_meta()
 
     def sheet_carry(self, body):
-        self.label(body, "Нажми на СС справа: её чат добавится к этой. Повторы склеятся сами, лишние строки "
-                         "убираются в «Строках» как обычно.")
-        self.label(body, "Так можно снять сцену с разных ракурсов и собрать реплики на одном кадре. Здесь "
-                         "ближайшие по времени СС, у которых сохранились исходные кадры.", 6)
+        names = self.scene_names()
+        mine = f"к СС {names.index(self.current()) + 1} сцены" if names else "к этой"
+        self.label(body, f"Нажми на СС справа — её строки добавятся {mine}, повторы склеятся сами.")
         Pill(body, "Назад к строкам", lambda: self.toggle_tool("lines"), kind="ghost").pack(anchor="w", pady=(px(8), 0))
 
     def sheet_crop(self, body):
-        edit = self.shot["edit"]
-        self.field(body, "Формат", 0)
-        FramePick(body, edit["format"], self.set_frame, lambda: core.plan(self.shot["bg"], self.shot["edit"])["base"],
+        shot, names = self.target, self.scene_names()
+        edit, look = shot["edit"], self.look(shot)[0]
+        whole = " · вся сцена" if names else ""
+        self.field(body, "Формат" + whole, 0)
+        FramePick(body, look["format"], self.set_frame, lambda: core.plan(shot["bg"], self.look(shot)[0])["base"],
                   self.sheet_w).pack(anchor="w")
+        self.field(body, "Размер" + whole)
+        self.size_pick = SizePick(body, look["size"], self.set_size, self.sheet_w)
+        self.size_pick.pack(fill="x")
+        self.size_pick.show(look["format"])
         self.field(body, "Приближение")
         zoom = self.slider(body, 1.0, 3.0, edit["zoom"], lambda v: self.change(zoom=v), step=0.05,
                            fmt=lambda v: f"{v:.2f}×")
-        self.sliders["zoom"] = (zoom, lambda: self.shot["edit"]["zoom"])
+        self.sliders["zoom"] = (zoom, lambda: shot["edit"]["zoom"])
         self.buttons(body, (("По центру", lambda: self.change(center=[0.5, 0.5])),), 12)
-        self.label(body, "Тяни картинку мышью, чтобы выбрать, что попадёт в кадр. Ctrl + колесо — приближение.", 10)
+        if names:
+            self.label(body, "Тёмные полосы сверху и снизу — переходы между СС, чат на них не заходит.", 12)
+            return
         join = edit.get("join") or {}
         side = join.get("side") if join.get("side") in core.JOIN_SIDES else "none"
-        self.field(body, "Расширить поле кадра", 8)
+        self.field(body, "Расширить поле кадра", 18)
         self.choice(body, SIDES, side, self.set_field_side)
         if side == "none":
-            self.label(body, "Кадр станет больше, а СС останется своего размера: место для второго ракурса или чата.",
-                       4)
+            self.label(body, "Место сбоку для второго ракурса или чата, СС остаётся своего размера.", 4)
             return
         pct = lambda v: f"{v:.0f}%"
         self.field(body, "Насколько")
         self.slider(body, 10, 100, round(join["size"] * 100), lambda v: self.change_field(size=v / 100), fmt=pct)
         self.field(body, "Мягкий край СС")
         self.slider(body, 0, 100, round(join["fade"] * 100), lambda v: self.change_field(fade=v / 100), fmt=pct)
-        self.label(body, "Новое место заполнено размытым продолжением СС. Положи туда второй ракурс из «Картинок» "
-                         "или отнеси чат.", 10)
+        self.label(body, "Новое место заполнено размытым продолжением СС.", 10)
 
     def set_field_side(self, side):
         edit = self.shot["edit"]
@@ -1125,61 +1774,247 @@ class Feed:
         self.schedule_save()
 
     def set_frame(self, value):
-        self.change(format=value, center=[0.5, 0.5])
+        if self.tool == "crop":
+            self.size_pick.show(value)
+        if not self.scene_names():
+            self.change(format=value, center=[0.5, 0.5])
+            return
+        self.shot["edit"]["format"] = value
+        self.schedule_save(self.shot)
+        self.media_redraw()
+
+    def set_size(self, value):
+        if not self.scene_names():
+            self.change(size=value)
+            return
+        self.shot["edit"]["size"] = value
+        self.schedule_save(self.shot)
+        self.media_redraw()
 
     def sheet_text(self, body):
-        edit = self.shot["edit"]
-        self.field(body, "Размер текста", 0)
-        self.choice(body, SCALES, edit["text_scale"], lambda v: self.change(text_scale=float(v)))
-        self.field(body, "Обводка")
-        self.choice(body, OUTLINES, edit["outline"], lambda v: self.change(outline=int(v)))
-        spots = [pos for _, pos in core.parts(self.shot["rows"], edit)]
+        shot, names = self.target, self.scene_names()
+        edit = shot["edit"]
+        whole = " · вся сцена" if names else ""
+        if names:
+            self.field(body, "Показывать", 0)
+            self.choice(body, VIEWS, "all" if self.whole else "one", self.set_whole)
+            if self.whole:
+                self.label(body, "Тяни чат любой СС мышью прямо по сцене: на переход, на соседнюю СС или в её угол. "
+                                 "Колесо — прокрутка, Ctrl + колесо — масштаб.", 8)
+        self.field(body, "Размер текста" + whole, 14 if names else 0)
+        self.choice(body, SCALES, edit["text_scale"], lambda v: self.change_text(text_scale=float(v)))
+        self.field(body, "Обводка" + whole)
+        self.choice(body, OUTLINES, edit["outline"], lambda v: self.change_text(outline=int(v)))
+        self.field(body, "Отступ от края" + whole)
+        margin = self.slider(body, 0, 96, edit["margin"], lambda v: self.change_text(margin=int(v)), step=2,
+                             fmt=lambda v: f"{v:.0f} px")
+        self.sliders["margin"] = (margin, lambda: shot["edit"]["margin"])
+        spots = [pos for _, pos in core.parts(shot["rows"], edit)]
+        self.field(body, "Где чат" if len(spots) == 1 else "Где части чата")
         for k, pos in enumerate(spots):
-            self.field(body, "Угол" if len(spots) == 1 else f"Угол, часть {k + 1}")
-            self.choice(body, POSITIONS, pos if isinstance(pos, str) else None,
-                        lambda v, k=k: self.pick_place(k, v), cols=2)
-        self.label(body, "Или перетащи чат прямо на картинке.", 6)
+            row = tk.Frame(body, bg=VOID)
+            row.pack(anchor="w", pady=(0, px(6)))
+            Corners(row, pos if isinstance(pos, str) else None, lambda v, k=k: self.pick_place(k, v)).pack(side="left")
+            text = ("" if len(spots) == 1 else f"Часть {k + 1} · ") + place_name(pos)
+            tk.Label(row, text=text, bg=VOID, fg=WHITE, font=(FONT["ui"], 10)).pack(side="left", padx=(px(10), 0))
+        self.label(body, "Клик по углу ставит туда чат. Его можно и тянуть мышью по картинке.", 6)
+
+    def change_text(self, **values):
+        shots = [s for _, s in self.members() if s] if self.scene_names() else [self.target]
+        for shot in shots:
+            shot["edit"].update(values)
+            self.schedule_save(shot)
+        self.media_redraw()
+        if self.previewing():
+            self.want_preview()
+
+    def set_whole(self, value):
+        self.whole = value == "all"
+        if self.whole:
+            self.fetch_scene()
+            self.preview = self.preview_info = None
+            self.want_preview()
+        self.redraw()
 
     def sheet_file(self, body):
         edit = self.shot["edit"]
-        self.field(body, "Размер", 0)
-        pick = SizePick(body, edit["size"], lambda v: self.change(size=v), self.sheet_w)
-        pick.pack(fill="x")
-        pick.show(edit["format"])
-        self.field(body, "Формат")
+        self.field(body, "Формат", 0)
         self.choice(body, FILES, edit["file"], self.set_file)
         if edit["file"] == "jpg":
             self.field(body, "Качество фона")
             quality = self.slider(body, 10, 100, edit.get("quality", core.TEXT_QUALITY),
                                   lambda v: self.change(quality=int(v)), fmt=lambda v: f"{v:.0f}")
             self.sliders["quality"] = (quality, lambda: self.shot["edit"].get("quality", core.TEXT_QUALITY))
-            self.label(body, "Сжимается только фон, текст чата всегда остаётся чётким. 92 — как раньше.", 4)
+            self.label(body, "Сжимается только фон, текст чата всегда остаётся чётким.", 4)
         self.file_info = tk.Label(body, text=self.preview_info or "считаю размер…", bg=VOID, fg=WHITE,
                                   font=(FONT["semi"], 12), anchor="w")
         self.file_info.pack(fill="x", pady=(px(18), px(2)))
-        self.label(body, "Картинка справа — точно как будет в файле. Наведи на неё: лупа покажет пиксели 1:1.")
+        self.label(body, "Размер кадра — в «Кадре».")
 
     def set_file(self, value):
         self.change(file=value)
         self.redraw()
 
-    def change(self, **values):
-        if self.shot is None:
+    def sheet_scene(self, body):
+        scene, names = self.shot["edit"].get("scene"), self.scene_names()
+        self.label(body, "Несколько СС одна под другой с плавными переходами — раскадровка для форума. Чат можно "
+                         "тянуть мышью прямо здесь: на переход или на другую СС.")
+        self.buttons(body, (("Выбрать СС", lambda: self.toggle_tool("scenepick")),) +
+                     ((("Разобрать", self.drop_scene),) if names else ()))
+        self.file_info = tk.Label(body, text=self.preview_info or "собираю…", bg=VOID, fg=WHITE,
+                                  font=(FONT["semi"], 12), anchor="w")
+        if not names:
             return
-        self.shot["edit"].update(values)
-        self.media_redraw()
-        if self.tool == "file":
-            self.want_preview()
+        self.field(body, "Порядок", 18)
+        for k, name in enumerate(names):
+            self.frame_row(body, k, name, len(names))
+        seams = {"all": "Все"} | {str(k): f"{k + 1}–{k + 2}" for k in range(len(names) - 1)}
+        self.seam = self.seam if self.seam in seams else "all"
+        look = scene["seams"][0 if self.seam == "all" else int(self.seam)]
+        pct = lambda v: f"{v:.0f}%"
+        self.field(body, "Переход", 10)
+        self.choice(body, seams, self.seam, self.pick_seam)
+        self.field(body, "Плавность")
+        self.slider(body, 0, 50, round(look["fade"] * 100), lambda v: self.change_seam(fade=v / 100), fmt=pct)
+        self.field(body, "Размытие")
+        self.slider(body, 0, 100, round(look["blur"] * 100), lambda v: self.change_seam(blur=v / 100), fmt=pct)
+        self.field(body, "Затемнение")
+        self.slider(body, 0, 100, round(look["dark"] * 100), lambda v: self.change_seam(dark=v / 100), fmt=pct)
+        self.field(body, "Просмотр", 10)
+        self.buttons(body, (("Целиком", lambda: self.view_fit("all")), ("По ширине", lambda: self.view_fit("width")),
+                            ("1:1", lambda: self.view_fit("real"))))
+        self.file_info.pack(fill="x", pady=(px(14), px(2)))
+
+    def frame_row(self, body, k, name, count):
+        mine = name == self.name
+        row = tk.Frame(body, bg=VOID)
+        row.pack(fill="x", pady=(0, px(4)))
+        photo = self.frame_thumb(name)
+        pick = []
+        if photo:
+            pick.append(tk.Label(row, image=photo, bg=VOID, cursor="hand2"))
+            pick[-1].pack(side="left", padx=(0, px(8)))
+        pick.append(tk.Label(row, text=f"{k + 1}. {when(name)}" + (" · эта" if mine else ""), bg=VOID,
+                             fg=WHITE if mine else SUB, font=(FONT["ui"], 10), cursor="hand2"))
+        pick[-1].pack(side="left")
+        for w in pick:
+            w.bind("<Button-1>", lambda _, k=k: self.focus_frame(k))
+            w.bind("<Enter>", lambda _: self.hint("Показать эту СС в сцене крупно"))
+            w.bind("<Leave>", lambda _: self.hint(None))
+        for key, text, on, command, tip in (
+                ("close", "×", not mine, lambda: self.drop_frame(k), "Убрать из сцены"),
+                ("down", "↓", k < count - 1, lambda: self.move_frame(k, 1), "Ниже"),
+                ("up", "↑", k > 0, lambda: self.move_frame(k, -1), "Выше"),
+                ("crop", "▭", True, lambda: self.edit_frame(name), "Поправить эту СС: кадр, текст, картинки")):
+            glyph, face = (ICONS[key], (FONT["icon"], 11)) if FONT["icon"] else (text, (FONT["ui"], 11))
+            button = tk.Label(row, text=glyph, font=face, bg=VOID, fg=SUB if on else VOID, width=2,
+                              cursor="hand2" if on else "")
+            button.pack(side="right")
+            if on:
+                button.bind("<Button-1>", lambda _, f=command: f())
+                button.bind("<Enter>", lambda _, b=button, t=tip: (b.config(fg=WHITE), self.hint(t)))
+                button.bind("<Leave>", lambda _, b=button: (b.config(fg=SUB), self.hint(None)))
+
+    def edit_frame(self, name):
+        self.part = None if name == self.name else name
+        self.toggle_tool("crop")
+
+    def frame_thumb(self, name):
+        size = (px(54), px(32))
+        if name != self.name:
+            return self.thumb(self.shot["out"], name, size)
+        bg = self.shot["bg"]
+        key = ("bg", id(bg), size)
+        if key not in self.thumbs:
+            x0, y0, x1, y1 = core.plan(bg, self.shot["edit"])["rect"]
+            im = Image.fromarray(bg[y0:y1, x0:x1])
+            im.thumbnail(size, Image.BILINEAR, reducing_gap=2.0)
+            self.thumbs[key] = ImageTk.PhotoImage(im)
+        return self.thumbs[key]
+
+    def sheet_scenepick(self, body):
+        self.label(body, "Отметь СС и нажми «Готово». Они встанут по времени съёмки и получат формат кадра этой СС, "
+                         f"а строки, которые уже были выше, уберутся сами. До {core.SCENE_MAX} СС.")
+        Pill(body, "Готово", lambda: self.toggle_tool("scene"), kind="ghost").pack(anchor="w", pady=(px(8), 0))
+
+    def scene_lists(self):
+        scene = self.shot["edit"].get("scene") or {"shots": [self.name], "seams": []}
+        return list(scene["shots"]), [dict(s) for s in scene["seams"]]
+
+    def set_scene(self, shots, seams):
+        self.shot["edit"]["scene"] = {"shots": shots, "seams": seams} if len(shots) > 1 else None
         self.schedule_save()
+
+    def toggle_scene(self, name):
+        shots, seams = self.scene_lists()
+        if name in shots:
+            k = shots.index(name)
+            shots.pop(k)
+            seams.pop(max(k - 1, 0))
+        elif len(shots) >= core.SCENE_MAX:
+            self.note = f"в сцену помещается до {core.SCENE_MAX} СС"
+            self.update_meta()
+            return
+        else:
+            k = next((i for i, n in enumerate(shots) if n > name), len(shots))
+            shots.insert(k, name)
+            self.fetch(name)
+            self.added.add(name)
+            near = max(k - 1, 0)
+            seams.insert(near, dict(seams[min(near, len(seams) - 1)] if seams else core.SEAM))
+        self.set_scene(shots, seams)
+        self.draw_donors(self.area())
+        self.update_meta()
+
+    def move_frame(self, k, delta):
+        shots, seams = self.scene_lists()
+        shots[k], shots[k + delta] = shots[k + delta], shots[k]
+        self.set_scene(shots, seams)
+        self.want_preview()
+        self.redraw()
+
+    def drop_frame(self, k):
+        shots, seams = self.scene_lists()
+        shots.pop(k)
+        seams.pop(max(k - 1, 0))
+        self.set_scene(shots, seams)
+        self.want_preview()
+        self.redraw()
+
+    def pick_seam(self, value):
+        self.seam = value
+        self.redraw()
+
+    def change_seam(self, **values):
+        seams = self.shot["edit"]["scene"]["seams"]
+        for k in range(len(seams)) if self.seam == "all" else (int(self.seam),):
+            seams[k].update(values)
+        self.want_preview()
+        self.schedule_save()
+
+    def drop_scene(self):
+        self.shot["edit"]["scene"] = None
+        self.preview = self.preview_info = None
+        self.want_preview()
+        self.redraw()
+        self.schedule_save()
+
+    def change(self, **values):
+        shot = self.target
+        if shot is None:
+            return
+        shot["edit"].update(values)
+        self.media_redraw()
+        if self.previewing():
+            self.want_preview()
+        self.schedule_save(shot)
 
     def media_redraw(self):
         if self.shot is None or self.index == 0:
             return
-        if self.tool == "lines":
-            self.draw_lines(self.area())
-        elif self.tool not in ("carry", "photopick"):
+        if self.tool not in DONORS:
             self.c.delete("shot")
-            self.decorate(self.painter.draw(self.shot, self.area()))
+            self.draw_media(self.area())
             self.c.tag_lower("shot")
         for bar, value in self.sliders.values():
             if bar.winfo_exists():
@@ -1194,36 +2029,39 @@ class Feed:
 
     def encode_preview(self):
         self.preview_job = None
-        if self.shot is None or self.tool != "file":
+        if self.shot is None or not self.previewing():
             return
         snap, key = self.snapshot(), (self.name, self.preview_rev)
 
         def work():
             try:
-                img, _, data = core.encoded(snap)
+                layout = {}
+                img, _, data = core.encoded(snap, layout)
                 arr = core.decoded(data) if snap["edit"]["file"] == "jpg" else img
-                self.app.inbox.put(("previewed", key, (arr, len(data))))
+                self.app.inbox.put(("previewed", key, (arr, len(data), layout or None)))
             except Exception as e:
                 self.app.inbox.put(("previewed", key, str(e)))
 
         threading.Thread(target=work, daemon=True).start()
 
     def previewed(self, key, value):
-        if key != (self.name, self.preview_rev) or self.tool != "file":
+        if key != (self.name, self.preview_rev) or not self.previewing():
             return
         if isinstance(value, str):
             self.preview_info = f"размер не посчитался: {value}"
         else:
-            self.preview, size = value
+            self.preview, size, self.layout = value
             self.preview_info = f"≈ {megabytes(size)} · {self.preview.shape[1]} × {self.preview.shape[0]}"
             self.media_redraw()
-        if self.sheet is not None and self.file_info.winfo_exists():
-            self.file_info.config(text=self.preview_info)
+        info = getattr(self, "file_info", None)
+        if self.sheet is not None and info is not None and info.winfo_exists():
+            info.config(text=self.preview_info)
 
-    def draw_preview(self, geo):
+    def draw_preview(self, rect):
         if self.preview is None:
             return
-        ix, iy, dw, dh = geo["img"]
+        self.preview_rect, self.preview_view = rect, self.preview
+        ix, iy, dw, dh = rect
         key = (id(self.preview), dw, dh)
         if self.preview_photo is None or self.preview_photo[0] != key:
             img = Image.fromarray(self.preview).resize((dw, dh), Image.BILINEAR, reducing_gap=2.0)
@@ -1236,25 +2074,63 @@ class Feed:
         else:
             self.c.itemconfig("meta", text=self.meta())
 
+    def line_items(self):
+        if not self.scene_names():
+            return [(self.shot, i, 0, self.name) for i in range(len(self.shot["rows"]))]
+        items = []
+        for k, (name, shot) in enumerate(self.members()):
+            items.append((shot, None, k, name))
+            items += [(shot, i, k, name) for i in range(len(shot["rows"]))] if shot else []
+        return items
+
     def draw_lines(self, area):
         self.c.delete("shot")
         ax, ay, aw, ah = area
-        rows = self.shot["rows"]
-        widest = max(r["glyphs"][-1][1] + 8 for r in rows)
+        items = self.items = self.line_items()
+        rows = [shot["rows"][i] for shot, i, _, _ in items if i is not None]
+        widest = max((r["glyphs"][-1][1] + 8 for r in rows), default=1)
         s = min(1.0, (aw - px(104)) / widest)
-        breaks = core.cuts(rows, self.shot["edit"])
         self.lines_x0, self.lines_s = ax + px(48), s
-        slot = max(px(28), round(rows[0]["pitch"] * s) + px(12))
-        self.offset = max(0, min(self.offset, max(0, slot * len(rows) + px(24) - ah)))
+        slot = max(px(28), round(max((r["pitch"] for r in rows), default=0) * s) + px(12))
+        self.offset = max(0, min(self.offset, max(0, slot * len(items) + px(24) - ah)))
         self.c.create_rectangle(ax, ay, ax + aw, ay + ah, fill=BLACK, outline="", tags=("shot",))
+        if not items:
+            self.c.create_text(ax + aw // 2, ay + ah // 2, text="Строк нет. Выбери их в чатлоге: кнопка «Из чатлога» "
+                               "слева.", fill=SUB, font=(FONT["ui"], 12), tags=("shot",))
         y = ay + px(12) - self.offset
         self.lines_top, self.lines_slot = y, slot
         self.row_photos = []
         on, off = ImageTk.PhotoImage(tick(px(18), True)), ImageTk.PhotoImage(tick(px(18), False))
         self.row_photos += [on, off]
-        for i, r in enumerate(rows):
-            if y + slot > ay and y < ay + ah:
-                tag = f"row{i}"
+        current, breaks = self.current(), {}
+        for j, (shot, i, k, name) in enumerate(items):
+            if y + slot > ay and y < ay + ah and i is None:
+                tag = f"head{j}"
+                state = "" if shot else " · не открылась" if self.cache.get(name) is False else " · загружаю…"
+                text = f"СС {k + 1} · {when(name)}" + (" · эта" if name == self.name else "") + state
+                if j:
+                    self.c.create_line(ax + px(16), y + px(4), ax + aw - px(16), y + px(4), fill=MIST, tags=("shot",))
+                self.c.create_rectangle(ax, y + px(5), ax + aw, y + slot, fill=BLACK, outline="", tags=("shot", tag))
+                self.c.create_text(ax + px(16), y + slot / 2 + px(2), text=text, anchor="w", font=(FONT["semi"], 10),
+                                   fill=WHITE if name == current else SUB, tags=("shot", tag))
+                if shot and shot["rows"]:
+                    names, home = self.scene_names(), f"home{j}"
+                    at = shot["edit"].get("home")
+                    n = names.index(at) + 1 if at in names else k + 1
+                    self.c.create_text(ax + aw - px(16), y + slot / 2 + px(2), text=f"чат на СС {n}", anchor="e",
+                                       font=(FONT["semi"], 9), fill=WHITE if n != k + 1 else SUB, tags=("shot", home))
+                    self.c.tag_bind(home, "<Enter>", lambda _, t=home: (self.c.itemconfig(t, fill=WHITE),
+                                                                        self.c.config(cursor="hand2")))
+                    self.c.tag_bind(home, "<Leave>", lambda _, t=home, c=WHITE if n != k + 1 else SUB: (
+                        self.c.itemconfig(t, fill=c), self.c.config(cursor="")))
+                self.c.tag_bind(tag, "<Enter>", lambda _: self.c.config(cursor="hand2"))
+                self.c.tag_bind(tag, "<Leave>", lambda _: self.c.config(cursor=""))
+            elif y + slot > ay and y < ay + ah:
+                r = shot["rows"][i]
+                if id(shot) not in breaks:
+                    breaks[id(shot)] = core.cuts(shot["rows"], shot["edit"])
+                cuts = breaks[id(shot)]
+                tag = f"row{j}"
                 self.c.create_rectangle(ax, y, ax + aw, y + slot, fill=BLACK, outline="",
                                         tags=("shot", tag, tag + "-bg"))
                 crop = chat.masked(r, preview=True)[:, :r["glyphs"][-1][1] + 8] * (1.0 if r["keep"] else 0.3)
@@ -1272,43 +2148,87 @@ class Feed:
                 for a, b in r.get("drop", []):
                     self.c.create_line(ax + px(48) + a * s, y + slot / 2, ax + px(48) + (b + 1) * s, y + slot / 2,
                                        fill=ERR, width=max(1, px(2)), tags=("shot", tag))
-                if i in breaks:
+                cut, idle = f"cut{j}", WHITE if i in cuts else DIM
+                if i in cuts:
                     self.c.create_line(ax + px(16), y, ax + aw - px(16), y, fill=SUB, dash=(4, 3), tags=("shot",))
-                    self.c.create_text(ax + aw - px(52), y + px(2), text=f"часть {breaks.index(i) + 2}", fill=SUB,
-                                       anchor="ne", font=(FONT["ui"], 9), tags=("shot",))
+                    self.c.create_text(ax + aw - px(52), y + px(3), text=f"часть {cuts.index(i) + 2}", fill=WHITE,
+                                       anchor="ne", font=(FONT["semi"], 9), tags=("shot",))
                 if i:
-                    cut = f"cut{i}"
                     glyph, face = (ICONS["cut"], (FONT["icon"], 12)) if FONT["icon"] else ("✂", (FONT["ui"], 12))
                     self.c.create_text(ax + aw - px(28), y + slot / 2, text=glyph, font=face, tags=("shot", cut),
-                                       fill=WHITE if i in breaks else MIST)
+                                       fill=idle)
                     self.c.tag_bind(cut, "<Enter>", lambda _, t=cut: (self.c.itemconfig(t, fill=WHITE),
                                                                       self.c.config(cursor="hand2")))
-                    self.c.tag_bind(cut, "<Leave>", lambda _, t=cut, on=i in breaks: (
-                        self.c.itemconfig(t, fill=WHITE if on else MIST), self.c.config(cursor="")))
-                self.c.tag_bind(tag, "<Enter>", lambda _, t=tag: (self.c.itemconfig(t + "-bg", fill=ROW),
-                                                                  self.c.config(cursor="hand2")))
-                self.c.tag_bind(tag, "<Leave>", lambda _, t=tag: (self.c.itemconfig(t + "-bg", fill=BLACK),
-                                                                  self.c.config(cursor="")))
+                    self.c.tag_bind(cut, "<Leave>", lambda _, t=cut, c=idle: (self.c.itemconfig(t, fill=c),
+                                                                              self.c.config(cursor="")))
+                self.c.tag_bind(tag, "<Enter>", lambda _, t=tag, c=cut, on=i in cuts: (
+                    self.c.itemconfig(t + "-bg", fill=ROW), self.c.itemconfig(c, fill=WHITE if on else SUB),
+                    self.c.config(cursor="hand2")))
+                self.c.tag_bind(tag, "<Leave>", lambda _, t=tag, c=cut, d=idle: (
+                    self.c.itemconfig(t + "-bg", fill=BLACK), self.c.itemconfig(c, fill=d),
+                    self.c.config(cursor="")))
             y += slot
         self.c.tag_lower("shot")
 
-    def set_click(self, value):
-        self.click_mode = value
-        self.click_hint.config(text=CLICK_HINTS[value])
-
-    def toggle_word(self, i, x, key):
-        r = self.shot["rows"][i]
-        word = next(((a, b) for a, b in chat.words(r) if a - 3 <= x <= b + 3), None)
-        if word is None:
-            return
+    def toggle_word(self, j, word, key):
+        shot, i = self.items[j][:2]
+        r = shot["rows"][i]
         other = "drop" if key == "hide" else "hide"
         mine = [tuple(span) for span in r.get(key, [])]
         r[other] = [tuple(span) for span in r.get(other, []) if tuple(span) != word]
         r[key] = [span for span in mine if span != word] if word in mine else mine + [word]
         for name, field in core.MARKS:
-            self.shot["edit"][field] = core.spans_of(self.shot["rows"], name)
+            shot["edit"][field] = core.spans_of(shot["rows"], name)
         self.draw_lines(self.area())
-        self.schedule_save()
+        self.schedule_save(shot)
+
+    def open_popup(self, j, word):
+        shot, i = self.items[j][:2]
+        r = shot["rows"][i]
+        hidden = word in [tuple(span) for span in r.get("hide", [])]
+        gone = word in [tuple(span) for span in r.get("drop", [])]
+        picks = (("hide", "Убрать плашку" if hidden else "Закрыть плашкой"),
+                 ("drop", "Вернуть слово" if gone else "Удалить слово"), ("row", "Убрать строку"))
+        s, top = self.lines_s, self.lines_top + j * self.lines_slot
+        left, right = self.lines_x0 + word[0] * s, self.lines_x0 + (word[1] + 1) * s
+        self.c.create_rectangle(left - px(3), top + px(3), right + px(3), top + self.lines_slot - px(3), outline=WHITE,
+                                tags=("popup",))
+        font = (FONT["ui"], 10)
+        item = px(34)
+        w, h = max(tkfont.Font(family=FONT["ui"], size=10).measure(t) for _, t in picks) + px(40), item * 3 + px(8)
+        ax, ay, aw, ah = self.area()
+        x = min(max(left, ax + px(8)), ax + aw - w - px(8))
+        y = top + self.lines_slot if top + self.lines_slot + h < ay + ah - px(8) else top - h
+        self.popup_photo = ImageTk.PhotoImage(rounded(w, h, px(10), SLATE, LINE, 1.2))
+        self.c.create_image(x, y, anchor="nw", image=self.popup_photo, tags=("popup",))
+        for k, (key, text) in enumerate(picks):
+            tag, row = f"pop-{key}", y + px(4) + k * item
+            self.c.create_rectangle(x + px(4), row, x + w - px(4), row + item, fill=SLATE, outline="",
+                                    tags=("popup", tag, tag + "-bg"))
+            self.c.create_text(x + px(18), row + item / 2, text=text, anchor="w", fill=WHITE, font=font,
+                               tags=("popup", tag))
+            self.c.tag_bind(tag, "<Enter>", lambda _, t=tag: (self.c.itemconfig(t + "-bg", fill=MIST),
+                                                              self.c.config(cursor="hand2")))
+            self.c.tag_bind(tag, "<Leave>", lambda _, t=tag: (self.c.itemconfig(t + "-bg", fill=SLATE),
+                                                              self.c.config(cursor="")))
+        self.popup = {"j": j, "word": word}
+
+    def close_popup(self):
+        self.c.delete("popup")
+        self.popup = None
+
+    def popup_pick(self, key):
+        j, word = self.popup["j"], self.popup["word"]
+        self.close_popup()
+        shot, i = self.items[j][:2]
+        if key != "row":
+            self.toggle_word(j, word, key)
+            return
+        shot["rows"][i]["keep"] = False
+        shot["edit"]["keep"] = [r["keep"] for r in shot["rows"]]
+        self.draw_lines(self.area())
+        self.count.config(text=self.count_text())
+        self.schedule_save(shot)
 
     def mark_overlay(self, geo):
         if self.tool != "images" or not geo or self.active_ov >= len(geo["overlays"]):
@@ -1318,7 +2238,7 @@ class Feed:
             return
         l, t, r, b = box["x"], box["y"], box["x"] + box["w"], box["y"] + box["h"]
         self.c.create_rectangle(l, t, r - 1, b - 1, outline=WHITE, width=1, dash=(4, 3), tags=("shot",))
-        locked = core.lock_ratio(self.shot["edit"]["overlays"][self.active_ov].get("cut", "free")) is not None
+        locked = core.lock_ratio(self.target["edit"]["overlays"][self.active_ov].get("cut", "free")) is not None
         spots = {"l": (l, (t + b) / 2), "r": (r, (t + b) / 2), "t": ((l + r) / 2, t), "b": ((l + r) / 2, b),
                  "lt": (l, t), "rt": (r, t), "lb": (l, b), "rb": (r, b)}
         k = px(5)
@@ -1334,9 +2254,8 @@ class Feed:
             self.c.tag_bind(tag, "<Leave>", lambda _: self.c.config(cursor=""))
 
     def sheet_images(self, body):
-        overlays = self.shot["edit"].setdefault("overlays", [])
-        self.label(body, "Второй ракурс, коллаж или стикер поверх кадра. С мягкими краями фото растворяется в СС, как "
-                         "двойная экспозиция. Если в «Кадре» расширено поле, фото само встанет на новое место.")
+        overlays = self.target["edit"].setdefault("overlays", [])
+        self.label(body, "Второй ракурс, коллаж или стикер поверх СС. С мягкими краями фото растворяется в ней.")
         self.buttons(body, (("Из файла", self.add_file), ("Из буфера", self.add_clipboard)))
         self.buttons(body, (("Из другой СС", lambda: self.toggle_tool("photopick")),), 6)
         if overlays:
@@ -1350,7 +2269,7 @@ class Feed:
             self.field(body, "Размер по ширине кадра")
             size = self.slider(body, 5, 200, round(ov["w"] * 100), lambda v: self.change_ov(w=round(v / 100, 4)),
                                fmt=pct)
-            self.sliders["ov"] = (size, lambda: round(self.shot["edit"]["overlays"][self.active_ov]["w"] * 100))
+            self.sliders["ov"] = (size, lambda: round(self.target["edit"]["overlays"][self.active_ov]["w"] * 100))
             self.field(body, "Мягкие края")
             self.slider(body, 0, 100, round(ov.get("soft", 0.0) * 100), lambda v: self.change_ov(soft=v / 100),
                         fmt=pct)
@@ -1361,12 +2280,9 @@ class Feed:
             FramePick(body, ov.get("cut", "free"), self.crop_ov, self.crop_size, self.sheet_w, CROPS,
                       (16, 20000)).pack(anchor="w")
             self.buttons(body, (("Сбросить обрезку", lambda: self.crop_ov("reset")), ("Убрать", self.remove_ov)), 8)
-        self.label(body, "Тяни картинку мышью, колесо меняет размер. У границы кадра картинка прилипает, и этот край "
-                         "остаётся чётким. Белые метки обрезают её, Shift + тяни внутри — сдвигает обрезку.", 16)
 
     def sheet_photopick(self, body):
-        self.label(body, "Нажми на СС справа: её фон ляжет поверх этой с мягкими краями. Чат той СС не переносится, "
-                         "для этого есть «Чат из другой СС» в «Строках».")
+        self.label(body, "Нажми на СС справа — её фон ляжет поверх этой с мягкими краями.")
         Pill(body, "Назад", lambda: self.toggle_tool("images"), kind="ghost").pack(anchor="w", pady=(px(8), 0))
 
     def pick_file(self, title):
@@ -1407,18 +2323,18 @@ class Feed:
             self.add_image(image)
 
     def add_image(self, image):
-        overlays = self.shot["edit"].setdefault("overlays", [])
+        overlays = self.target["edit"].setdefault("overlays", [])
         if len(overlays) >= core.MAX_OVERLAYS:
             self.note = f"больше {core.MAX_OVERLAYS} картинок не поместится"
             self.update_meta()
             return
         try:
-            ov = core.add_overlay(self.shot["out"], self.shot["name"], image)
+            ov = core.add_overlay(self.target["out"], self.target["name"], image)
         except OSError as e:
             self.note = f"картинка не сохранилась: {e}"
             self.update_meta()
             return
-        p = core.plan(self.shot["bg"], self.shot["edit"])
+        p = core.plan(self.target["bg"], self.look(self.target)[0])
         if p["ext_box"] and ov["soft"]:
             core.fit_field(ov, p, image.size)
         overlays.append(ov)
@@ -1432,22 +2348,22 @@ class Feed:
 
     def source_size(self, ov):
         try:
-            return core.overlay_image(self.shot["out"] / "src" / ov["file"]).size
+            return core.overlay_image(self.target["out"] / "src" / ov["file"]).size
         except OSError:
             return None
 
     def crop_size(self):
-        ov = self.shot["edit"]["overlays"][self.active_ov]
+        ov = self.target["edit"]["overlays"][self.active_ov]
         W, H = self.source_size(ov) or (1, 1)
         l, t, r, b = ov["crop"]
         return round((r - l) * W), round((b - t) * H)
 
     def crop_ov(self, value):
-        ov = self.shot["edit"]["overlays"][self.active_ov]
+        ov = self.target["edit"]["overlays"][self.active_ov]
         size = self.source_size(ov)
         if size is None:
             return
-        out_w = core.plan(self.shot["bg"], self.shot["edit"])["size"][0]
+        out_w = core.plan(self.target["bg"], self.look(self.target)[0])["size"][0]
         before = ov["w"] * out_w / max(1e-6, ov["crop"][2] - ov["crop"][0])
         exact = core.exact_of(value)
         if value == "reset":
@@ -1465,70 +2381,74 @@ class Feed:
         self.schedule_save()
 
     def change_ov(self, **values):
-        self.shot["edit"]["overlays"][self.active_ov].update(values)
+        self.target["edit"]["overlays"][self.active_ov].update(values)
         self.media_redraw()
         self.schedule_save()
 
     def remove_ov(self):
-        overlays = self.shot["edit"]["overlays"]
+        overlays = self.target["edit"]["overlays"]
         overlays.pop(self.active_ov)
         self.active_ov = max(0, self.active_ov - 1)
         self.redraw()
         self.schedule_save()
 
-    def toggle_cut(self, i):
-        rows, edit = self.shot["rows"], self.shot["edit"]
+    def toggle_cut(self, j):
+        shot, i = self.items[j][:2]
+        rows, edit = shot["rows"], shot["edit"]
         breaks = core.cuts(rows, edit)
         spots = core.places(edit, len(breaks) + 1)[1:]
         if i in breaks:
             k = breaks.index(i)
             breaks.pop(k)
             spots.pop(k)
-        elif len(breaks) >= core.MAX_PARTS - 1:
-            self.note = "больше трёх частей не бывает"
-            self.update_meta()
-            return
         else:
             k = sorted(breaks + [i]).index(i)
             used = [edit["pos"]] + spots
             order = list(core.SPARE_PLACES[core.corner_of(edit["pos"])]) + list(core.CHAT_POSITIONS)
             free = [c for c in order if c not in used]
             breaks.insert(k, i)
-            spots.insert(k, free[0] if free else core.places(edit, len(breaks) + 1)[-1])
+            spots.insert(k, free[0] if free else core.corner_of(used[k]))
         edit["breaks"], edit["places"] = breaks, spots
         self.draw_lines(self.area())
         self.count.config(text=self.count_text())
-        self.schedule_save()
+        self.schedule_save(shot)
 
     def count_text(self):
-        rows = self.shot["rows"]
-        n = len(core.parts(rows, self.shot["edit"]))
-        return f"В СС {sum(r['keep'] for r in rows)} из {len(rows)}" + (f" · частей: {n}" if n > 1 else "")
+        shots = [s for _, s in self.members() if s] if self.scene_names() else [self.shot]
+        kept, total = sum(r["keep"] for s in shots for r in s["rows"]), sum(len(s["rows"]) for s in shots)
+        if len(shots) > 1:
+            return f"В сцене {kept} из {total}"
+        n = len(core.parts(self.shot["rows"], self.shot["edit"]))
+        return f"В СС {kept} из {total}" + (f" · частей: {n}" if n > 1 else "")
 
     def set_place(self, part, pos):
-        edit = self.shot["edit"]
+        shot = self.target
+        edit = shot["edit"]
         if part == 0:
             edit["pos"] = pos
             return
-        spots = core.places(edit, len(core.parts(self.shot["rows"], edit)))[1:]
+        spots = core.places(edit, len(core.parts(shot["rows"], edit)))[1:]
         spots[part - 1] = pos
         edit["places"] = spots
 
     def pick_place(self, part, pos):
-        if self.shot is None:
+        if self.target is None:
             return
         self.set_place(part, pos)
-        self.media_redraw()
+        self.redraw()
         self.schedule_save()
 
     def row_at(self, y):
-        return min(max(int((y - self.lines_top) // self.lines_slot), 0), len(self.shot["rows"]) - 1)
+        return min(max(int((y - self.lines_top) // self.lines_slot), 0), len(self.items) - 1)
 
-    def mark_rows(self, a, b):
-        rows = self.shot["rows"]
-        for r in rows[min(a, b):max(a, b) + 1]:
-            r["keep"] = self.drag["keep"]
-        self.shot["edit"]["keep"] = [r["keep"] for r in rows]
+    def mark_rows(self, a, b, drag):
+        touched = drag["shots"]
+        for shot, i, _, name in self.items[min(a, b):max(a, b) + 1]:
+            if i is not None:
+                shot["rows"][i]["keep"] = drag["keep"]
+                touched[name] = shot
+        for shot in touched.values():
+            shot["edit"]["keep"] = [r["keep"] for r in shot["rows"]]
         self.draw_lines(self.area())
         self.count.config(text=self.count_text())
 
@@ -1536,11 +2456,17 @@ class Feed:
         self.c.delete("shot")
         ax, ay, aw, ah = area
         out = self.shot["out"]
-        names = core.donors(out, self.name, self.names)
+        names = core.donors(out, self.name if self.tool == "scenepick" else self.current(), self.names)
         if not names:
             self.c.create_text(ax + aw // 2, ay + ah // 2, text="Других СС с исходными кадрами нет", fill=SUB,
                                font=(FONT["ui"], 12), tags=("shot",))
             return
+        picking = self.tool == "scenepick"
+        chosen = set(self.scene_names()) | {self.name}
+        if picking:
+            names = [n for n in reversed(self.names) if n in chosen or n in names]
+            ticks = [ImageTk.PhotoImage(tick(px(20), on)) for on in (False, True)]
+            self.photos += ticks
         cols = 2 if len(names) <= 4 else 3 if len(names) <= 9 else 4
         lines = -(-len(names) // cols)
         gap, cap = px(16), px(28)
@@ -1553,19 +2479,26 @@ class Feed:
             photo = self.thumb(out, name, (max(1, round(cw)), max(1, round(ch))))
             w, h = (photo.width(), photo.height()) if photo else (round(cw), round(ch))
             left, up = x + (cw - w) / 2, y + (ch - h) / 2
+            on = picking and name in chosen
+            idle = WHITE if on else HAIR
             if photo:
                 self.c.create_image(left, up, anchor="nw", image=photo, tags=("shot", tag))
-            self.c.create_rectangle(left - 1, up - 1, left + w, up + h, outline=HAIR, fill="" if photo else ROW,
-                                    tags=("shot", tag, tag + "-box"))
-            self.c.create_text(left, up + h + px(8), text=when(name), anchor="nw", fill=SUB, font=(FONT["ui"], 10),
-                               tags=("shot", tag, tag + "-label"))
+            self.c.create_rectangle(left - 1, up - 1, left + w, up + h, outline=idle, width=2 if on else 1,
+                                    fill="" if photo else ROW, tags=("shot", tag, tag + "-box"))
+            if picking:
+                self.c.create_image(left + px(8), up + px(8), anchor="nw", image=ticks[on], tags=("shot", tag))
+            mine = picking and name == self.name
+            self.c.create_text(left, up + h + px(8), text=when(name) + (" · эта СС" if mine else ""), anchor="nw",
+                               fill=WHITE if on else SUB, font=(FONT["ui"], 10), tags=("shot", tag, tag + "-label"))
+            if mine:
+                continue
             self.c.tag_bind(tag, "<Button-1>", lambda _, n=name: self.donor_pick(n))
             self.c.tag_bind(tag, "<Enter>", lambda _, t=tag: (self.c.itemconfig(t + "-box", outline=WHITE),
                                                               self.c.itemconfig(t + "-label", fill=WHITE),
                                                               self.c.config(cursor="hand2")))
-            self.c.tag_bind(tag, "<Leave>", lambda _, t=tag: (self.c.itemconfig(t + "-box", outline=HAIR),
-                                                              self.c.itemconfig(t + "-label", fill=SUB),
-                                                              self.c.config(cursor="")))
+            self.c.tag_bind(tag, "<Leave>", lambda _, t=tag, c=idle, f=WHITE if on else SUB: (
+                self.c.itemconfig(t + "-box", outline=c), self.c.itemconfig(t + "-label", fill=f),
+                self.c.config(cursor="")))
 
     def thumb(self, out, name, size):
         path = core.shot_image(out, name)
@@ -1587,6 +2520,9 @@ class Feed:
         if self.tool == "carry":
             self.carry(name)
             return
+        if self.tool == "scenepick":
+            self.toggle_scene(name)
+            return
         self.c.config(cursor="watch")
         self.c.update_idletasks()
         try:
@@ -1604,8 +2540,11 @@ class Feed:
     def carry(self, name):
         self.c.config(cursor="watch")
         self.c.update_idletasks()
+        shot = self.target
+        if shot is None:
+            return
         try:
-            added = core.carry_chat(self.shot, name, self.app.cfg)
+            added = core.carry_chat(shot, name, self.app.cfg)
         except (OSError, ValueError) as e:
             self.c.config(cursor="")
             self.note = f"чат не перенёсся: {e}"
@@ -1615,18 +2554,45 @@ class Feed:
         self.tool = "lines"
         self.redraw()
         if added:
-            self.schedule_save()
+            self.schedule_save(shot)
         self.note = (f"из СС от {when(name)} добавлено строк: {added}" if added
                      else "все строки той СС уже есть в этой")
         self.update_meta()
 
+    def drop_repeats(self):
+        missing = [n for n, shot in self.members() if shot is None and self.cache.get(n) is not False]
+        if missing:
+            self.c.config(cursor="watch")
+            self.c.update_idletasks()
+        for name in missing:
+            try:
+                shot = core.load_shot(self.shot["out"], name, self.app.cfg)
+            except (OSError, ValueError):
+                shot = None
+            self.cache[name] = shot or False
+        self.c.config(cursor="")
+        shots, gone = [shot for _, shot in self.members()], 0
+        for shot, dup in zip(shots, core.repeats(shots)):
+            if dup:
+                for i in dup:
+                    shot["rows"][i]["keep"] = False
+                shot["edit"]["keep"] = [r["keep"] for r in shot["rows"]]
+                self.schedule_save(shot)
+                gone += len(dup)
+        self.note = f"убрал повторы из сцены: {gone}" if gone else "повторов в сцене нет"
+        if self.tool == "lines":
+            self.redraw()
+        self.update_meta()
+
     def reset_lines(self):
         keep = self.app.cfg["keep"]
-        for r in self.shot["rows"]:
-            r["keep"] = r["kind"] in keep
-        self.shot["edit"]["keep"] = [r["keep"] for r in self.shot["rows"]]
+        for shot in [s for _, s in self.members() if s] if self.scene_names() else [self.shot]:
+            log = core.log_path(shot["out"], shot["name"]).exists()
+            for r in shot["rows"]:
+                r["keep"] = log or r["kind"] in keep
+            shot["edit"]["keep"] = [r["keep"] for r in shot["rows"]]
+            self.schedule_save(shot)
         self.redraw()
-        self.schedule_save()
 
     def tags_here(self):
         return self.c.gettags("current")
@@ -1637,22 +2603,57 @@ class Feed:
             return
         row = next((t for t in tags if re.fullmatch(r"row\d+", t)), None)
         cut = next((t for t in tags if re.fullmatch(r"cut\d+", t)), None)
-        if self.tool == "lines":
-            if cut:
-                self.toggle_cut(int(cut[3:]))
-            elif row and self.click_mode != "rows":
-                self.toggle_word(int(row[3:]), (e.x - self.lines_x0) / self.lines_s, self.click_mode)
-            elif row:
-                i = int(row[3:])
-                self.drag = {"kind": "rows", "keep": not self.shot["rows"][i]["keep"], "last": i}
-                self.mark_rows(i, i)
+        head = next((t for t in tags if re.fullmatch(r"head\d+", t)), None)
+        if self.tool == "logpick":
+            row = next((int(t[4:]) for t in tags if re.fullmatch(r"lrow\d+", t)), None)
+            head = next((int(t[5:]) for t in tags if re.fullmatch(r"lhead\d+", t)), None)
+            if head is not None:
+                self.toggle_chunk(head)
+            elif row is not None:
+                on = self.logview["items"][row][1] not in self.logview["on"]
+                self.drag = {"kind": "log", "on": on, "first": row, "last": row}
+                self.mark_log(row, row, on)
             return
-        if self.tool in ("carry", "photopick", "file"):
+        if self.tool == "lines":
+            pick = next((t[4:] for t in tags if t.startswith("pop-") and not t.endswith("-bg")), None)
+            if pick or self.popup:
+                self.popup_pick(pick) if pick else self.close_popup()
+                return
+            home = next((int(t[4:]) for t in tags if re.fullmatch(r"home\d+", t)), None)
+            if home is not None:
+                self.next_home(home)
+                return
+            if not (head or cut or row):
+                return
+            j = int(head[4:] if head else (cut or row)[3:])
+            name = self.items[j][3]
+            self.part = None if name == self.name else name
+            self.hint(None)
+            if head:
+                self.draw_lines(self.area())
+            elif cut:
+                self.toggle_cut(j)
+            else:
+                shot, i = self.items[j][:2]
+                self.drag = {"kind": "rows", "keep": not shot["rows"][i]["keep"], "first": j, "last": j,
+                             "shots": {}, "moved": False}
+            return
+        hit = self.scene_chat_at(e) if self.previewing() else None
+        if hit:
+            self.drag = {"kind": "scenechat", "x": e.x, "y": e.y, "hit": hit}
+            self.c.config(cursor="fleur")
+            return
+        if self.view_box and self.inside(e, {"img": self.preview_rect}):
+            self.drag = {"kind": "view", "x": e.x, "y": e.y, "at": (self.view["cx"], self.view["cy"]), "moved": False}
+            self.loupe.hide()
+            return
+        shot = self.target
+        if self.tool in DONORS + PREVIEWS or shot is None or self.previewing():
             return
         over = self.tool == "images"
         handle = next((t[7:] for t in tags if t.startswith("handle-")), None)
         if over and handle and self.painter.geo:
-            item = self.shot["edit"]["overlays"][self.active_ov]
+            item = shot["edit"]["overlays"][self.active_ov]
             box = self.painter.geo["overlays"][self.active_ov]
             size = self.source_size(item)
             if box and size:
@@ -1662,7 +2663,7 @@ class Feed:
         ov = next((int(t[7:]) for t in tags if re.fullmatch(r"shot-ov\d+", t)), None)
         if over and ov is not None:
             self.active_ov = ov
-            item = self.shot["edit"]["overlays"][ov]
+            item = shot["edit"]["overlays"][ov]
             kind = "ovpan" if e.state & 0x1 else "ov"
             self.drag = {"kind": kind, "part": ov, "x": e.x, "y": e.y, "at": (item["x"], item["y"]),
                          "crop": list(item["crop"])}
@@ -1673,7 +2674,7 @@ class Feed:
         if geo and part is not None and part < len(geo["chats"]) and geo["chats"][part]:
             self.drag = {"kind": "chat", "part": part, "x": e.x, "y": e.y, "at": self.c.coords(f"shot-chat{part}")}
         elif geo and self.tool == "crop" and self.inside(e, geo):
-            self.drag = {"kind": "pan", "x": e.x, "y": e.y, "center": list(self.shot["edit"]["center"])}
+            self.drag = {"kind": "pan", "x": e.x, "y": e.y, "center": list(shot["edit"]["center"])}
             self.c.config(cursor="fleur")
 
     def inside(self, e, geo):
@@ -1684,23 +2685,46 @@ class Feed:
         if not self.drag:
             return
         geo = self.painter.geo
-        if self.drag["kind"] == "rows":
+        if self.drag["kind"] == "log":
+            j = self.log_item_at(e.y)
+            if j != self.drag["last"]:
+                self.drag["last"] = j
+                self.mark_log(self.drag["first"], j, self.drag["on"])
+        elif self.drag["kind"] == "rows":
             i = self.row_at(e.y)
             if i != self.drag["last"]:
-                self.mark_rows(self.drag["last"], i)
-                self.drag["last"] = i
+                self.drag["moved"], self.drag["last"] = True, i
+                self.mark_rows(self.drag["first"], i, self.drag)
         elif self.drag["kind"] == "chat":
-            ix, iy, dw, dh = geo["img"]
-            ch = geo["chats"][self.drag["part"]]
-            slack = geo["pad"] * geo["d"]
-            x = min(max(self.drag["at"][0] + e.x - self.drag["x"], ix - slack), ix + dw - ch["w"] + slack)
-            y = min(max(self.drag["at"][1] + e.y - self.drag["y"], iy - slack), iy + dh - ch["h"] + slack)
-            self.c.coords(f"shot-chat{self.drag['part']}", x, y)
+            at = (self.drag["at"][0] + e.x - self.drag["x"], self.drag["at"][1] + e.y - self.drag["y"])
+            self.c.coords(f"shot-chat{self.drag['part']}", *self.chat_spot(self.drag["part"], *at)[1:])
         elif self.drag["kind"] == "crop":
             self.drag_crop(e, geo)
+        elif self.drag["kind"] == "scenechat":
+            x0, y0, d = self.view_box
+            rx, ry = self.preview_rect[:2]
+            _, _, left, top, w, h = self.drag["hit"]
+            x = rx + (left - x0) * d + e.x - self.drag["x"]
+            y = ry + (top - y0) * d + e.y - self.drag["y"]
+            self.c.delete("ghost")
+            self.c.create_rectangle(x, y, x + w * d, y + h * d, outline=VOID, width=3, tags=("ghost",))
+            self.c.create_rectangle(x, y, x + w * d, y + h * d, outline=WHITE, width=1, dash=(5, 3), tags=("ghost",))
+        elif self.drag["kind"] == "view":
+            dx, dy = e.x - self.drag["x"], e.y - self.drag["y"]
+            if not self.drag["moved"] and max(abs(dx), abs(dy)) < px(4):
+                return
+            self.drag["moved"] = True
+            self.c.config(cursor="fleur")
+            H, W = self.preview.shape[:2]
+            d = self.view_box[2]
+            self.view["cx"] = self.drag["at"][0] - dx / d / W
+            self.view["cy"] = self.drag["at"][1] - dy / d / H
+            if not self.pending_media:
+                self.pending_media = True
+                self.c.after(16, self.flush_media)
 
         elif self.drag["kind"] in ("ov", "ovpan"):
-            ov = self.shot["edit"]["overlays"][self.drag["part"]]
+            ov = self.target["edit"]["overlays"][self.drag["part"]]
             (out_w, out_h), d = geo["out"], geo["d"]
             if self.drag["kind"] == "ov":
                 ov["x"] = round(min(max(self.drag["at"][0] + (e.x - self.drag["x"]) / d / out_w, 0.0), 1.0), 4)
@@ -1717,16 +2741,31 @@ class Feed:
                 self.pending_media = True
                 self.c.after(16, self.flush_media)
         else:
-            bg = self.shot["bg"]
-            H, W = bg.shape[:2]
+            shot = self.target
+            H, W = shot["bg"].shape[:2]
             x0, y0, x1, y1 = geo["plan"]["rect"]
             k = (x1 - x0) / (geo["plan"]["base"][0] * geo["d"])
             cx = self.drag["center"][0] - (e.x - self.drag["x"]) * k / W
             cy = self.drag["center"][1] - (e.y - self.drag["y"]) * k / H
-            self.shot["edit"]["center"] = [cx, cy]
+            shot["edit"]["center"] = [cx, cy]
             if not self.pending_media:
                 self.pending_media = True
                 self.c.after(16, self.flush_media)
+
+    def chat_spot(self, part, x, y):
+        geo = self.painter.geo
+        ix, iy = geo["img"][:2]
+        d, pad, margin = geo["d"], geo["pad"], geo["plan"]["margin"]
+        (W, H), (it, ib) = geo["out"], geo["inset"]
+        inner = H - it - ib
+        lw, lh = geo["chats"][part]["lw"], geo["chats"][part]["lh"]
+        left, top = (x - ix) / d + pad, (y - iy) / d - it + pad
+        near = margin + 0.04 * min(W, inner)
+        hx = "left" if left < near else "right" if left + lw - 2 * pad > W - near else round(left / W, 4)
+        vy = "top" if top < near else "bottom" if top + lh - 2 * pad > inner - near else round(top / inner, 4)
+        pos = f"{vy}-{hx}" if isinstance(hx, str) and isinstance(vy, str) else [hx, vy]
+        left, top = chat.place(W, inner, lw, lh, pad, pos, margin)
+        return pos, ix + left * d, iy + (top + it) * d
 
     def snap_ov(self, ov, box, geo):
         if not box:
@@ -1742,7 +2781,7 @@ class Feed:
 
     def drag_crop(self, e, geo):
         drag = self.drag
-        ov = self.shot["edit"]["overlays"][drag["part"]]
+        ov = self.target["edit"]["overlays"][drag["part"]]
         (out_w, out_h), d = geo["out"], geo["d"]
         box, (SW, SH), (l, t, r, b) = drag["box"], drag["size"], drag["crop"]
         X, Y = (box["x"] - geo["img"][0]) / d, (box["y"] - geo["img"][1]) / d
@@ -1783,6 +2822,69 @@ class Feed:
             self.pending_media = True
             self.c.after(16, self.flush_media)
 
+    def loaded_members(self):
+        return [(n, shot) for n, shot in self.members() if shot]
+
+    def scene_chat_at(self, e):
+        if not self.view_box or not self.layout or not self.layout.get("chats"):
+            return None
+        x0, y0, d = self.view_box
+        x, y = x0 + (e.x - self.preview_rect[0]) / d, y0 + (e.y - self.preview_rect[1]) / d
+        return next((c for c in reversed(self.layout["chats"])
+                     if c[2] <= x <= c[2] + c[4] and c[3] <= y <= c[3] + c[5]), None)
+
+    def drop_scene_chat(self, drag, e):
+        k, part, left, top, lw, lh = drag["hit"]
+        layout, d = self.layout, self.view_box[2]
+        names = layout.get("names") or [n for n, _ in self.loaded_members()]
+        if k >= len(names) or max(abs(e.x - drag["x"]), abs(e.y - drag["y"])) < px(4):
+            return
+        name, shot = names[k], self.member(names[k])
+        if shot is None:
+            self.note = "эта СС не открылась, чат не перенёсся"
+            self.update_meta()
+            return
+        pad, margin, W = layout["pads"][k], layout["margins"][k], self.preview.shape[1]
+        left, top = left + (e.x - drag["x"]) / d + pad, top + (e.y - drag["y"]) / d + pad
+        w, h = lw - 2 * pad, lh - 2 * pad
+        mid = top + h / 2
+        j = next((n for n, (a, b) in enumerate(layout["spans"]) if mid < b), len(layout["spans"]) - 1)
+        a, b = layout["spans"][j]
+        inner, top = b - a, top - a
+        near = margin + 0.04 * min(W, inner)
+        hx = "left" if left < near else "right" if left + w > W - near else None
+        vy = None if top < 0 or top + h > inner else "top" if top < near else "bottom" if top + h > inner - near else None
+        if hx and vy:
+            pos = f"{vy}-{hx}"
+        else:
+            x = {"left": margin, "right": W - margin - w}.get(hx, left)
+            y = {"top": margin, "bottom": inner - margin - h}.get(vy, top)
+            pos = [round(min(max(x, 0), W - w) / W, 4), round(y / inner, 4)]
+        edit = shot["edit"]
+        if part == 0:
+            edit["pos"] = pos
+        else:
+            spots = core.places(edit, len(core.parts(shot["rows"], edit)))[1:]
+            spots[part - 1] = pos
+            edit["places"] = spots
+        edit["home"] = None if j == k else names[j]
+        self.schedule_save(shot)
+        self.want_preview()
+        self.note = f"чат СС {k + 1} теперь на СС {j + 1}" if j != k else ""
+        self.update_meta()
+
+    def next_home(self, j):
+        shot, _, k, name = self.items[j]
+        names = [n for n, _ in self.loaded_members()]
+        if shot is None or len(names) < 2:
+            return
+        at = shot["edit"].get("home")
+        now = names.index(at) if at in names else names.index(name)
+        to = names[(now + 1) % len(names)]
+        shot["edit"]["home"] = None if to == name else to
+        self.schedule_save(shot)
+        self.draw_lines(self.area())
+
     def flush_media(self):
         self.pending_media = False
         self.media_redraw()
@@ -1790,90 +2892,173 @@ class Feed:
     def release(self, e):
         drag, self.drag = self.drag, None
         self.c.config(cursor="")
-        if not drag or self.shot is None:
+        if not drag or self.shot is None or drag["kind"] == "log":
             return
-        geo = self.painter.geo
-        edit = self.shot["edit"]
+        if drag["kind"] == "scenechat":
+            self.c.delete("ghost")
+            self.drop_scene_chat(drag, e)
+            return
+        if drag["kind"] == "view":
+            k = None if drag["moved"] or self.tool != "scene" else self.seam_at(e.y)
+            if k is not None:
+                self.seam = "all" if self.seam == str(k) else str(k)
+                self.redraw()
+            return
         if drag["kind"] == "rows":
-            self.schedule_save()
+            if not drag["moved"]:
+                j = drag["first"]
+                shot, i = self.items[j][:2]
+                r, x = shot["rows"][i], (e.x - self.lines_x0) / self.lines_s
+                word = next(((a, b) for a, b in chat.words(r) if a - 3 <= x <= b + 3), None)
+                if r["keep"] and word and e.x >= self.lines_x0 - px(4):
+                    self.open_popup(j, word)
+                    return
+                self.mark_rows(j, j, drag)
+            for shot in drag["shots"].values():
+                self.schedule_save(shot)
+            return
+        shot = self.target
+        if shot is None:
             return
         if drag["kind"] == "chat":
-            x, y = self.c.coords(f"shot-chat{drag['part']}")
-            ix, iy = geo["img"][:2]
-            d, pad = geo["d"], geo["pad"]
-            out_w, out_h = geo["out"]
-            left, top = (x - ix) / d, (y - iy) / d
-            ch = geo["chats"][drag["part"]]
-            margin = geo["plan"]["margin"]
-            pos = [round((left + pad) / out_w, 4), round((top + pad) / out_h, 4)]
-            for corner in core.CHAT_POSITIONS:
-                cl, ct = chat.place(out_w, out_h, ch["lw"], ch["lh"], pad, corner, margin)
-                if ((cl - left) ** 2 + (ct - top) ** 2) ** 0.5 < 0.06 * min(out_w, out_h):
-                    pos = corner
-                    break
-            self.set_place(drag["part"], pos)
+            at = (drag["at"][0] + e.x - drag["x"], drag["at"][1] + e.y - drag["y"])
+            self.set_place(drag["part"], self.chat_spot(drag["part"], *at)[0])
         elif drag["kind"] in ("ov", "ovpan", "crop"):
             self.redraw()
             self.schedule_save()
             return
         else:
-            H, W = self.shot["bg"].shape[:2]
-            x0, y0, x1, y1 = chat.frame_rect(W, H, core.ratio_of(edit["format"]), edit["zoom"], edit["center"])
-            edit["center"] = [round((x0 + x1) / 2 / W, 4), round((y0 + y1) / 2 / H, 4)]
+            look = self.look(shot)[0]
+            H, W = shot["bg"].shape[:2]
+            x0, y0, x1, y1 = chat.frame_rect(W, H, core.ratio_of(look["format"]), look["zoom"], look["center"])
+            shot["edit"]["center"] = [round((x0 + x1) / 2 / W, 4), round((y0 + y1) / 2 / H, 4)]
         self.media_redraw()
         if self.tool == "text":
             self.redraw()
         self.schedule_save()
 
     def hover(self, e):
-        if self.drag or self.index == 0 or self.shot is None or self.tool == "lines":
-            return
-        if self.tool == "file":
-            geo = self.painter.geo
-            if self.preview is not None and geo and self.inside(e, geo):
-                self.loupe.show(e.x, e.y, geo["img"], self.preview)
-            else:
-                self.loupe.hide()
+        if self.drag or self.index == 0 or self.shot is None:
             return
         tags = self.tags_here()
-        if "shot-chat" in tags or (self.tool == "images" and "shot-ov" in tags):
+        rail = next((t[5:] for t in tags if t.startswith("rail-")), None)
+        if rail or any(t.startswith(("rail", "nav", "older")) for t in tags):
+            self.loupe.hide()
+            self.hint(RAIL_HINTS.get(rail))
+            return
+        if self.tool == "lines":
+            self.hint(self.lines_hint(tags, e))
+            return
+        if self.tool == "logpick":
+            head = any(re.fullmatch(r"lhead\d+", t) for t in tags)
+            row = any(re.fullmatch(r"lrow\d+", t) for t in tags)
+            self.hint("Клик — отметить весь кусок или снять с него отметки" if head else
+                      "Клик — отметить строку · веди мышью, чтобы отметить несколько" if row else None)
+            return
+        if self.tool in DONORS:
+            donor = any(re.fullmatch(r"donor\d+", t) for t in tags)
+            self.hint({"carry": "Клик — добавить строки этой СС", "photopick": "Клик — положить фон этой СС поверх",
+                       "scenepick": "Клик — добавить в сцену или убрать"}[self.tool] if donor else None)
+            return
+        if self.previewing():
+            rect = self.preview_rect
+            inside = self.preview is not None and rect and self.inside(e, {"img": rect})
+            grab = inside and self.view_box and self.scene_chat_at(e) is not None
+            seam = inside and self.view_box and self.tool == "scene" and self.seam_at(e.y) is not None
+            self.c.config(cursor=("hand2" if seam else "fleur") if inside and self.view_box else "")
+            if inside and not grab and (not self.view_box or self.view_box[2] < 1):
+                self.loupe.show(e.x, e.y, rect, self.preview_view)
+            else:
+                self.loupe.hide()
+            self.hint(None if not inside else
+                      "Тяни чат — на переход, на другую СС или в её угол" if grab else
+                      "Клик — настроить только этот переход" if seam else
+                      "Тяни — двигать · колесо — прокрутка · Ctrl + колесо — масштаб" if self.view_box else
+                      "Точно как в файле · лупа показывает пиксели 1:1")
+            return
+        over = self.tool == "images"
+        if "shot-chat" in tags:
             self.c.config(cursor="fleur")
+            self.hint("Тяни чат мышью — у края он сам встанет на отступ")
+        elif over and any(t.startswith("handle-") for t in tags):
+            self.hint("Тяни — обрезать картинку")
+        elif over and "shot-ov" in tags:
+            self.c.config(cursor="fleur")
+            self.hint("Тяни — двигать · колесо — размер · Shift + тяни — сдвинуть обрезку")
         elif self.tool == "crop" and self.painter.geo and self.inside(e, self.painter.geo):
             self.c.config(cursor="fleur")
-        elif not any(t.startswith(("rail", "nav", "older")) for t in tags):
+            self.hint("Тяни — выбрать, что в кадре · колесо — приближение")
+        else:
             self.c.config(cursor="")
+            self.hint(None)
+
+    def lines_hint(self, tags, e):
+        if "popup" in tags:
+            return None
+        if any(re.fullmatch(r"cut\d+", t) for t in tags):
+            return "Разрезать чат здесь — дальше пойдёт новая часть"
+        if any(re.fullmatch(r"home\d+", t) for t in tags):
+            return "Клик — перенести чат этой СС на следующую СС сцены"
+        if any(re.fullmatch(r"head\d+", t) for t in tags):
+            return "Клик — выбрать эту СС"
+        row = next((t for t in tags if re.fullmatch(r"row\d+", t)), None)
+        if row is None:
+            return None
+        shot, i = self.items[int(row[3:])][:2]
+        if not shot["rows"][i]["keep"]:
+            return "Клик — вернуть строку"
+        if e.x < self.lines_x0 - px(4):
+            return "Клик — убрать строку · веди мышью, чтобы отметить несколько"
+        return "Клик по слову — закрыть или удалить его · по галочке — убрать строку"
 
     def wheel(self, e):
         step = -1 if e.delta > 0 else 1
+        if self.popup:
+            self.close_popup()
+        if self.tool == "logpick" and self.logview and self.logview["offset"] is not None:
+            self.logview["offset"] += step * px(72)
+            self.draw_log(self.area())
+            return
+        if self.view_box:
+            if e.state & 0x4:
+                self.zoom_view(self.view["zoom"] * (1.25 if step < 0 else 0.8), (e.x, e.y))
+            else:
+                x0, y0, d = self.view_box
+                self.view["cy"] += step * 0.25 * self.preview_rect[3] / d / self.preview.shape[0]
+                self.media_redraw()
+            self.loupe.hide()
+            return
         if self.tool == "lines" and self.shot is not None:
             self.offset += step * px(72)
             self.draw_lines(self.area())
             return
+        shot = self.target
         ov = next((int(t[7:]) for t in self.tags_here() if re.fullmatch(r"shot-ov\d+", t)), None)
-        if self.tool == "images" and self.shot is not None and ov is not None:
-            item = self.shot["edit"]["overlays"][ov]
+        if self.tool == "images" and shot is not None and ov is not None:
+            item = shot["edit"]["overlays"][ov]
             item["w"] = round(min(max(item["w"] * (1.08 if step < 0 else 1 / 1.08), 0.05), 2.0), 4)
             self.active_ov = ov
             self.media_redraw()
             self.schedule_save()
             return
-        if self.tool == "crop" and self.shot is not None and e.state & 0x4:
-            zoom = min(3.0, max(1.0, round(self.shot["edit"]["zoom"] - step * 0.1, 2)))
+        if self.tool == "crop" and shot is not None:
+            zoom = min(3.0, max(1.0, round(shot["edit"]["zoom"] - step * 0.1, 2)))
             self.change(zoom=zoom)
             return
         now = time.monotonic()
-        if now - self.last_wheel > 0.25:
+        if self.tool is None and now - self.last_wheel > 0.25:
             self.last_wheel = now
             self.go(self.index + step)
 
-    def schedule_save(self):
-        if self.shot is None:
+    def schedule_save(self, shot=None):
+        shot = shot or self.target
+        if shot is None:
             return
         self.note = "сохраняю…"
         self.update_meta()
         if self.save_job:
             self.c.after_cancel(self.save_job)
-        self.save_target = self.shot
+        self.saves[shot["name"]] = shot
         self.save_job = self.c.after(450, self.save_now)
 
     def flush_save(self):
@@ -1885,34 +3070,52 @@ class Feed:
         if self.save_job:
             self.c.after_cancel(self.save_job)
             self.save_job = None
-            try:
-                core.save_shot(self.snapshot(self.save_target))
-            except Exception:
-                pass
+            snaps, self.saves = [self.snapshot(s) for s in self.saves.values()], {}
+            self.store(snaps, lambda *_: None)
 
-    def snapshot(self, shot=None):
+    def snapshot(self, shot=None, deep=True):
         shot = shot or self.shot
-        return {**shot, "rows": [dict(r) for r in shot["rows"]], "edit": json.loads(json.dumps(shot["edit"]))}
+        snap = {**shot, "rows": [dict(r) for r in shot["rows"]], "edit": json.loads(json.dumps(shot["edit"]))}
+        scene = shot["edit"].get("scene") if deep else None
+        if scene:
+            snap["members"] = {n: self.snapshot(m, False) for n in scene["shots"]
+                               if n != shot["name"] and (m := self.cache.get(n))}
+        return snap
 
     def save_now(self):
         self.save_job = None
-        snap = self.snapshot(self.save_target)
-        name = snap["name"]
+        snaps, self.saves = [self.snapshot(s) for s in self.saves.values()], {}
+        if snaps:
+            self.save_queue.put(snaps)
 
-        def work():
+    def save_loop(self):
+        while True:
+            self.store(self.save_queue.get(), lambda *a: self.app.inbox.put(("saved",) + a))
+
+    @staticmethod
+    def store(snaps, report):
+        snaps.sort(key=lambda snap: bool(snap["edit"].get("scene")))
+        for snap in snaps:
             try:
-                core.save_shot(snap)
-                self.app.inbox.put(("saved", name, None))
+                core.save_shot(snap, heads=False)
+                report(snap["name"], None)
             except Exception as e:
-                self.app.inbox.put(("saved", name, str(e)))
-
-        threading.Thread(target=work, daemon=True).start()
+                report(snap["name"], str(e))
+        if snaps:
+            names = [snap["name"] for snap in snaps]
+            for head in core.refresh_heads(snaps[0]["out"], names, snaps[0].get("cfg"), names):
+                report(head, None)
 
     def saved(self, name, error):
-        if name == self.name:
+        self.media = None
+        if name in (self.name, self.part):
             self.note = f"не сохранилось: {error}" if error else "сохранено"
             self.update_meta()
-            self.media = None
+        if self.shot is not None and name in self.scene_names() and self.drag is None:
+            if self.previewing() and name != self.name:
+                self.want_preview()
+            elif self.tool is None:
+                self.redraw()
 
     def copy(self):
         name = self.name
@@ -1923,8 +3126,7 @@ class Feed:
 
         def work():
             try:
-                img = (core.render(snap["bg"], snap["rows"], snap["edit"], snap["out"] / "src")[0] if snap
-                       else core.read_image(path))
+                img = core.render_shot(snap)[0] if snap else core.read_image(path)
                 core.copy_image(img)
                 self.app.inbox.put(("copied", name, None))
             except Exception as e:
@@ -1951,11 +3153,13 @@ class Feed:
             self.go(self.index - 1)
         elif e.keysym in ("Down", "Next"):
             self.go(self.index + 1)
+        elif e.keysym == "Escape" and self.popup:
+            self.close_popup()
         elif e.keysym == "Escape" and self.tool:
             self.toggle_tool(self.tool)
         elif e.keycode == 67 and e.state & 0x4 and self.index > 0:
             self.copy()
-        elif e.keycode in (49, 50, 51, 52, 53) and self.shot is not None and self.index > 0:
+        elif 49 <= e.keycode < 49 + len(TOOLS) and self.shot is not None and self.index > 0:
             self.toggle_tool(TOOLS[e.keycode - 49])
 
 
@@ -2115,11 +3319,14 @@ class Settings:
         self.key_pill.pack(anchor="w")
         control, self.mode_sub, text = self.row(f, "Режим", self.mode_text())
         self.choice(control, MODES, "yes" if cfg["auto"] else "no", self.set_mode)
+        control, _, _ = self.row(f, "Чат", "Из чатлога — F11 снимает только сцену, строки потом выбираешь из записи "
+                                           "чата")
+        self.source_pick = self.choice(control, SOURCES, cfg["source"], self.set_source)
         control, _, _ = self.row(f, "Звук", "Сигнал, когда СС готова")
         self.choice(control, SOUND, "yes" if cfg["sound"] else "no", lambda v: self.app.set("sound", v))
         control, _, _ = self.row(f, "Трей", "Крестик прячет окно в трей, съёмка работает. Выход — через значок")
         self.choice(control, SOUND, "yes" if cfg["tray"] else "no", self.app.set_tray)
-        self.section(f, "Кадр и файл")
+        self.section(f, "Новые СС: кадр и файл")
         control, _, _ = self.row(f, "Кадр", "Свой — ширина и высота в пикселях")
         FramePick(control, cfg["format"], self.set_frame, self.frame_now, self.list_w - self.label_w).pack(anchor="w")
         control, _, _ = self.row(f, "Размер файла", "По короткой стороне, в пикселях")
@@ -2137,13 +3344,16 @@ class Settings:
         self.quality.pack(anchor="w")
         self.quality_row = self.last_row
         self.show_quality()
-        self.section(f, "Чат на СС")
+        self.section(f, "Новые СС: чат")
         control, _, _ = self.row(f, "Текст чата")
         self.choice(control, SCALES, raw["text_scale"], lambda v: self.app.set("text_scale", v))
         control, _, _ = self.row(f, "Обводка")
         self.choice(control, OUTLINES, raw["outline"], lambda v: self.app.set("outline", v))
         control, _, _ = self.row(f, "Угол чата")
         self.choice(control, POSITIONS, cfg["chat_pos"], lambda v: self.app.set("chat_pos", v), cols=2)
+        control, _, _ = self.row(f, "Отступ от края", "Чат у края кадра встаёт на этот отступ. В редакторе — «Текст»")
+        Slider(control, 0, 96, cfg["margin"], lambda v: None, lambda v: self.app.set("margin", str(int(v))),
+               width=self.list_w - self.label_w - px(20), step=2, fmt=lambda v: f"{v:.0f} px").pack(anchor="w")
         control, _, _ = self.row(f, "Ники", "В новых СС. В редакторе — инструмент «Строки»")
         self.choice(control, NICKS, "yes" if cfg["hide_names"] else "no", lambda v: self.app.set("hide_names", v))
         control, _, _ = self.row(f, "Строки в СС", "Остальные можно вернуть в редакторе")
@@ -2172,12 +3382,26 @@ class Settings:
         self.update_src()
         self.section(f, "Чатлог")
         control, _, _ = self.row(f, "Запись чата", "Каждая строка чата с временем, по файлу на день")
-        self.choice(control, SOUND, "yes" if cfg["chatlog"] else "no",
-                    lambda v: (self.app.set("chatlog", v), self.toggle_chatlog(v)))
+        self.chatlog_pick = self.choice(control, SOUND, "yes" if cfg["chatlog"] else "no", self.set_chatlog)
         self.chatlog_state = tk.Label(control, text="Выключен", bg=VOID, fg=SUB, font=(FONT["ui"], 9), anchor="w",
                                       justify="left", wraplength=self.list_w - self.label_w - px(10))
         self.chatlog_state.pack(fill="x", pady=(px(4), 0))
         Pill(control, "Открыть", self.open_chatlog, kind="ghost").pack(anchor="w", pady=(px(8), 0))
+
+    def set_chatlog(self, value):
+        self.app.set("chatlog", value)
+        self.toggle_chatlog(value)
+        if value == "no" and self.app.cfg["source"] == "log":
+            self.app.set("source", "screen")
+            self.source_pick.set("screen")
+            self.mode_sub.config(text=self.mode_text())
+
+    def set_source(self, value):
+        self.app.set("source", value)
+        self.mode_sub.config(text=self.mode_text())
+        if value == "log" and not self.app.cfg["chatlog"]:
+            self.chatlog_pick.set("yes")
+            self.set_chatlog("yes")
 
     def toggle_chatlog(self, value):
         if value == "yes" and self.chatlog_stop is None:
@@ -2250,9 +3474,10 @@ class Settings:
 
     def mode_text(self):
         cfg = self.app.cfg
+        keys = cfg["hud_key"] if cfg["source"] == "log" else f"{cfg['hud_key']} и {cfg['dark_key']}"
         if cfg["auto"]:
-            return f"Программа сама жмёт {cfg['hud_key']} и {cfg['dark_key']}."
-        return f"Сам жмёшь {cfg['hud_key']} и {cfg['dark_key']} перед {cfg['key']}."
+            return f"Программа сама жмёт {keys}."
+        return f"Сам жмёшь {keys} перед {cfg['key']}."
 
     def set_mode(self, value):
         self.app.set("auto", value)

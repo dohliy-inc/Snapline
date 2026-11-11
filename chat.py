@@ -9,6 +9,9 @@ CHAT_GAP = 3
 WRAP_SHARE = 0.22
 WORD_GAP = 0.18
 SAME_ROW = 0.08
+TAG_TOP = 0.52
+TAG_DROP = 0.12
+TAG_COLOR = 30
 
 SPEECH, ACTION, AME, SYSTEM, OOC = "речь", "действие", "над головой", "система", "OOC"
 KINDS = (SPEECH, ACTION, AME, SYSTEM, OOC)
@@ -109,6 +112,10 @@ def _prefix(row):
     ys = np.flatnonzero(g.any(axis=1))
     h, w = ys[-1] - ys[0] + 1, b - a + 1
     gap = glyphs[1][0] - b - 1 if len(glyphs) > 1 else pitch
+    stem = np.flatnonzero(g[:, 0])
+    if (len(stem) and stem[0] <= row["base"] - TAG_TOP * pitch and stem[-1] >= row["base"] + TAG_DROP * pitch
+            and len(stem) >= 0.9 * (stem[-1] - stem[0] + 1)):
+        return "["
     if h > 0.7 * pitch and w < 0.6 * pitch:
         left, right = np.flatnonzero(g[:, 0]) - ys[0], np.flatnonzero(g[:, -1]) - ys[0]
         if len(left) >= 0.8 * h:
@@ -148,13 +155,31 @@ def _orange_share(px):
     return float(((r > 200) & (g > 90) & (g < 170) & (b < 90)).mean())
 
 
+def _color(row, a, b):
+    lum = row["lum"][:, a:b + 1]
+    return row["rgb"][:, a:b + 1][lum > 0.8 * lum.max()].mean(axis=0)
+
+
+def _tagged(row):
+    spans = words(row)
+    if len(spans) < 2:
+        return None
+    tag, rest = _color(row, *spans[0]), _color(row, spans[1][0], spans[-1][1])
+    r, g, b = tag
+    warm = r > 180 and b < min(r, g) - 40
+    return rest if warm and np.abs(tag - rest).max() > TAG_COLOR else None
+
+
 def classify(rows, keep=(SPEECH, ACTION)):
     prev = None
     for row in rows:
         mark = _prefix(row)
         px = _strong(row, row["glyphs"][0][0])
         body = px.mean(axis=0)
-        if mark == ">":
+        tail = _tagged(row) if mark == "[" else None
+        if tail is not None:
+            kind, body = SYSTEM, tail
+        elif mark == ">":
             kind = AME if _pink(body) else SYSTEM
         elif mark == "(":
             kind = OOC
@@ -377,11 +402,11 @@ def chat_layer(rows, outline=1, scale=1.0, max_h=None):
 
 
 def place(width, height, layer_w, layer_h, pad, pos, margin):
-    if isinstance(pos, str):
-        top = margin - pad if pos.startswith("top") else height - margin + pad - layer_h
-        left = margin - pad if pos.endswith("left") else width - margin + pad - layer_w
-    else:
-        left, top = round(pos[0] * width) - pad, round(pos[1] * height) - pad
+    y, x = pos.split("-") if isinstance(pos, str) else pos[::-1]
+    left = (margin - pad if x == "left" else width - margin + pad - layer_w if x == "right"
+            else round(x * width) - pad)
+    top = (margin - pad if y == "top" else height - margin + pad - layer_h if y == "bottom"
+           else round(y * height) - pad)
     left = min(max(left, -pad), max(width - layer_w + pad, -pad))
     top = min(max(top, -pad), max(height - layer_h + pad, -pad))
     return left, top

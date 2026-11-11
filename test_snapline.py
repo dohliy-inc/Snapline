@@ -1,13 +1,17 @@
 import ctypes
+import json
 import os
 import tempfile
 import time
+from collections import deque
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
 from PIL import Image
 
 import chat
+import chatlog
 import core
 
 SAMPLES = Path(__file__).resolve().parent / "tests" / "fixtures"
@@ -25,7 +29,8 @@ def scaled(img, w, h):
 def make_cfg(out, **kw):
     cfg = {"key": "F11", "auto": True, "hud_key": "F7", "dark_key": "F2", "hud_delay": 0, "out": Path(out),
            "format": "square", "ratio": 1.0, "size": "native", "file": "png", "quality": 92, "chat_pos": "top-left",
-           "margin": 24, "text_scale": 1.5, "outline": 2, "keep": (SP, AC), "sound": False, "chatlog": False, "hide_names": False}
+           "margin": 24, "text_scale": 1.5, "outline": 2, "keep": (SP, AC), "sound": False, "chatlog": False, "hide_names": False,
+           "source": "screen"}
     cfg.update(kw)
     return cfg
 
@@ -184,12 +189,13 @@ def check_config():
             raw2, cfg2 = core.load_config()
             assert raw2 == raw and cfg2["ratio"] == 0.8 and cfg2["keep"] == (SP, O) and cfg2["size"] == "4k"
             assert core.parse_config(dict(raw, size=" 0900 "))["size"] == "900"
+            assert cfg["source"] == "screen" and core.parse_config(dict(raw, source=" Log "))["source"] == "log"
             framed = core.parse_config(dict(raw, format="1200 X 0800"))
             assert framed["format"] == "1200x800" and framed["ratio"] == 1.5
             for bad in (dict(raw, hotkey="F7"), dict(raw, size="8k"), dict(raw, size="100"), dict(raw, size="9000"),
                         dict(raw, format="wide"), dict(raw, format="100x800"), dict(raw, format="1200x0"),
                         dict(raw, file="gif"), dict(raw, text_scale="9"),
-                        dict(raw, keep="крики"), dict(raw, sound="maybe")):
+                        dict(raw, keep="крики"), dict(raw, sound="maybe"), dict(raw, source="ocr")):
                 try:
                     core.parse_config(bad)
                 except ValueError:
@@ -293,11 +299,22 @@ def check_parts():
     assert core.places(edit, 3) == ["top-left", "bottom-left", "top-right"]
     assert core.corner_of([0.22, 0.84]) == "bottom-left"
     assert core.places(dict(edit, pos=[0.8, 0.1]), 2) == [[0.8, 0.1], "bottom-right"]
-    assert core.cuts(rows, dict(edit, breaks=[0, 99, 9, 5, 5, 7])) == [5, 7]
+    assert core.cuts(rows, dict(edit, breaks=[0, 99, 9, 5, 5, 7])) == [5, 7, 9]
+    assert core.places(edit, 6) == ["top-left", "bottom-left", "top-right", "bottom-right", "top-left", "bottom-left"]
+    assert core.corner_of(["right", 0.1]) == "top-right" and core.corner_of([0.1, "bottom"]) == "bottom-left"
+    assert chat.place(1440, 1440, 300, 100, 4, ["left", 0.5], 24) == (20, 716)
+    assert chat.place(1440, 1440, 300, 100, 4, [0.3, "bottom"], 24) == (428, 1320)
+    layers = [np.zeros((100, 300, 4), np.uint8), np.zeros((80, 200, 4), np.uint8), None, np.zeros((50, 50, 4), np.uint8)]
+    spots = core.chat_spots((1440, 1440), layers, ["top-left", "top-left", "top-right", ["right", 0.5]], 4, 24)
+    assert spots == [(20, 20), (20, 136), None, (1370, 716)], spots
+    wide = [np.zeros((100, 900, 4), np.uint8), np.zeros((60, 900, 4), np.uint8)]
+    assert core.chat_spots((1440, 1440), wide, ["bottom-left", "bottom-right"], 4, 24) == [(20, 1320), (520, 1244)]
     bg = load("real_bg.webp")
     one, n1 = core.render(bg, rows, edit)
     two, n2 = core.render(bg, rows, dict(edit, breaks=[9]))
     assert n1 == n2 == len(rows), (n1, n2, len(rows))
+    many = list(range(2, len(rows), 2))
+    assert len(many) > 3 and core.render(bg, rows, dict(edit, breaks=many))[1] == len(rows)
     assert not (one != core.render(bg, [], edit)[0]).any(axis=2)[2 * one.shape[0] // 3:].any()
     H = two.shape[0]
     frame = core.render(bg, [], edit)[0]
@@ -537,6 +554,192 @@ def check_watermark():
     assert [r["kind"] for r in rows if r["keep"]] and core.read_image(example / "example_bg.webp").shape == (1440, 2560, 3)
 
 
+def check_scene():
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp)
+        cfg = make_cfg(out)
+        names = []
+        for i, size in enumerate((None, None, (1920, 1080))):
+            state = {"session": core.Session()}
+            state["session"].name = f"SS_2026-01-01_00-00-0{i}"
+            bg, shot = load("real_bg.webp"), load("real_chat_ic.png")
+            if size:
+                bg, shot = scaled(bg, *size), scaled(shot, *size)
+            core.handle(bg, state, cfg)
+            core.handle(shot, state, cfg)
+            names.append(state["session"].name)
+        first, head, last = names
+        trio = [core.load_shot(out, n, cfg) for n in names]
+        kept = [i for i, r in enumerate(trio[1]["rows"]) if r["keep"]]
+        assert kept and core.repeats(trio) == [[], kept, []], core.repeats(trio)
+        whole = core.load_shot(out, head, cfg)
+        single, painted = core.render_shot(whole)
+        seams = [dict(core.SEAM, dark=0.0), dict(core.SEAM, dark=0.0), dict(core.SEAM, dark=0.0)]
+        whole["edit"]["scene"] = {"shots": [first, "SS_2026-01-01_09-09-09", head, last], "seams": seams}
+        layout = {}
+        img, n = core.render_shot(whole, layout=layout)
+        assert img.shape == (3 * 1440 - 2 * 288, 1440, 3) and n == painted, (img.shape, n, painted)
+        assert {k: layout[k] for k in ("tops", "heights", "laps")} == {
+            "tops": [0, 1152, 2304], "heights": [1440] * 3, "laps": [288, 288]}, layout
+        assert layout["spans"] == [(0, 1296), (1296, 2448), (2448, 3744)] and len(layout["chats"]) == 3
+        mine = [c for c in layout["chats"] if c[0] == 1][0]
+        assert 1296 <= mine[3] < 1500, mine
+        moved, there = dict(whole, edit=dict(whole["edit"], home=last)), {}
+        core.render_shot(moved, layout=there)
+        box = [c for c in there["chats"] if c[0] == 1][0]
+        theirs = [c for c in there["chats"] if c[0] == 2][0]
+        assert theirs[3] >= box[3] + box[5] - 2 * there["pads"][1] and box[3] + there["pads"][1] > 2448, (box, theirs)
+        seam, where = dict(whole, edit=dict(whole["edit"], pos=[0.1, 1.02])), {}
+        core.render_shot(seam, layout=where)
+        box = [c for c in where["chats"] if c[0] == 1][0]
+        assert 2448 < box[3] + where["pads"][1] < 2448 + 60, box
+        assert core.inset([288, 288], 0) == (0, 144) and core.inset([288, 288], 1) == (144, 144)
+        assert core.inset([288, 288], 2) == (144, 0)
+        bare = dict(whole, rows=[], members={n: dict(core.frame_shot(out, n, cfg), rows=[]) for n in (first, last)})
+        plain = core.render_shot(bare)[0]
+        assert np.array_equal(plain[1440:2304], core.render(whole["bg"], [], whole["edit"])[0][288:1152])
+        changed = (img != plain).any(axis=2)
+        assert changed[:200].any() and not changed[1152:1152 + 144].any() and changed[1152 + 144:1152 + 400].any()
+        mid = img[1152 + 144].astype(float).mean(), img[2304 + 144].astype(float).mean()
+        seams[2]["dark"] = 0.5
+        img = core.render_shot(whole)[0]
+        assert img[1152 + 144].astype(float).mean() == mid[0] and img[2304 + 144].astype(float).mean() < mid[1] * 0.7
+        whole["edit"]["scene"]["shots"] = [head, last, first]
+        img = core.render_shot(whole)[0]
+        assert np.array_equal(img[:1152], single[:1152])
+        for s in seams:
+            s["fade"] = 0.0
+        assert core.render_shot(whole)[0].shape[0] == 3 * 1440
+        whole["edit"]["format"] = "800x800"
+        assert core.render_shot(whole)[0].shape == (3 * 800, 800, 3)
+        assert core.load_shot(out, last, cfg)["edit"]["format"] == "square"
+        whole["edit"]["format"] = "square"
+        core.save_shot(whole)
+        assert Image.open(core.shot_image(out, head)).size == (1440, 3 * 1440)
+        assert core.scenes_with(out, last) == [head] and core.scenes_with(out, head) == []
+        before = core.read_image(core.shot_image(out, head))
+        other = core.load_shot(out, last, cfg)
+        other["edit"]["zoom"] = 2.0
+        core.save_shot(other)
+        after = core.read_image(core.shot_image(out, head))
+        assert np.array_equal(after[:1440], before[:1440]) and np.array_equal(after[2880:], before[2880:])
+        assert not np.array_equal(after[1440:2880], before[1440:2880])
+        whole["edit"]["scene"]["shots"] = [head, "SS_2026-01-01_09-09-09"]
+        assert core.scene_of(whole) is None and core.render_shot(whole)[0].shape == single.shape
+
+ME, TALK, SYS, GREY = "#c2a2da", "#e6e6e6", "#ffffff", "#a0a0a0"
+
+
+def check_log():
+    assert core.hex_color("rgb(194, 162, 218)") == ME and core.hex_color("#FFFF90") == "#FFFF90"
+    assert core.hex_color("transparent") == TALK
+    assert core.log_entry("[19:10:00] * Malachy Doyle курит.", True) == ("19:10:00", [["* Malachy Doyle курит.", ME]])
+    assert core.log_entry("[19:10:00]  ", True) is None and core.log_entry("{broken", False) is None
+    line = {"text": "Malachy Doyle говорит: Ну и срань, - *щёлкает каналы*",
+            "parts": [[" Malachy Doyle говорит: Ну и срань, - ", "rgb(230, 230, 230)"], ["*щёлкает каналы* ", "rgb(194, 162, 218)"]]}
+    assert chatlog.parts(line) == [["Malachy Doyle говорит: Ну и срань, - ", TALK], ["*щёлкает каналы*", ME]]
+    assert chatlog.parts({"text": "* кто-то", "parts": [["другое", "rgb(1, 2, 3)"]]}) == [["* кто-то", ME]]
+    assert chatlog.fresh(["a", "b", "c", "d"], deque(["x", "a", "b"])) == ["c", "d"]
+    assert chatlog.fresh(["b", "c", "d"], deque(["a", "b", "c"])) == ["d"] and chatlog.fresh(["a"], deque(["a"])) == []
+    assert chatlog.fresh(["a", "b"], deque()) == ["a", "b"] and chatlog.fresh(["c"], deque(["a", "b"])) == ["c"]
+
+    talk = [["Malachy Doyle говорит: Ну и срань, - ", TALK], ["*продолжает щелкать каналы один за другим, пепелит "
+                                                              "прямо на диван.*", ME]]
+    me = [["* Malachy Doyle сидит напротив телевизора у себя в пабе, без энтузиазма переключает каналы.", ME]]
+    script = [("19:00:00", [["* Malachy Doyle выходит из дома.", ME]]),
+              ("19:08:00", [["> Ваш транспорт Vigero '68 заспавнен.", "#4caf50"]]),
+              ("19:09:00", [["* Malachy Doyle паркуется у паба.", ME]]),
+              ("19:12:00", [["(( [5] Malachy Doyle: sps ))", GREY]]),
+              ("19:17:00", me), ("19:18:00", [[">", "#ffd040"], [" Телепортация на вход бизнеса.", SYS]]),
+              ("19:20:10", talk), ("19:21:00", [["* Malachy Doyle встаёт.", ME]]),
+              ("20:30:00", [["* Malachy Doyle уходит.", ME]])]
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp)
+        cfg = make_cfg(tmp, file="png")
+        folder = out / "chatlog"
+        folder.mkdir()
+        (folder / "2026-11-08.jsonl").write_text(
+            "".join(json.dumps({"time": t, "parts": p}, ensure_ascii=False) + "\n" for t, p in script) + "oops\n",
+            encoding="utf-8")
+        (folder / "2026-11-07.txt").write_text("[23:59:30] * Malachy Doyle зевает.\n", encoding="utf-8")
+        when = datetime(2026, 11, 8, 19, 20, 24)
+        lines = core.read_log(out, when)
+        assert [l[0].strftime("%H:%M") for l in lines] == ["19:00", "19:08", "19:09", "19:12", "19:17", "19:18",
+                                                           "19:20", "19:21"]
+        assert len(core.read_log(out, datetime(2026, 11, 8, 0, 5))) == 1
+        assert core.log_chunks(lines) == [0, 1, 4] and core.log_chunks([]) == []
+
+        rows = chat.classify(chat.extract_rows(core.log_frame(lines[1:7], (2560, 1440))))
+        assert [r["kind"] for r in rows] == [S, AC, O, AC, AC, S, AC, AC], [r["kind"] for r in rows]
+        assert rows[4]["cont"]
+
+        name = "SS_2026-11-08_19-20-24"
+        bg = load("bg.webp")
+        core.save_src(bg, cfg, f"{name}_bg", core.SRC_BG)
+        shot = {"name": name, "out": out, "bg": bg, "rows": [], "edit": core.new_edit(cfg, []), "cfg": cfg}
+        picked = lines[3:7]
+        assert core.use_log(shot, cfg, picked) == 6 and all(r["keep"] for r in shot["rows"])
+        assert core.shot_files(out, name)[1] == [core.log_path(out, name)]
+        assert core.picked_log(shot["edit"]) == picked
+        assert {core.log_key(*l) for l in core.picked_log(shot["edit"])} == {core.log_key(*l) for l in picked}
+        assert core.picked_log({"log": [{"at": "вчера", "parts": []}]}) == [] and core.picked_log({}) == []
+        assert core.save_shot(shot)[1] == 6
+        again = core.load_shot(out, name, cfg)
+        assert all(again["edit"]["keep"]) and len(again["rows"]) == 6 and core.picked_log(again["edit"]) == picked
+        try:
+            core.carry_chat(again, name, cfg)
+            raise AssertionError("carry into a chatlog shot")
+        except ValueError:
+            pass
+        (out / "src" / f"{name}_chat1.webp").write_bytes((SAMPLES / "chat1.webp").read_bytes())
+        assert core.use_screen(again, cfg) > 0 and not core.log_path(out, name).exists()
+        assert again["edit"]["breaks"] == [] and core.picked_log(again["edit"]) == picked
+        core.save_shot(again)
+        assert core.load_shot(out, name, cfg)["edit"]["keep"] == again["edit"]["keep"] != shot["edit"]["keep"]
+
+        empty = dict(shot, name="SS_2026-11-08_23-50-00", rows=[], edit=core.new_edit(cfg, []))
+        core.save_src(bg, cfg, f"{empty['name']}_bg", core.SRC_BG)
+        assert core.use_log(empty, cfg, []) == 0 and empty["rows"] == []
+        assert core.save_shot(empty)[1] == 0 and core.load_shot(out, empty["name"], cfg)["rows"] == []
+        assert core.log_path(out, empty["name"]).exists()
+
+    t = datetime(2026, 11, 8, 19, 0)
+    tagged = [[["[Информация] ", "#ffff90"], ["Лавка пожертвования ветеранам боевых действий.", SYS]],
+              [["[REPORT]: ", "#fcc419"], ["Ваша жалоба доставлена администрации сервера. Пожалуйста, ожидайте ответа "
+                                           "от администрации.", SYS]],
+              [["[!] ", "#9e5cb6"], ["Zeke Garthie говорит (к Malachy Doyle): А то ты не знаешь, как это бывает? "
+                                     "Забухаешь где-то, потом только через дня два домой.", TALK]],
+              [["Joshua Norman говорит: Давай его.. Светлое.", TALK]]]
+    rows = chat.classify(chat.extract_rows(core.log_frame([(t, p) for p in tagged], (2560, 1440))))
+    assert [r["kind"] for r in rows] == [S, S, S, SP, SP, SP], [r["kind"] for r in rows]
+    assert [r["mark"] for r in rows][:4] == ["[", "[", None, "["] and rows[2]["cont"]
+
+    tap, grab = core.tap, core.grab
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(tmp, source="log")
+            log = chatlog.Log(Path(tmp) / "chatlog")
+            log.write([{"text": me[0][0], "parts": [[me[0][0], "rgb(194, 162, 218)"]]}])
+            assert (Path(tmp) / "chatlog" / f"{datetime.now():%Y-%m-%d}.txt").exists()
+            log.status("Чат найден")
+            assert chatlog.Log(Path(tmp) / "chatlog").tail(5) == [me[0][0]]
+            assert "Чат найден" in (Path(tmp) / "chatlog" / "status.log").read_text(encoding="utf-8")
+            game = FakeGame()
+            core.tap, core.grab = game.tap, game.grab
+            state = {"session": core.Session()}
+            assert core.on_hotkey(state, cfg) is core.TONE_SS
+            assert game.taps == ["F7", "F7"], game.taps
+            shot = core.load_shot(Path(tmp), state["session"].name, cfg)
+            assert shot["rows"] == [] and core.log_path(Path(tmp), shot["name"]).exists()
+            game.taps = []
+            state = {"session": core.Session()}
+            time.sleep(1.1)
+            assert core.on_hotkey(state, dict(cfg, auto=False)) is core.TONE_SS and game.taps == []
+            assert core.load_shot(Path(tmp), state["session"].name, cfg)["rows"] == []
+    finally:
+        core.tap, core.grab = tap, grab
+
+
 if __name__ == "__main__":
     check_rows()
     check_format()
@@ -553,4 +756,6 @@ if __name__ == "__main__":
     check_order()
     check_join()
     check_quality()
+    check_scene()
+    check_log()
     print("ok")

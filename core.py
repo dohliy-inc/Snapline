@@ -10,16 +10,16 @@ import time
 import traceback
 import winsound
 from ctypes import wintypes
-from datetime import datetime
+from datetime import datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
-from PIL import Image, ImageFilter, ImageGrab
+from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageGrab
 
 import chat
 
-VERSION = "1.3"
+VERSION = "1.4"
 RELEASES = "https://github.com/dohliy-inc/Snapline/releases/latest"
 APP_DIR = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent
 RES_DIR = Path(getattr(sys, "_MEIPASS", APP_DIR))
@@ -46,6 +46,7 @@ DEFAULTS = {
     "sound": "yes",
     "hide_names": "no",
     "chatlog": "no",
+    "source": "screen",
     "tray": "yes",
     "tray_hint": "yes",
 }
@@ -59,12 +60,27 @@ SRC_BG = (".jpg", {"quality": 95, "subsampling": 0})
 SRC_CHAT = (".webp", {"lossless": True, "quality": 0, "method": 1})
 CHAT_POSITIONS = ("top-left", "top-right", "bottom-left", "bottom-right")
 LAYOUT_KEYS = ("format", "zoom", "center", "pos", "places", "size", "file", "quality", "text_scale", "outline",
-               "margin", "overlays", "join")
+               "margin", "overlays", "join", "scene")
 JOIN_SIDES = {"left": Image.Transpose.FLIP_LEFT_RIGHT, "right": None, "top": Image.Transpose.TRANSVERSE,
               "bottom": Image.Transpose.TRANSPOSE}
 MAX_OVERLAYS = 4
+SCENE_MAX = 8
+SEAM = {"fade": 0.2, "blur": 0.6, "dark": 0.3}
 MARKS = (("hide", "hidden"), ("drop", "dropped"))
-MAX_PARTS = 3
+LOG_FONT = "arialbd.ttf"
+LOG_SIZE = 18 / 1440
+LOG_PITCH = 21.5 / 1440
+LOG_LEFT = 27 / 1440
+LOG_WIDTH = 0.25
+LOG_SPAN_S = 60 * 60
+LOG_GAP_S = 3 * 60
+LOG_STAMP = "%Y-%m-%d %H:%M:%S"
+LOG_GUESS = (("*", "#c2a2da"), ("((", "#a0a0a0"))
+LOG_TEXT = "#e6e6e6"
+LOG_SAY = re.compile(r"(?:\[!\] )?(?P<who>[^\s:(*>\[][^:()]{1,40}?) (?:говорит|кричит|шепчет)[^:(]*"
+                     r"(?:\((?:к (?P<to>[^)]+)|[^)]*)\))?:")
+LOG_NEAR_S = 10 * 60
+SOURCES = ("screen", "log")
 SPARE_PLACES = {"top-left": ("bottom-left", "top-right"), "top-right": ("bottom-right", "top-left"),
                 "bottom-left": ("top-left", "bottom-right"), "bottom-right": ("top-right", "bottom-left")}
 KEYS = {f"F{i}": 0x6F + i for i in range(1, 25)}
@@ -81,6 +97,8 @@ TONE_FAIL = ((300, 450),)
 
 EVENTS = queue.Queue()
 FILES = threading.Lock()
+FRAMES = threading.Lock()
+_frames = {}
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -223,6 +241,9 @@ def parse_config(raw):
     pos = raw["chat_pos"].strip().lower()
     if pos not in CHAT_POSITIONS:
         raise ValueError(f"chat_pos = {pos}: можно {', '.join(CHAT_POSITIONS)}")
+    source = raw["source"].strip().lower()
+    if source not in SOURCES:
+        raise ValueError(f"source = {source}: можно {', '.join(SOURCES)}")
     kinds = {k.lower(): k for k in chat.KINDS}
     keep = [k.strip().lower() for k in raw["keep"].split(",") if k.strip()]
     bad = [k for k in keep if k not in kinds]
@@ -249,6 +270,7 @@ def parse_config(raw):
         "sound": _bool(raw, "sound"),
         "hide_names": _bool(raw, "hide_names"),
         "chatlog": _bool(raw, "chatlog"),
+        "source": source,
         "tray": _bool(raw, "tray"),
         "tray_hint": _bool(raw, "tray_hint"),
     }
@@ -275,6 +297,7 @@ def new_edit(cfg, rows):
         "dropped": spans_of(rows, "drop"),
         "overlays": [],
         "join": None,
+        "scene": None,
         "size": cfg["size"],
         "file": cfg["file"],
         "quality": cfg["quality"],
@@ -312,21 +335,25 @@ def auto_hide(rows, only_new=False):
 
 
 def cuts(rows, edit):
-    return sorted({int(i) for i in edit.get("breaks", []) if 0 < int(i) < len(rows)})[:MAX_PARTS - 1]
+    return sorted({int(i) for i in edit.get("breaks", []) if 0 < int(i) < len(rows)})
 
 
 def corner_of(pos):
     if isinstance(pos, str):
         return pos if pos in SPARE_PLACES else "top-left"
     x, y = pos
-    return ("top" if y < 0.5 else "bottom") + "-" + ("left" if x < 0.5 else "right")
+    v = y if y in ("top", "bottom") else "top" if y < 0.5 else "bottom"
+    h = x if x in ("left", "right") else "left" if x < 0.5 else "right"
+    return f"{v}-{h}"
 
 
 def places(edit, count):
     first, extra = edit["pos"], list(edit.get("places", []))
-    spare = SPARE_PLACES[corner_of(first)]
+    corner = corner_of(first)
+    spare = SPARE_PLACES[corner]
+    order = list(spare) + [c for c in CHAT_POSITIONS if c != corner and c not in spare] + [corner]
     while len(extra) < count - 1:
-        extra.append(spare[len(extra) % len(spare)])
+        extra.append(order[len(extra) % len(order)])
     return [first] + extra[:count - 1]
 
 
@@ -336,19 +363,24 @@ def parts(rows, edit):
     return [(rows[a:b], pos) for (a, b), pos in zip(spans, places(edit, len(spans)))]
 
 
-def plan(bg, edit):
+def plan(bg, edit, width=None):
     H, W = bg.shape[:2]
     rect = chat.frame_rect(W, H, ratio_of(edit["format"]), edit["zoom"], edit["center"])
     cw, ch = rect[2] - rect[0], rect[3] - rect[1]
-    short = min(cw, ch)
-    exact = exact_of(edit["format"])
-    side = min(exact) if exact else side_of(edit["size"]) or short
-    f = side / short
-    k = side / REFERENCE_SIDE
-    base = exact or (max(1, round(cw * f)), max(1, round(ch * f)))
     join = edit.get("join")
     edge = join["side"] if join and join.get("side") in JOIN_SIDES else None
     wide = edge in ("left", "right")
+    if width:
+        bw = max(1, round(width / (1 + join["size"]) if wide else width))
+        base = (bw, max(1, round(bw * ch / cw)))
+    else:
+        short = min(cw, ch)
+        exact = exact_of(edit["format"])
+        side = min(exact) if exact else side_of(edit["size"]) or short
+        f = side / short
+        base = exact or (max(1, round(cw * f)), max(1, round(ch * f)))
+    side = min(base)
+    k = side / REFERENCE_SIDE
     ext, fade = join_sizes(join, base[0] if wide else base[1]) if edge else (0, 0)
     size = (base[0] + ext, base[1]) if wide else (base[0], base[1] + ext)
     box = {"left": (0, 0, ext, base[1]), "right": (base[0], 0, base[0] + ext, base[1]),
@@ -437,8 +469,7 @@ def join_canvas(frame, join):
     canvas[:, :bw] = np.asarray(base)
     canvas[:, bw:] = cover[:, fade:]
     if fade:
-        t = (np.arange(fade, dtype=np.float32) + 0.5) / fade
-        a = (t * t * (3 - 2 * t))[None, :, None]
+        a = ramp(fade)[None, :, None]
         under = canvas[:, bw - fade:bw].astype(np.float32)
         canvas[:, bw - fade:bw] = np.clip((under + (cover[:, :fade] - under) * a).round(), 0, 255).astype(np.uint8)
     out = Image.fromarray(canvas)
@@ -535,10 +566,8 @@ def paste_overlays(frame, overlays, src):
     return np.asarray(img.convert("RGB"))
 
 
-def render(bg, rows, edit, src=None, rough=None):
-    if rows and bg.shape[1] != rows[0]["screen_w"]:
-        raise ValueError(f"фон шириной {bg.shape[1]} px, а чат снят на экране {rows[0]['screen_w']} px")
-    p = plan(bg, edit)
+def backdrop(bg, edit, src=None, width=None):
+    p = plan(bg, edit, width)
     x0, y0, x1, y1 = p["rect"]
     frame = bg[y0:y1, x0:x1]
     if (frame.shape[1], frame.shape[0]) != p["base"]:
@@ -548,14 +577,136 @@ def render(bg, rows, edit, src=None, rough=None):
         frame = np.asarray(join_canvas(Image.fromarray(frame), edit["join"]))
     if src is not None and edit.get("overlays"):
         frame = paste_overlays(frame, edit["overlays"], src)
+    if width and frame.shape[1] != width:
+        tall = max(1, round(frame.shape[0] * width / frame.shape[1]))
+        frame = np.asarray(Image.fromarray(frame).resize((width, tall), Image.LANCZOS))
+    return frame, p
+
+
+def chat_spots(size, layers, spots, pad, margin, boxes=None, span=None):
+    W, H = size
+    boxes, out = [] if boxes is None else boxes, []
+    for layer, pos in zip(layers, spots):
+        if layer is None:
+            out.append(None)
+            continue
+        lh, lw = layer.shape[:2]
+        left, top = chat.place(W, H, lw, lh, pad, pos, margin)
+        if span and not isinstance(pos, str):
+            top = min(max(round(pos[1] * H) - pad, span[0] - pad), max(span[1] - lh + pad, span[0] - pad))
+            boxes.append((left + pad, top + pad, left + lw - pad, top + lh - pad))
+            out.append((left, top))
+            continue
+        for _ in boxes if isinstance(pos, str) else ():
+            hit = [b for b in boxes if b[0] < left + lw - pad and left + pad < b[2] and b[1] < top + lh - pad
+                   and top + pad < b[3]]
+            if not hit:
+                break
+            top = (max(b[3] for b in hit) + margin - pad if pos.startswith("top")
+                   else min(b[1] for b in hit) - margin - lh + pad)
+        top = min(max(top, -pad), max(H - lh + pad, -pad))
+        boxes.append((left + pad, top + pad, left + lw - pad, top + lh - pad))
+        out.append((left, top))
+    return out
+
+
+def paint_chat(img, rows, edit, p, window=None, boxes=None, found=None):
+    y0, y1 = window or (0, img.shape[0])
+    groups = parts(rows, edit)
+    made = [chat.chat_layer(part, p["outline"], p["scale"], y1 - y0 - 2 * p["margin"]) for part, _ in groups]
+    spots = chat_spots((img.shape[1], y1 - y0), [m[0] for m in made], [pos for _, pos in groups], p["outline"] + 2,
+                       p["margin"], boxes, (-y0, img.shape[0] - y0) if window else None)
+    painted = 0
+    for k, ((layer, n, _), spot) in enumerate(zip(made, spots)):
+        if layer is not None:
+            img, painted = chat.blend(img, layer, spot[0], spot[1] + y0), painted + n
+            if found is not None:
+                found.append((k, spot[0], spot[1] + y0, layer.shape[1], layer.shape[0]))
+    return img, painted
+
+
+def ramp(n):
+    t = (np.arange(n, dtype=np.float32) + 0.5) / n
+    return t * t * (3 - 2 * t)
+
+
+def seam(upper, lower, lap, look):
+    w = ramp(lap)[:, None, None]
+    a, b = upper[-lap:].astype(np.float32), lower[:lap].astype(np.float32)
+    r = look["blur"] * lap / 6
+    if r >= 0.5:
+        pad = round(3 * r)
+        soft = lambda part: np.asarray(Image.fromarray(part).filter(ImageFilter.GaussianBlur(r)), np.float32)
+        a += (soft(upper[-lap - pad:])[-lap:] - a) * w
+        b += (soft(lower[:lap + pad])[:lap] - b) * (1 - w)
+    mix = (a + (b - a) * w) * (1 - look["dark"] * np.sin(np.pi * w))
+    return np.clip(mix.round(), 0, 255).astype(np.uint8)
+
+
+def framed(edit, head):
+    return dict(edit, format=head["format"], size=head["size"], join=None)
+
+
+def laps_of(hs, seams):
+    return [round(min(max(s["fade"], 0.0), 0.5) * min(a, b)) for s, a, b in zip(seams, hs, hs[1:])]
+
+
+def inset(laps, k):
+    return (laps[k - 1] // 2 if k else 0), (laps[k] // 2 if k < len(laps) else 0)
+
+
+def stack(frames, seams):
+    hs = [f.shape[0] for f in frames]
+    laps = laps_of(hs, seams)
+    tops = [0]
+    for h, lap in zip(hs, laps):
+        tops.append(tops[-1] + h - lap)
+    out = np.empty((tops[-1] + hs[-1], frames[0].shape[1], 3), np.uint8)
+    for f, top in zip(frames, tops):
+        out[top:top + f.shape[0]] = f
+    for i, lap in enumerate(laps):
+        if lap:
+            out[tops[i + 1]:tops[i + 1] + lap] = seam(frames[i], frames[i + 1], lap, seams[i])
+    return out, {"tops": tops, "heights": hs, "laps": laps}
+
+
+def render(bg, rows, edit, src=None, rough=None, scene=None, layout=None):
+    if rows and bg.shape[1] != rows[0]["screen_w"]:
+        raise ValueError(f"фон шириной {bg.shape[1]} px, а чат снят на экране {rows[0]['screen_w']} px")
+    if not scene:
+        frame, p = backdrop(bg, edit, src)
+        if rough:
+            frame = jpeg_pass(frame, rough)
+        img, painted = paint_chat(frame, rows, edit, p)
+        return (frame.copy() if img is frame else img), painted
+    frame, p = backdrop(bg, framed(edit, edit), src)
+    frames = []
+    for other in scene[0]:
+        if other is None:
+            frames.append((frame, p, rows, edit))
+        else:
+            f, q = backdrop(other["bg"], framed(other["edit"], edit), other["out"] / "src", frame.shape[1])
+            frames.append((f, q, other["rows"], other["edit"]))
+    img, where = stack([f for f, _, _, _ in frames], scene[1])
+    if layout is not None:
+        layout.update(where)
     if rough:
-        frame = jpeg_pass(frame, rough)
-    img, painted = frame, 0
-    for part, pos in parts(rows, edit):
-        done, n, _ = chat.compose(img, part, p["outline"], pos, p["margin"], p["scale"])
-        if done is not None:
-            img, painted = done, painted + n
-    return (frame.copy() if img is frame else img), painted
+        img = np.array(jpeg_pass(img, rough))
+    painted, spans, taken, chats = 0, [], {}, []
+    for k, ((f, _, _, _), top) in enumerate(zip(frames, where["tops"])):
+        a, b = inset(where["laps"], k)
+        spans.append((top + a, top + f.shape[0] - b))
+    homes = scene[2] if len(scene) > 2 else list(range(len(frames)))
+    for k, (f, q, r, e) in enumerate(frames):
+        found = []
+        img, n = paint_chat(img, r, e, q, spans[homes[k]], taken.setdefault(homes[k], []), found)
+        chats += [(k,) + box for box in found]
+        painted = n if e is edit else painted
+    if layout is not None:
+        layout.update(chats=chats, spans=spans, names=scene[3] if len(scene) > 3 else None,
+                      pads=[q["outline"] + 2 for _, q, _, _ in frames],
+                      margins=[q["margin"] for _, q, _, _ in frames])
+    return img, painted
 
 
 def watermark(chat_img):
@@ -642,11 +793,21 @@ def chat_number(path):
     return int(re.search(r"_chat(\d+)$", path.stem)[1])
 
 
+def log_path(out, name):
+    return out / "src" / f"{name}_log.png"
+
+
+def screen_chats(out, name):
+    chats = [p for p in (out / "src").glob(f"{name}_chat*") if p.suffix in (SRC_CHAT[0], ".png")]
+    return sorted(chats, key=chat_number)
+
+
 def shot_files(out, name):
     src = out / "src"
     bgs = [src / f"{name}_bg{ext}" for ext in (SRC_BG[0], ".png")]
-    chats = [p for p in src.glob(f"{name}_chat*") if p.suffix in (SRC_CHAT[0], ".png")]
-    return next((p for p in bgs if p.exists()), bgs[0]), sorted(chats, key=chat_number), src / f"{name}.json"
+    log = log_path(out, name)
+    chats = [log] if log.exists() else screen_chats(out, name)
+    return next((p for p in bgs if p.exists()), bgs[0]), chats, src / f"{name}.json"
 
 
 def shot_image(out, name):
@@ -708,8 +869,252 @@ def load_shot(out, name, cfg):
     if not bg_path.exists() or not chat_paths:
         return None
     rows, edit, mark, legacy = load_rows(out, name, cfg)
+    if mark is None and chat_paths[0] == log_path(out, name):
+        mark = recent_mark(out)
     return {"name": name, "out": out, "bg": clean_bg(read_image(bg_path), mark), "rows": rows, "edit": edit,
-            "legacy": legacy}
+            "legacy": legacy, "cfg": cfg}
+
+
+def shot_time(name):
+    try:
+        return datetime.strptime(name[3:22], "%Y-%m-%d_%H-%M-%S")
+    except (ValueError, TypeError):
+        return None
+
+
+def hex_color(text):
+    nums = re.findall(r"\d+", text)
+    if text.startswith("#") or len(nums) < 3:
+        return text if re.fullmatch(r"#[0-9a-fA-F]{6}", text) else LOG_TEXT
+    return "#" + "".join(f"{min(int(v), 255):02x}" for v in nums[:3])
+
+
+def guess_parts(text):
+    color = next((c for mark, c in LOG_GUESS if text.startswith(mark)), LOG_TEXT)
+    return [[text, color]]
+
+
+def log_entry(line, plain):
+    if plain:
+        m = re.match(r"\[(\d\d:\d\d:\d\d)\] (.*)", line)
+        return (m[1], guess_parts(m[2])) if m and m[2].strip() else None
+    try:
+        item = json.loads(line)
+        parts = [[str(t), hex_color(str(c))] for t, c in item["parts"] if str(t)]
+        return (item["time"], parts) if parts else None
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
+def read_log(out, at, span=LOG_SPAN_S):
+    start, end, lines = at - timedelta(seconds=span), at + timedelta(seconds=span), []
+    for day in sorted({start.date(), end.date()}):
+        base = out / "chatlog" / f"{day:%Y-%m-%d}"
+        path = next((p for p in (base.with_suffix(".jsonl"), base.with_suffix(".txt")) if p.exists()), None)
+        if path is None:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            entry = log_entry(line, path.suffix == ".txt")
+            if entry is None:
+                continue
+            when = datetime.combine(day, datetime.strptime(entry[0], "%H:%M:%S").time())
+            if start <= when <= end:
+                lines.append((when, entry[1]))
+    return lines
+
+
+def log_who(parts):
+    text = "".join(t for t, _ in parts).strip()
+    m = LOG_SAY.match(text)
+    if m:
+        return chat.SPEECH, m["who"].strip(), (m["to"] or "").strip() or None
+    m = re.match(r"Вы сказали (.{1,40}?) шепотом:", text)
+    if m:
+        return chat.SPEECH, m[1], m[1]
+    if text.startswith("(("):
+        return chat.OOC, None, None
+    pink =any(c.lower() == LOG_GUESS[0][1] for _, c in parts)
+    words = text.lstrip("*> ").split()
+    if text.startswith("* "):
+        return chat.ACTION, " ".join(words[:2]) or None, None
+    if text.startswith(">"):
+        return (chat.AME, " ".join(words[:2]) or None, None) if pink else (chat.SYSTEM, None, None)
+    m = re.search(r"\*([^*()]{3,40})\)?\s*$", text)
+    if pink and m:
+        return chat.ACTION, m[1].strip(), None
+    return chat.SYSTEM, None, None
+
+
+def log_chunks(lines, gap=LOG_GAP_S):
+    return [k for k in range(len(lines)) if not k or (lines[k][0] - lines[k - 1][0]).total_seconds() > gap]
+
+
+def log_key(when, parts):
+    return f"{when:{LOG_STAMP}}", "".join(text for text, _ in parts)
+
+
+def picked_log(edit):
+    try:
+        return [(datetime.strptime(e["at"], LOG_STAMP), [[str(t), hex_color(str(c))] for t, c in e["parts"]])
+                for e in edit.get("log") or []]
+    except (ValueError, KeyError, TypeError):
+        return []
+
+
+def log_rows(lines, measure, limit):
+    rows = []
+    for when, parts in lines:
+        row, x = [], 0.0
+        words = [(w, c) for text, c in parts for w in re.findall(r"\S+\s*|\s+", text)]
+        while words and not words[0][0].strip():
+            words.pop(0)
+        for word, color in words:
+            if x and x + measure(word.rstrip()) > limit:
+                rows.append((when, row))
+                row, x = [], 0.0
+                word = word.lstrip()
+                if not word:
+                    continue
+            if row and row[-1][2] == color:
+                row[-1][1] += word
+            else:
+                row.append([x, word, color])
+            x += measure(word)
+        if row:
+            rows.append((when, row))
+    return rows
+
+
+def log_frame(lines, size):
+    W, H = size
+    font = ImageFont.truetype(LOG_FONT, max(8, round(LOG_SIZE * H)))
+    pitch, left = LOG_PITCH * H, round(LOG_LEFT * H)
+    rows = log_rows(lines, font.getlength, LOG_WIDTH * W)
+    top, ascent = round(pitch), font.getmetrics()[0]
+    img = Image.new("RGB", (W, max(H, round(2 * top + pitch * len(rows)))))
+    d = ImageDraw.Draw(img)
+    for k, (_, row) in enumerate(rows):
+        base = top + round(k * pitch) + ascent
+        for x, text, color in row:
+            d.text((left + x, base), text.rstrip(), font=font, fill=color, anchor="ls")
+    return np.asarray(img)
+
+
+_marks = {}
+
+
+def recent_mark(out):
+    chats = sorted((out / "src").glob("SS_*_chat*"), key=stamp)[-6:]
+    for p in reversed(chats):
+        if p not in _marks:
+            try:
+                _marks[p] = watermark(read_image(p))
+            except OSError:
+                _marks[p] = None
+        if _marks[p]:
+            return _marks[p]
+    return None
+
+
+def adopt(shot, rows, cfg):
+    if cfg["hide_names"]:
+        auto_hide(rows)
+    shot["rows"] = rows
+    shot["edit"].update(keep=[bool(r["keep"]) for r in rows], breaks=[], hidden=spans_of(rows, "hide"),
+                        dropped=spans_of(rows, "drop"))
+
+
+def use_log(shot, cfg, lines):
+    frame = log_frame(lines, shot["bg"].shape[1::-1])
+    path = log_path(shot["out"], shot["name"])
+    with FILES:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        save(frame, path)
+    rows = chat.classify(chat.extract_rows(frame), cfg["keep"])
+    for r in rows:
+        r["keep"] = True
+    adopt(shot, rows, cfg)
+    shot["edit"]["log"] = [{"at": log_key(when, parts)[0], "parts": parts} for when, parts in lines]
+    return len(rows)
+
+
+def use_screen(shot, cfg):
+    out, name = shot["out"], shot["name"]
+    with FILES:
+        log_path(out, name).unlink(missing_ok=True)
+    rows = []
+    for p in screen_chats(out, name):
+        rows = chat.merge(rows, chat.classify(chat.extract_rows(read_image(p)), cfg["keep"]))
+    adopt(shot, rows, cfg)
+    return len(rows)
+
+
+def stamp(path):
+    try:
+        return path.stat().st_mtime_ns
+    except OSError:
+        return 0
+
+
+def frame_shot(out, name, cfg):
+    bg, chats, meta = shot_files(out, name)
+    key = (str(out), name, stamp(meta), stamp(bg), len(chats))
+    with FRAMES:
+        if key not in _frames:
+            if len(_frames) >= SCENE_MAX:
+                _frames.pop(next(iter(_frames)))
+            try:
+                _frames[key] = load_shot(out, name, cfg)
+            except (OSError, ValueError):
+                _frames[key] = None
+        return _frames[key]
+
+
+def scene_of(shot):
+    scene, name, cfg = shot["edit"].get("scene"), shot.get("name"), shot.get("cfg")
+    if not scene or name not in scene.get("shots", ()) or cfg is None:
+        return None
+    frames, seams, given, ready, names = [], [], scene.get("seams") or [], shot.get("members") or {}, []
+    for k, n in enumerate(scene["shots"]):
+        other = None if n == name else ready.get(n) or frame_shot(shot["out"], n, cfg)
+        if n != name and other is None:
+            continue
+        if frames:
+            seams.append(dict(SEAM, **given[k - 1]) if k - 1 < len(given) else dict(SEAM))
+        frames.append(other)
+        names.append(n)
+    homes = [names.index(h) if h in names else k
+             for k, h in enumerate((f or shot)["edit"].get("home") for f in frames)]
+    return (frames, seams, homes, names) if len(frames) > 1 else None
+
+
+def repeats(shots):
+    seen, out = [], []
+    for shot in shots:
+        rows = shot["rows"] if shot else []
+        out.append([i for i, r in enumerate(rows) if r["keep"] and any(chat.same_row(r, s) for s in seen)])
+        seen += [r for i, r in enumerate(rows) if r["keep"] and i not in out[-1]]
+    return out
+
+
+def scenes_with(out, name):
+    heads = []
+    for meta in (out / "src").glob("SS_*.json"):
+        try:
+            text = meta.read_text(encoding="utf-8")
+            if meta.stem != name and name in text and name in (json.loads(text).get("scene") or {})["shots"]:
+                heads.append(meta.stem)
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+    return heads
+
+
+def render_shot(shot, rough=None, layout=None):
+    return render(shot["bg"], shot["rows"], shot["edit"], shot["out"] / "src", rough, scene_of(shot), layout)
 
 
 def donors(out, name, names, limit=12):
@@ -721,6 +1126,8 @@ def donors(out, name, names, limit=12):
 
 def carry_chat(shot, donor, cfg):
     out, name, rows, edit = shot["out"], shot["name"], shot["rows"], shot["edit"]
+    if log_path(out, name).exists():
+        raise ValueError("чат этой СС взят из чатлога, добавь строки оттуда")
     _, files, _ = shot_files(out, donor)
     if not files:
         raise ValueError("у этой СС нет исходных кадров чата")
@@ -751,14 +1158,14 @@ def carry_chat(shot, donor, cfg):
     return len(merged) - len(rows)
 
 
-def encoded(shot):
+def encoded(shot, layout=None):
     edit = shot["edit"]
     file, params, rough = edit["file"], dict(FILE_TYPES[edit["file"]]), None
     if file == "jpg":
         quality = int(edit.get("quality", TEXT_QUALITY))
         params["quality"] = max(quality, TEXT_QUALITY)
         rough = quality if quality < TEXT_QUALITY else None
-    img, painted = render(shot["bg"], shot["rows"], edit, shot["out"] / "src", rough)
+    img, painted = render_shot(shot, rough, layout)
     buf = io.BytesIO()
     Image.fromarray(img).save(buf, "JPEG" if file == "jpg" else "PNG", **params)
     return img, painted, buf.getvalue()
@@ -768,17 +1175,37 @@ def decoded(data):
     return np.asarray(Image.open(io.BytesIO(data)).convert("RGB"))
 
 
-def save_shot(shot):
+def write_image(out, name, file, data):
+    (out / f"{name}.{file}").write_bytes(data)
+    for other in FILE_TYPES.keys() - {file}:
+        (out / f"{name}.{other}").unlink(missing_ok=True)
+
+
+def save_shot(shot, heads=True):
     img, painted, data = encoded(shot)
     out, name, file = shot["out"], shot["name"], shot["edit"]["file"]
     _, _, meta = shot_files(out, name)
     with FILES:
         meta.parent.mkdir(parents=True, exist_ok=True)
-        (out / f"{name}.{file}").write_bytes(data)
-        for other in FILE_TYPES.keys() - {file}:
-            (out / f"{name}.{other}").unlink(missing_ok=True)
+        write_image(out, name, file, data)
         meta.write_text(json.dumps(shot["edit"], ensure_ascii=False), encoding="utf-8")
+    if heads:
+        refresh_heads(out, [name], shot.get("cfg"))
     return img, painted
+
+
+def refresh_heads(out, names, cfg, skip=()):
+    heads = sorted({h for n in names for h in scenes_with(out, n)} - set(skip)) if cfg else []
+    for head in heads:
+        try:
+            whole = load_shot(out, head, cfg)
+            if whole:
+                data = encoded(whole)[2]
+                with FILES:
+                    write_image(out, head, whole["edit"]["file"], data)
+        except (OSError, ValueError) as e:
+            log(f"Сцена {head} не обновилась: {e}", "fail")
+    return heads
 
 
 def copy_image(arr):
@@ -816,7 +1243,7 @@ def sample_shot(cfg):
     shot = read_image(RES_DIR / "samples" / "example_chat.png")
     rows = chat.classify(chat.extract_rows(shot), cfg["keep"])
     bg = clean_bg(read_image(RES_DIR / "samples" / "example_bg.webp"), watermark(shot))
-    return {"name": None, "out": out, "bg": bg, "rows": rows, "edit": new_edit(cfg, rows)}
+    return {"name": None, "out": out, "bg": bg, "rows": rows, "edit": new_edit(cfg, rows), "cfg": cfg}
 
 
 class Session:
@@ -964,7 +1391,8 @@ def handle(img, state, cfg):
     for key, field in MARKS:
         edit[field] = spans_of(s.rows, key)
     bg = clean_bg(s.bg, s.mark)
-    img, painted = save_shot({"name": s.name, "out": cfg["out"], "bg": bg, "rows": s.rows, "edit": edit})
+    img, painted = save_shot({"name": s.name, "out": cfg["out"], "bg": bg, "rows": s.rows, "edit": edit, "cfg": cfg},
+                             heads=bool(old))
     kept = sum(r["keep"] for r in s.rows)
     tail = "" if painted == kept else f" Влезло {painted} строк из {kept}."
     log(f"СС готова: {s.name}.{edit['file']}, {img.shape[1]}×{img.shape[0]}.{tail}", "ok")
@@ -1011,7 +1439,32 @@ def auto_shot(state, cfg):
     return handle(shot, state, cfg)
 
 
+def scene_shot(state, cfg):
+    if cfg["auto"]:
+        tap(cfg["hud_key"])
+        try:
+            time.sleep(cfg["hud_delay"])
+            bg = grab()
+        finally:
+            tap(cfg["hud_key"])
+    else:
+        bg = grab()
+    s = state["session"] = Session()
+    save_src(bg, cfg, f"{s.name}_bg", SRC_BG)
+    out = cfg["out"]
+    shot = {"name": s.name, "out": out, "bg": clean_bg(bg, recent_mark(out)), "rows": [], "edit": new_edit(cfg, []),
+            "cfg": cfg}
+    use_log(shot, cfg, [])
+    img, _ = save_shot(shot, heads=False)
+    EVENTS.put(("ss", s.name))
+    log(f"СС готова: {s.name}.{shot['edit']['file']}, {img.shape[1]}×{img.shape[0]}. Чат пока пустой: строки "
+        "выбери в «Строках» из чатлога.", "ok")
+    return TONE_SS
+
+
 def on_hotkey(state, cfg):
+    if cfg["source"] == "log":
+        return scene_shot(state, cfg)
     img = grab()
     if cfg["auto"] and not chat.is_chat_shot(img):
         return auto_shot(state, cfg)
