@@ -66,6 +66,13 @@ JOIN_SIDES = {"left": Image.Transpose.FLIP_LEFT_RIGHT, "right": None, "top": Ima
 MAX_OVERLAYS = 4
 SCENE_MAX = 8
 SEAM = {"fade": 0.2, "blur": 0.6, "dark": 0.3}
+LUMA = np.array([0.299, 0.587, 0.114], np.float32)
+GRAIN_TAPS = np.exp(-np.arange(-3, 4, dtype=np.float32) ** 2 / 2)
+GRAIN_TAPS /= GRAIN_TAPS.sum()
+GRAIN_GAIN = 0.873
+GRAIN_MIN = 0.3
+GRAIN_TILE, GRAIN_STEP = 64, 160
+GRAIN_SPREAD = 32
 MARKS = (("hide", "hidden"), ("drop", "dropped"))
 LOG_FONT = "arialbd.ttf"
 LOG_SIZE = 18 / 1440
@@ -566,20 +573,44 @@ def paste_overlays(frame, overlays, src):
     return np.asarray(img.convert("RGB"))
 
 
+def grain(img):
+    h, w, s = img.shape[0], img.shape[1], GRAIN_TILE
+    y = np.stack([img[a:a + s, b:b + s] for a in range(0, max(1, h - s + 1), GRAIN_STEP)
+                  for b in range(0, max(1, w - s + 1), GRAIN_STEP)]).astype(np.float32) @ LUMA
+    pad = np.pad(y, ((0, 0), (3, 3), (3, 3)), mode="reflect")
+    row = sum(t * pad[:, :, i:i + y.shape[2]] for i, t in enumerate(GRAIN_TAPS))
+    soft = sum(t * row[:, i:i + y.shape[1]] for i, t in enumerate(GRAIN_TAPS))
+    d = np.abs(y - soft).ravel()
+    return float(np.partition(d, d.size // 2)[d.size // 2] * 1.4826)
+
+
+def regrain(small, big):
+    add = max(0.0, grain(big) ** 2 - grain(small) ** 2) ** 0.5 / GRAIN_GAIN
+    if add < GRAIN_MIN:
+        return small
+    noise = np.asarray(Image.effect_noise(small.shape[1::-1], GRAIN_SPREAD), np.float32)
+    noise = (noise - noise.mean()) * (add / GRAIN_SPREAD)
+    return np.clip((small + noise[..., None]).round(), 0, 255).astype(np.uint8)
+
+
+def shrink(img, size):
+    out = np.asarray(Image.fromarray(img).resize(size, Image.LANCZOS))
+    return regrain(out, img) if size[0] < img.shape[1] else out
+
+
 def backdrop(bg, edit, src=None, width=None):
     p = plan(bg, edit, width)
     x0, y0, x1, y1 = p["rect"]
     frame = bg[y0:y1, x0:x1]
     if (frame.shape[1], frame.shape[0]) != p["base"]:
-        method = Image.LANCZOS if p["base"][0] < frame.shape[1] else Image.BICUBIC
-        frame = np.asarray(Image.fromarray(frame).resize(p["base"], method))
+        frame = (shrink(frame, p["base"]) if p["base"][0] < frame.shape[1]
+                 else np.asarray(Image.fromarray(frame).resize(p["base"], Image.BICUBIC)))
     if p["size"] != p["base"]:
         frame = np.asarray(join_canvas(Image.fromarray(frame), edit["join"]))
     if src is not None and edit.get("overlays"):
         frame = paste_overlays(frame, edit["overlays"], src)
     if width and frame.shape[1] != width:
-        tall = max(1, round(frame.shape[0] * width / frame.shape[1]))
-        frame = np.asarray(Image.fromarray(frame).resize((width, tall), Image.LANCZOS))
+        frame = shrink(frame, (width, max(1, round(frame.shape[0] * width / frame.shape[1]))))
     return frame, p
 
 

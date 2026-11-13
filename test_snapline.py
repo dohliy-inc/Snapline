@@ -1,11 +1,24 @@
 import ctypes
 import json
 import os
+import re
+import sys
 import tempfile
 import time
 from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
+
+FROZEN_OUT = tuple(re.findall(r"--exclude-module (\S+)", (Path(__file__).resolve().parent / "build.bat").read_text()))
+
+
+class FrozenOut:
+    def find_spec(self, name, path=None, target=None):
+        if any(name == m or name.startswith(m + ".") for m in FROZEN_OUT):
+            raise ModuleNotFoundError(f"{name} is excluded from the exe by build.bat")
+
+
+sys.meta_path.insert(0, FrozenOut())
 
 import numpy as np
 from PIL import Image
@@ -539,6 +552,19 @@ def check_quality():
         assert max(text_err) < text_err[0] + 1.5 and bg_err[2] > bg_err[0] * 1.5, (text_err, bg_err)
 
 
+def check_grain():
+    clean = load("real_bg.webp")
+    size = (clean.shape[1] * 9 // 16, clean.shape[0] * 9 // 16)
+    assert np.array_equal(core.shrink(clean, size), scaled(clean, *size))
+    noise = (np.asarray(Image.effect_noise(clean.shape[1::-1], 40), np.float32)[..., None] - 127.5) / 16
+    noisy = np.clip((clean + noise).round(), 0, 255).astype(np.uint8)
+    plain, kept = scaled(noisy, *size), core.shrink(noisy, size)
+    native = core.grain(noisy)
+    assert core.grain(plain) < native * 0.8, (core.grain(plain), native)
+    assert abs(core.grain(kept) - native) < native * 0.2, (core.grain(kept), native)
+    assert np.abs(kept.mean((0, 1)) - plain.mean((0, 1))).max() < 0.5
+
+
 def check_watermark():
     bg, shot = load("real_bg.webp"), load("real_chat_ic.png")
     mark = core.watermark(shot)
@@ -756,6 +782,7 @@ if __name__ == "__main__":
     check_order()
     check_join()
     check_quality()
+    check_grain()
     check_scene()
     check_log()
     print("ok")
