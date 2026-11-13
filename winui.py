@@ -7,26 +7,12 @@ from theme import VOID, make_icon, px
 
 
 LRESULT = ctypes.c_ssize_t
-
-
 WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
-
-
 WM_NCCALCSIZE, WM_NCACTIVATE, WM_NCLBUTTONDOWN = 0x0083, 0x0086, 0x00A1
-
-
 WM_TRAY, WM_LBUTTONUP, WM_LBUTTONDBLCLK, WM_RBUTTONUP = 0x8001, 0x0202, 0x0203, 0x0205
-
-
 SHOW_MSG = ctypes.windll.user32.RegisterWindowMessageW("Snapline.Show")
-
-
 TASKBAR_CREATED = ctypes.windll.user32.RegisterWindowMessageW("TaskbarCreated")
-
-
 HT_CAPTION = 2
-
-
 GRIPS = (
     ("left", 10, "size_we"), ("right", 11, "size_we"), ("top", 12, "size_ns"), ("bottom", 15, "size_ns"),
     ("topleft", 13, "size_nw_se"), ("topright", 14, "size_ne_sw"), ("bottomleft", 16, "size_ne_sw"),
