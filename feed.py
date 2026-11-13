@@ -18,6 +18,7 @@ from theme import (
     VOID, WHITE, megabytes, px, rounded, when
 )
 from widgets import Choice, Loupe, Painter, Pill, Slider
+from tools.blur import BlurTool
 from tools.crop import CropTool
 from tools.file import FileTool
 from tools.images import ImagesTool
@@ -28,7 +29,7 @@ from tools.style import StyleTool
 from tools.text import TextTool
 
 
-class Feed(LinesTool, LogTool, CropTool, TextTool, ImagesTool, SceneTool, FileTool, StyleTool):
+class Feed(LinesTool, LogTool, CropTool, TextTool, ImagesTool, SceneTool, FileTool, StyleTool, BlurTool):
     def __init__(self, app, parent):
         self.app = app
         self.c = tk.Canvas(parent, bg=VOID, highlightthickness=0, bd=0)
@@ -55,6 +56,7 @@ class Feed(LinesTool, LogTool, CropTool, TextTool, ImagesTool, SceneTool, FileTo
         self.hint_text = None
         self.hint_photo = None
         self.active_ov = 0
+        self.active_blur = 0
         self.loading = set()
         self.offset = 0
         self.last_wheel = 0.0
@@ -331,6 +333,7 @@ class Feed(LinesTool, LogTool, CropTool, TextTool, ImagesTool, SceneTool, FileTo
             ("scene", "Сцена", lambda: self.toggle_tool("scene"), self.tool in ("scene", "scenepick")),
             ("file", "Файл", lambda: self.toggle_tool("file"), self.tool == "file"),
             ("style", "Стиль", lambda: self.toggle_tool("style"), self.tool == "style"),
+            ("blur", "Размытие", lambda: self.toggle_tool("blur"), self.tool == "blur"),
         ]
         tools.append(None)
         if self.shot is not None or view_only:
@@ -478,6 +481,8 @@ class Feed(LinesTool, LogTool, CropTool, TextTool, ImagesTool, SceneTool, FileTo
                 self.c.create_rectangle(l, t, r - 1, b - 1, outline=WHITE, width=1, dash=(4, 3), tags=("shot",))
         elif self.tool in ("file", "style"):
             self.draw_preview(geo["img"])
+        elif self.tool == "blur":
+            self.draw_blurs(geo)
         self.mark_overlay(geo)
 
     def draw_saved(self, area, name):
@@ -612,7 +617,7 @@ class Feed(LinesTool, LogTool, CropTool, TextTool, ImagesTool, SceneTool, FileTo
         self.sheet = sheet
         head = tk.Frame(sheet, bg=VOID)
         head.pack(fill="x", padx=(0, px(12)))
-        title = {"lines": "Строки чата", "crop": "Кадр", "text": "Текст", "images": "Картинки", "file": "Файл", "style": "Стиль",
+        title = {"lines": "Строки чата", "crop": "Кадр", "text": "Текст", "images": "Картинки", "file": "Файл", "style": "Стиль", "blur": "Размытие",
                  "carry": "Чат из другой СС", "logpick": "Чатлог", "photopick": "Фото из другой СС", "scene": "Сцена",
                  "scenepick": "СС для сцены"}[self.tool]
         tk.Label(head, text=title, bg=VOID, fg=WHITE, font=(FONT["display"], 20)).pack(side="left")
@@ -837,6 +842,9 @@ class Feed(LinesTool, LogTool, CropTool, TextTool, ImagesTool, SceneTool, FileTo
                 self.drag = {"kind": "rows", "keep": not shot["rows"][i]["keep"], "first": j, "last": j,
                              "shots": {}, "moved": False}
             return
+        if self.tool == "blur":
+            self.blur_press(e)
+            return
         hit = self.scene_chat_at(e) if self.previewing() else None
         if hit:
             self.drag = {"kind": "scenechat", "x": e.x, "y": e.y, "hit": hit}
@@ -922,6 +930,8 @@ class Feed(LinesTool, LogTool, CropTool, TextTool, ImagesTool, SceneTool, FileTo
                 self.pending_media = True
                 self.c.after(16, self.flush_media)
 
+        elif self.drag["kind"] in ("bnew", "bmove", "bsize"):
+            self.blur_motion(e)
         elif self.drag["kind"] in ("ov", "ovpan"):
             ov = self.target["edit"]["overlays"][self.drag["part"]]
             (out_w, out_h), d = geo["out"], geo["d"]
@@ -989,6 +999,9 @@ class Feed(LinesTool, LogTool, CropTool, TextTool, ImagesTool, SceneTool, FileTo
         shot = self.target
         if shot is None:
             return
+        if drag["kind"] in ("bnew", "bmove", "bsize"):
+            self.blur_release(drag)
+            return
         if drag["kind"] == "chat":
             at = (drag["at"][0] + e.x - drag["x"], drag["at"][1] + e.y - drag["y"])
             self.set_place(drag["part"], self.chat_spot(drag["part"], *at)[0])
@@ -1044,6 +1057,9 @@ class Feed(LinesTool, LogTool, CropTool, TextTool, ImagesTool, SceneTool, FileTo
                       "Клик — настроить только этот переход" if seam else
                       "Тяни — двигать · колесо — прокрутка · Ctrl + колесо — масштаб" if self.view_box else
                       "Точно как в файле · лупа показывает пиксели 1:1")
+            return
+        if self.tool == "blur":
+            self.blur_hover(e)
             return
         over = self.tool == "images"
         if "shot-chat" in tags:
@@ -1269,6 +1285,8 @@ class Feed(LinesTool, LogTool, CropTool, TextTool, ImagesTool, SceneTool, FileTo
             self.close_popup()
         elif e.keysym == "Escape" and self.tool:
             self.toggle_tool(self.tool)
+        elif e.keysym == "Delete" and self.tool == "blur" and self.drag is None:
+            self.remove_blur()
         elif e.keycode == 67 and e.state & 0x4 and self.index > 0:
             self.copy()
         elif e.keycode in (89, 90) and e.state & 0x4 and self.shot is not None and self.drag is None:

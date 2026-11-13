@@ -22,7 +22,7 @@ DIM = "#6b7180"
 WHITE = "#f4f4f5"
 SUB = "#a3a8b3"
 ERR = "#ff7a70"
-ICONS = {"style": "", "file": "", "scene": "", "images": "", "cut": "", "lines": "", "crop": "", "text": "", "copy": "", "folder": "",
+ICONS = {"blur": "", "style": "", "file": "", "scene": "", "images": "", "cut": "", "lines": "", "crop": "", "text": "", "copy": "", "folder": "",
          "up": "", "down": "", "close": ""}
 CHROME = {"min": "", "max": "", "restore": "", "close": ""}
 CHROME_TEXT = {"min": "–", "max": "□", "restore": "❐", "close": "×"}
@@ -32,6 +32,7 @@ FILES = {"jpg": "JPG", "png": "PNG"}
 STYLES = {"none": "Нет", "cctv": "Камера наблюдения", "body": "Бодикам"}
 PRESET_NAMES = {"none": "Нет", "film": "Кино", "warm": "Тёплый", "cold": "Холодный", "faded": "Выцветший",
                 "noir": "Нуар", "sepia": "Сепия"}
+BLUR_NAMES = {"blur": "Размытие", "pixel": "Пиксели"}
 LOOK_NAMES = {"bright": "Яркость", "contrast": "Контраст", "sat": "Насыщенность", "temp": "Температура",
               "shadows": "Тени", "highlights": "Света"}
 UNDO_MAX = 200
@@ -39,11 +40,11 @@ UNDO_MERGE_S = 0.8
 NICKS = {"no": "Показывать", "yes": "Прятать"}
 CROPS = {"free": "Свободно", "1:1": "Квадрат", "4:3": "4:3", "3:4": "3:4", "16:9": "16:9", "9:16": "9:16"}
 HANDLES = ("l", "r", "t", "b", "lt", "rt", "lb", "rb")
-TOOLS = ("lines", "crop", "text", "images", "scene", "file", "style")
+TOOLS = ("lines", "crop", "text", "images", "scene", "file", "style", "blur")
 PREVIEWS = ("scene", "file", "style")
 DONORS = ("carry", "photopick", "scenepick")
-EDITS = ("lines", "carry", "logpick", "crop", "text", "images", "photopick")
-FRAMED = ("crop", "text", "images")
+EDITS = ("lines", "carry", "logpick", "crop", "text", "images", "photopick", "blur")
+FRAMED = ("crop", "text", "images", "blur")
 SIDES = {"none": "Нет", "left": "Слева", "right": "Справа", "top": "Сверху", "bottom": "Снизу"}
 FIELD_DEFAULT = {"size": 0.5, "fade": 0.3}
 RAIL_HINTS = {"lines": "Какие строки чата попадут в СС · клавиша 1",
@@ -53,6 +54,7 @@ RAIL_HINTS = {"lines": "Какие строки чата попадут в СС 
               "scene": "Несколько СС одна под другой · клавиша 5",
               "file": "JPG или PNG, качество и вес файла · клавиша 6",
               "style": "Цвет, пресеты, LUT и стиль камеры · клавиша 7",
+              "blur": "Размыть или запикселить часть кадра · клавиша 8",
               "copy": "Скопировать СС в буфер (Ctrl+C), вставлять через Ctrl+V",
               "folder": "Показать файл в папке"}
 EDGES = {"left": "у левого края", "right": "у правого края", "top": "у верхнего края", "bottom": "у нижнего края"}

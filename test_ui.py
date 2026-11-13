@@ -55,8 +55,21 @@ def popup_hide(feed):
 
 
 class Key:
-    def __init__(self, keycode, state):
-        self.keycode, self.state, self.keysym, self.widget = keycode, state, "", None
+    def __init__(self, keycode, state, keysym=""):
+        self.keycode, self.state, self.keysym, self.widget = keycode, state, keysym, None
+
+
+class Mouse:
+    def __init__(self, feed, fx, fy):
+        ix, iy, dw, dh = feed.painter.geo["img"]
+        self.x, self.y, self.state = ix + fx * dw, iy + fy * dh, 0
+
+
+def drag(feed, a, b):
+    feed.press(Mouse(feed, *a))
+    feed.motion(Mouse(feed, (a[0] + b[0]) / 2, (a[1] + b[1]) / 2))
+    feed.motion(Mouse(feed, *b))
+    feed.release(Mouse(feed, *b))
 
 
 def expect(ok, what):
@@ -112,6 +125,18 @@ def main():
         (lambda: feed.set_style("cctv"), 1500),
         (lambda: feed.set_style("none"), 1000),
         (lambda: feed.change(look={}, preset="none"), 1000),
+        (lambda: feed.toggle_tool("blur"), 1200),
+        (lambda: drag(feed, (0.3, 0.3), (0.6, 0.5)), 800),
+        (lambda: expect(len(feed.shot["edit"].get("blurs", [])) == 1, "drag did not add a blur area"), 100),
+        (lambda: drag(feed, (0.45, 0.4), (0.5, 0.45)), 800),
+        (lambda: expect(abs(feed.shot["edit"]["blurs"][0]["x"] - 0.35) < 0.02, "drag did not move the area"), 100),
+        (lambda: feed.set_blur(mode="pixel", power=0.9), 1000),
+        (lambda: drag(feed, (0.1, 0.1), (0.102, 0.102)), 600),
+        (lambda: expect(len(feed.shot["edit"]["blurs"]) == 1, "a tiny drag left an area"), 100),
+        (lambda: feed.key(Key(46, 0, "Delete")), 800),
+        (lambda: expect(not feed.shot["edit"]["blurs"], "Delete did not remove the area"), 100),
+        (lambda: feed.undo(), 800),
+        (lambda: expect(feed.shot["edit"]["blurs"][0]["mode"] == "pixel", "undo did not bring the area back"), 100),
         (lambda: feed.toggle_tool("file"), 1500),
         (lambda: feed.set_file("png"), 1000),
         (lambda: feed.set_file("jpg"), 1000),
@@ -148,6 +173,7 @@ def main():
     edit = json.loads((shots / "src" / f"{state['name']}.json").read_text(encoding="utf-8"))
     assert edit["format"] == "square" and edit["file"] == "jpg" and edit.get("style") == "none", edit
     assert edit["hidden"] and edit["text_scale"] == 1.3 and not edit["overlays"], edit
+    assert edit["blurs"] and edit["blurs"][0]["mode"] == "pixel" and edit["blurs"][0]["power"] == 0.9, edit["blurs"]
     assert edit["scene"] and edit["scene"]["shots"] == list(reversed(NAMES)), edit["scene"]
     print("ui ok")
 

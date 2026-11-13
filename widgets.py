@@ -11,6 +11,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageTk
 
 import chat
 import core
+import styles
 from theme import (
     CHROME, CHROME_TEXT, DIM, ERR, FONT, FORMATS, LINE, MIST, ROW, SIZES, SLATE, SUB, VOID, WHITE, animations_on, px,
     rgb, rounded, same, shade
@@ -417,6 +418,7 @@ class Painter:
             frame = self.frame(bg, p["rect"], (dw, dh))
         else:
             frame = self.joined(shot, p, d, (dw, dh))
+        frame = styles.obscure(frame, edit.get("blurs"))
         if any(laps):
             frame = shade(frame, [lap * d for lap in laps])
         it, ib = laps[0] // 2, laps[1] // 2

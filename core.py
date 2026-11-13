@@ -607,6 +607,8 @@ def backdrop(bg, edit, src=None, width=None):
                  else np.asarray(Image.fromarray(frame).resize(p["base"], Image.BICUBIC)))
     if p["size"] != p["base"]:
         frame = np.asarray(join_canvas(Image.fromarray(frame), edit["join"]))
+    if edit.get("blurs"):
+        frame = np.asarray(styles.obscure(Image.fromarray(frame), edit["blurs"]))
     if src is not None and edit.get("overlays"):
         frame = paste_overlays(frame, edit["overlays"], src)
     if width and frame.shape[1] != width:

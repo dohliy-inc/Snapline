@@ -7,6 +7,8 @@ STYLES = ("none", "cctv", "body")
 PRESETS = ("none", "film", "warm", "cold", "faded", "noir", "sepia")
 LOOK = ("bright", "contrast", "sat", "temp", "shadows", "highlights")
 LUT_SIDES = (2, 65)
+BLUR_MODES = ("blur", "pixel")
+BLUR_MAX = 12
 LABELS = {"cctv": "CAM 01", "body": "UNIT 1"}
 TEXT_MAX = 40
 LUMA = np.array([0.299, 0.587, 0.114], np.float32)
@@ -209,6 +211,32 @@ def grade(frame, name, look, lut=None):
     if look:
         t = correct(t, look)
     return u8(t * 255)
+
+
+def obscure(img, blurs):
+    if not blurs:
+        return img
+    out = img.copy()
+    W, H = out.size
+    side = min(W, H)
+    for b in blurs[:BLUR_MAX]:
+        x0, y0 = max(0, round(b["x"] * W)), max(0, round(b["y"] * H))
+        x1, y1 = min(W, round((b["x"] + b["w"]) * W)), min(H, round((b["y"] + b["h"]) * H))
+        if x1 - x0 < 2 or y1 - y0 < 2:
+            continue
+        power = min(max(float(b.get("power", 0.6)), 0.05), 1.0)
+        if b.get("mode") == "pixel":
+            cell = max(2, round(side * 0.045 * power))
+            part = out.crop((x0, y0, x1, y1))
+            small = part.resize((max(1, round(part.width / cell)), max(1, round(part.height / cell))), Image.BOX)
+            out.paste(small.resize(part.size, Image.NEAREST), (x0, y0))
+        else:
+            r = max(1.0, side * 0.03 * power)
+            pad = round(r * 3)
+            l, t, rr, bb = max(0, x0 - pad), max(0, y0 - pad), min(W, x1 + pad), min(H, y1 + pad)
+            soft = out.crop((l, t, rr, bb)).filter(ImageFilter.GaussianBlur(r))
+            out.paste(soft.crop((x0 - l, y0 - t, x1 - l, y1 - t)), (x0, y0))
+    return out
 
 
 def apply(frame, style, when, text):

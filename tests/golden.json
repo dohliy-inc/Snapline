@@ -10,5 +10,6 @@
  "cctv": "1440x1440:9f4cdd7c56662b9b6e26",
  "body": "2560x1440:9ae0dddbb1e20cac6720",
  "scene": "1440x2592:506ab79fea21dc453ae6",
- "graded": "1440x1440:5e347fee32e458274dff"
+ "graded": "1440x1440:5e347fee32e458274dff",
+ "blurred": "1872x1440:e689fea7ca9b5cb2e14a"
 }

@@ -599,6 +599,13 @@ def check_styles():
         except ValueError:
             continue
         raise AssertionError(bad)
+    pic = Image.fromarray(plain)
+    assert styles.obscure(pic, []) is pic
+    for mode in styles.BLUR_MODES:
+        hid = np.asarray(styles.obscure(pic, [{"x": 0.5, "y": 0.5, "w": 0.25, "h": 0.25, "mode": mode, "power": 0.8}]))
+        inside, outside = (slice(720, 1080), slice(720, 1080)), (slice(0, 700), slice(0, 1440))
+        assert np.abs(hid[inside].astype(int) - plain[inside].astype(int)).mean() > 3, mode
+        assert np.array_equal(hid[outside], plain[outside]), mode
     warm = styles.grade(plain, "warm", {"bright": 30})
     assert warm.shape == plain.shape and warm[..., 0].mean() > plain[..., 0].mean() + 3
     assert len(styles.apply(plain, "cctv", None, "")[1]) == 1
@@ -648,6 +655,10 @@ def golden_cases(out):
     lut.write_text(cube(5, lambda r, g, b: (r * 0.9, g, min(1.0, b * 1.1 + 0.05))), encoding="utf-8")
     graded = dict(base, preset="film", look={"contrast": 20, "temp": -30, "shadows": 25}, lut=core.add_lut(out, lut))
     yield "graded", lambda: core.render(bg, rows, graded, out / "src")[0]
+    blurs = [{"x": 0.55, "y": 0.55, "w": 0.3, "h": 0.2, "mode": "blur", "power": 0.7},
+             {"x": 0.1, "y": 0.6, "w": 0.2, "h": 0.15, "mode": "pixel", "power": 0.5}]
+    yield "blurred", lambda: core.render(bg, rows, dict(base, blurs=blurs, join={"side": "right", "size": 0.3,
+                                                                                   "fade": 0.3}))[0]
 
 
 def digest(img):
