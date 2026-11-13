@@ -12,167 +12,72 @@ import core
 
 
 VOID = "#0a0a0a"
-
-
 BLACK = "#000000"
-
-
 ROW = "#15171b"
-
-
 SLATE = "#1e2026"
-
-
 MIST = "#2a2f39"
-
-
 HAIR = "#202329"
-
-
 LINE = "#454b57"
-
-
 DIM = "#6b7180"
-
-
 WHITE = "#f4f4f5"
-
-
 SUB = "#a3a8b3"
-
-
 ERR = "#ff7a70"
-
-
-ICONS = {"file": "", "scene": "", "images": "", "cut": "", "lines": "", "crop": "", "text": "", "copy": "", "folder": "",
+ICONS = {"style": "", "file": "", "scene": "", "images": "", "cut": "", "lines": "", "crop": "", "text": "", "copy": "", "folder": "",
          "up": "", "down": "", "close": ""}
-
-
 CHROME = {"min": "", "max": "", "restore": "", "close": ""}
-
-
 CHROME_TEXT = {"min": "–", "max": "□", "restore": "❐", "close": "×"}
-
-
 FORMATS = {"square": "Квадрат", "full": "Экран", "16:9": "16:9", "4:3": "4:3", "4:5": "4:5"}
-
-
 SIZES = {"native": "Как снято", "hd": "720", "fhd": "1080", "qhd": "1440", "4k": "2160"}
-
-
 FILES = {"jpg": "JPG", "png": "PNG"}
-
-
 STYLES = {"none": "Нет", "cctv": "Камера наблюдения", "body": "Бодикам"}
-
-
+PRESET_NAMES = {"none": "Нет", "film": "Кино", "warm": "Тёплый", "cold": "Холодный", "faded": "Выцветший",
+                "noir": "Нуар", "sepia": "Сепия"}
+LOOK_NAMES = {"bright": "Яркость", "contrast": "Контраст", "sat": "Насыщенность", "temp": "Температура",
+              "shadows": "Тени", "highlights": "Света"}
 UNDO_MAX = 200
-
-
 UNDO_MERGE_S = 0.8
-
-
 NICKS = {"no": "Показывать", "yes": "Прятать"}
-
-
 CROPS = {"free": "Свободно", "1:1": "Квадрат", "4:3": "4:3", "3:4": "3:4", "16:9": "16:9", "9:16": "9:16"}
-
-
 HANDLES = ("l", "r", "t", "b", "lt", "rt", "lb", "rb")
-
-
-TOOLS = ("lines", "crop", "text", "images", "scene", "file")
-
-
-PREVIEWS = ("scene", "file")
-
-
+TOOLS = ("lines", "crop", "text", "images", "scene", "file", "style")
+PREVIEWS = ("scene", "file", "style")
 DONORS = ("carry", "photopick", "scenepick")
-
-
 EDITS = ("lines", "carry", "logpick", "crop", "text", "images", "photopick")
-
-
 FRAMED = ("crop", "text", "images")
-
-
 SIDES = {"none": "Нет", "left": "Слева", "right": "Справа", "top": "Сверху", "bottom": "Снизу"}
-
-
 FIELD_DEFAULT = {"size": 0.5, "fade": 0.3}
-
-
 RAIL_HINTS = {"lines": "Какие строки чата попадут в СС · клавиша 1",
               "crop": "Что попадёт в кадр и какого он размера · клавиша 2",
               "text": "Размер текста, обводка и где стоит чат · клавиша 3",
               "images": "Второй ракурс или стикер поверх СС · клавиша 4",
               "scene": "Несколько СС одна под другой · клавиша 5",
               "file": "JPG или PNG, качество и вес файла · клавиша 6",
+              "style": "Цвет, пресеты, LUT и стиль камеры · клавиша 7",
               "copy": "Скопировать СС в буфер (Ctrl+C), вставлять через Ctrl+V",
               "folder": "Показать файл в папке"}
-
-
 EDGES = {"left": "у левого края", "right": "у правого края", "top": "у верхнего края", "bottom": "у нижнего края"}
-
-
 SCALES = {"1": "×1", "1.25": "×1.25", "1.5": "×1.5", "1.75": "×1.75", "2": "×2"}
-
-
 OUTLINES = {"0": "Нет", "1": "1 px", "2": "2 px", "3": "3 px"}
-
-
 POSITIONS = {"top-left": "Сверху слева", "top-right": "Сверху справа",
              "bottom-left": "Снизу слева", "bottom-right": "Снизу справа"}
-
-
 DISCORD = "https://discord.com/users/320909791826280452"
-
-
 SITE = "https://ls-project.com/"
-
-
 MODES = {"yes": "Одна кнопка", "no": "Две кнопки"}
-
-
 SOURCES = {"screen": "С экрана", "log": "Из чатлога"}
-
-
 VIEWS = {"one": "Эту СС", "all": "Всю сцену"}
-
-
 LOG_SHOW = {"rp": "Отыгровка", "all": "Все строки"}
-
-
 LOG_NAMES = 14
-
-
 SOUND = {"yes": "Вкл", "no": "Выкл"}
-
-
 KINDS = {chat.SPEECH: "Речь", chat.ACTION: "Действия", chat.AME: "Над головой",
          chat.SYSTEM: "Система", chat.OOC: "OOC и ЛС"}
-
-
 MONTHS = ("января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября",
           "октября", "ноября", "декабря")
-
-
 TK_KEYS = {"Pause": "PAUSE", "Scroll_Lock": "SCROLLLOCK", "Insert": "INSERT", "Home": "HOME", "End": "END",
            "Prior": "PAGEUP", "Next": "PAGEDOWN"}
-
-
 SIDE_W = 400
-
-
 RAIL_W = 112
-
-
 PAD = 36
-
-
 K = 1.0
-
-
 FONT = {}
 
 

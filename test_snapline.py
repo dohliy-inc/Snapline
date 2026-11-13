@@ -588,7 +588,25 @@ def check_styles():
         out = core.render(bg, rows, dict(edit, style=style, style_text="CAM 7"), when=when)[0]
         assert out.shape == plain.shape and np.abs(out.astype(int) - plain.astype(int)).mean() > 5
     assert styles.apply(plain, "none", when, None)[0] is plain
+    assert styles.grade(plain, "none", {"temp": 0}) is plain
+    size, table = styles.read_cube(cube(3, lambda r, g, b: (r, g, b)))
+    assert size == 3 and table[:6] == [0.0, 0.0, 0.0, 0.5, 0.0, 0.0]
+    same = styles.grade(plain, "none", {}, styles.ImageFilter.Color3DLUT(size, table))
+    assert np.abs(same.astype(int) - plain.astype(int)).max() <= 1
+    for bad in ("LUT_1D_SIZE 4\n", "LUT_3D_SIZE 2\n0 0 0\n"):
+        try:
+            styles.read_cube(bad)
+        except ValueError:
+            continue
+        raise AssertionError(bad)
+    warm = styles.grade(plain, "warm", {"bright": 30})
+    assert warm.shape == plain.shape and warm[..., 0].mean() > plain[..., 0].mean() + 3
     assert len(styles.apply(plain, "cctv", None, "")[1]) == 1
+
+
+def cube(n, f):
+    rows = [f(r / (n - 1), g / (n - 1), b / (n - 1)) for b in range(n) for g in range(n) for r in range(n)]
+    return f"LUT_3D_SIZE {n}\n" + "".join(f"{r:.4f} {g:.4f} {b:.4f}\n" for r, g, b in rows)
 
 
 def golden_cases(out):
@@ -626,6 +644,10 @@ def golden_cases(out):
     yield "cctv", lambda: core.render(bg, rows, dict(base, style="cctv", style_text="CAM 7"), when=when)[0]
     yield "body", lambda: core.render(bg, rows, dict(base, format="16:9", style="body"), when=when)[0]
     yield "scene", lambda: core.render_shot(scene)[0]
+    lut = out / "teal.cube"
+    lut.write_text(cube(5, lambda r, g, b: (r * 0.9, g, min(1.0, b * 1.1 + 0.05))), encoding="utf-8")
+    graded = dict(base, preset="film", look={"contrast": 20, "temp": -30, "shadows": 25}, lut=core.add_lut(out, lut))
+    yield "graded", lambda: core.render(bg, rows, graded, out / "src")[0]
 
 
 def digest(img):

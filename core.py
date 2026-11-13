@@ -61,7 +61,8 @@ SRC_BG = (".jpg", {"quality": 95, "subsampling": 0})
 SRC_CHAT = (".webp", {"lossless": True, "quality": 0, "method": 1})
 CHAT_POSITIONS = ("top-left", "top-right", "bottom-left", "bottom-right")
 LAYOUT_KEYS = ("format", "zoom", "center", "pos", "places", "size", "file", "quality", "text_scale", "outline",
-               "margin", "overlays", "join", "scene", "style", "style_text")
+               "margin", "overlays", "join", "scene", "style", "style_text", "preset", "look", "lut")
+LUT_DIR = "luts"
 JOIN_SIDES = {"left": Image.Transpose.FLIP_LEFT_RIGHT, "right": None, "top": Image.Transpose.TRANSVERSE,
               "bottom": Image.Transpose.TRANSPOSE}
 MAX_OVERLAYS = 4
@@ -700,7 +701,35 @@ def stack(frames, seams):
     return out, {"tops": tops, "heights": hs, "laps": laps}
 
 
-def styled(frame, edit, when):
+def lut_of(edit, src):
+    name = edit.get("lut")
+    if not name or src is None:
+        return None
+    path = Path(src).parent / LUT_DIR / name
+    try:
+        return styles.load_lut(str(path), path.stat().st_mtime_ns)
+    except (OSError, ValueError):
+        return None
+
+
+def add_lut(out, path):
+    path = Path(path)
+    data = path.read_bytes()
+    styles.read_cube(data.decode("utf-8", errors="replace"))
+    folder = Path(out) / LUT_DIR
+    folder.mkdir(parents=True, exist_ok=True)
+    stem, k = re.sub(r"[^\w.-]+", "_", path.stem)[:60] or "lut", 1
+    target = folder / f"{stem}.cube"
+    while target.exists() and target.read_bytes() != data:
+        k += 1
+        target = folder / f"{stem}_{k}.cube"
+    if not target.exists():
+        target.write_bytes(data)
+    return target.name
+
+
+def styled(frame, edit, when, src=None):
+    frame = styles.grade(frame, edit.get("preset"), edit.get("look"), lut_of(edit, src))
     return styles.apply(frame, edit.get("style"), when, edit.get("style_text"))
 
 
@@ -709,7 +738,7 @@ def render(bg, rows, edit, src=None, rough=None, scene=None, layout=None, when=N
         raise ValueError(f"фон шириной {bg.shape[1]} px, а чат снят на экране {rows[0]['screen_w']} px")
     if not scene:
         frame, p = backdrop(bg, edit, src)
-        frame, marks = styled(frame, edit, when)
+        frame, marks = styled(frame, edit, when, src)
         if rough:
             frame = jpeg_pass(frame, rough)
         img, painted = paint_chat(frame, rows, edit, p, boxes=marks)
@@ -722,7 +751,7 @@ def render(bg, rows, edit, src=None, rough=None, scene=None, layout=None, when=N
         else:
             f, q = backdrop(other["bg"], framed(other["edit"], edit), other["out"] / "src", frame.shape[1])
             r, e, t = other["rows"], other["edit"], shot_time(other.get("name"))
-        f, b = styled(f, edit, t)
+        f, b = styled(f, edit, t, src)
         frames.append((f, q, r, e))
         marks.append(b)
     img, where = stack([f for f, _, _, _ in frames], scene[1])

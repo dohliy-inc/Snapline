@@ -24,10 +24,11 @@ from tools.images import ImagesTool
 from tools.lines import LinesTool
 from tools.logpick import LogTool
 from tools.scene import SceneTool
+from tools.style import StyleTool
 from tools.text import TextTool
 
 
-class Feed(LinesTool, LogTool, CropTool, TextTool, ImagesTool, SceneTool, FileTool):
+class Feed(LinesTool, LogTool, CropTool, TextTool, ImagesTool, SceneTool, FileTool, StyleTool):
     def __init__(self, app, parent):
         self.app = app
         self.c = tk.Canvas(parent, bg=VOID, highlightthickness=0, bd=0)
@@ -329,6 +330,7 @@ class Feed(LinesTool, LogTool, CropTool, TextTool, ImagesTool, SceneTool, FileTo
             ("images", "Картинки", lambda: self.toggle_tool("images"), self.tool in ("images", "photopick")),
             ("scene", "Сцена", lambda: self.toggle_tool("scene"), self.tool in ("scene", "scenepick")),
             ("file", "Файл", lambda: self.toggle_tool("file"), self.tool == "file"),
+            ("style", "Стиль", lambda: self.toggle_tool("style"), self.tool == "style"),
         ]
         tools.append(None)
         if self.shot is not None or view_only:
@@ -474,7 +476,7 @@ class Feed(LinesTool, LogTool, CropTool, TextTool, ImagesTool, SceneTool, FileTo
             if geo["join"]:
                 l, t, r, b = geo["join"]
                 self.c.create_rectangle(l, t, r - 1, b - 1, outline=WHITE, width=1, dash=(4, 3), tags=("shot",))
-        elif self.tool == "file":
+        elif self.tool in ("file", "style"):
             self.draw_preview(geo["img"])
         self.mark_overlay(geo)
 
@@ -508,7 +510,7 @@ class Feed(LinesTool, LogTool, CropTool, TextTool, ImagesTool, SceneTool, FileTo
                 parts.append(f"масштаб {round(self.view_box[2] * 100)}%")
         geo = self.painter.geo
         kept = sum(r["keep"] for r in shot["rows"]) if shot else 0
-        drawn = self.tool in FRAMED or not scene and self.tool in (None, "file")
+        drawn = self.tool in FRAMED or not scene and self.tool in (None, "file", "style")
         if geo and shot and drawn and geo["painted"] < kept:
             parts.append(f"влезло {geo['painted']} из {kept} строк")
         if self.note:
@@ -610,7 +612,7 @@ class Feed(LinesTool, LogTool, CropTool, TextTool, ImagesTool, SceneTool, FileTo
         self.sheet = sheet
         head = tk.Frame(sheet, bg=VOID)
         head.pack(fill="x", padx=(0, px(12)))
-        title = {"lines": "Строки чата", "crop": "Кадр", "text": "Текст", "images": "Картинки", "file": "Файл",
+        title = {"lines": "Строки чата", "crop": "Кадр", "text": "Текст", "images": "Картинки", "file": "Файл", "style": "Стиль",
                  "carry": "Чат из другой СС", "logpick": "Чатлог", "photopick": "Фото из другой СС", "scene": "Сцена",
                  "scenepick": "СС для сцены"}[self.tool]
         tk.Label(head, text=title, bg=VOID, fg=WHITE, font=(FONT["display"], 20)).pack(side="left")

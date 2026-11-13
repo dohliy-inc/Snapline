@@ -1,7 +1,12 @@
+from functools import lru_cache
+
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 STYLES = ("none", "cctv", "body")
+PRESETS = ("none", "film", "warm", "cold", "faded", "noir", "sepia")
+LOOK = ("bright", "contrast", "sat", "temp", "shadows", "highlights")
+LUT_SIDES = (2, 65)
 LABELS = {"cctv": "CAM 01", "body": "UNIT 1"}
 TEXT_MAX = 40
 LUMA = np.array([0.299, 0.587, 0.114], np.float32)
@@ -126,6 +131,84 @@ def bodycam(frame, when, text):
             y = boxes[-1][3]
     boxes.append(rec_dot(d, write(d, (x, y), "REC", small, s, "ra"), s))
     return np.asarray(img), boxes
+
+
+def preset(t, name):
+    y = (t @ LUMA)[..., None]
+    if name == "film":
+        t = t + (1 - y) * np.array([-0.05, 0.02, 0.05], np.float32) + y * np.array([0.06, 0.02, -0.05], np.float32)
+        return (t - 0.5) * 1.1 + 0.5
+    if name == "warm":
+        return y + (t * np.array([1.07, 1.0, 0.88], np.float32) - y) * 1.05
+    if name == "cold":
+        return y + (t * np.array([0.9, 0.99, 1.08], np.float32) - y) * 0.95
+    if name == "faded":
+        t = y + (t - y) * 0.72
+        return 0.07 + t * 0.88 * np.array([1.02, 1.0, 0.95], np.float32)
+    if name in ("noir", "sepia"):
+        g = np.clip(y, 0, 1)
+        g = g + (g * g * (3 - 2 * g) - g) * (0.65 if name == "noir" else 0.25)
+        return g * (np.array([1.0, 1.0, 1.0], np.float32) if name == "noir" else
+                    np.array([1.08, 0.94, 0.74], np.float32)) + (0.0 if name == "noir" else 0.03)
+    return t
+
+
+def correct(t, look):
+    bright, contrast, sat, temp, shadows, highlights = (float(look.get(k, 0)) / 100 for k in LOOK)
+    if temp:
+        t = t * np.array([1 + 0.12 * temp, 1.0, 1 - 0.12 * temp], np.float32)
+    if bright:
+        t = np.clip(t, 0, 1) ** np.float32(2 ** -bright)
+    if shadows or highlights:
+        y = t @ LUMA
+        lift = 0.25 * shadows * np.clip(1 - y / 0.5, 0, 1) ** 2 + 0.25 * highlights * np.clip(y / 0.5 - 1, 0, 1) ** 2
+        t = t + lift[..., None]
+    if contrast:
+        t = (t - 0.5) * (1 + 0.8 * contrast) + 0.5
+    if sat:
+        y = (t @ LUMA)[..., None]
+        t = y + (t - y) * (1 + sat)
+    return t
+
+
+def read_cube(text):
+    size, rows = None, []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        head = line.split()[0].upper()
+        if head == "LUT_3D_SIZE":
+            size = int(line.split()[1])
+        elif head == "LUT_1D_SIZE":
+            raise ValueError("одномерные LUT не поддерживаются, нужен 3D LUT")
+        elif head[0].isdigit() or head[0] in "-.":
+            rows.append([float(v) for v in line.split()[:3]])
+    if size is None or not LUT_SIDES[0] <= size <= LUT_SIDES[1]:
+        raise ValueError("в файле нет LUT_3D_SIZE от 2 до 65")
+    if len(rows) != size ** 3 or any(len(r) != 3 for r in rows):
+        raise ValueError(f"ожидалось {size ** 3} строк цвета, найдено {len(rows)}")
+    return size, [v for r in rows for v in r]
+
+
+@lru_cache(maxsize=8)
+def load_lut(path, stamp):
+    size, table = read_cube(open(path, encoding="utf-8", errors="replace").read())
+    return ImageFilter.Color3DLUT(size, table)
+
+
+def grade(frame, name, look, lut=None):
+    look = {k: v for k, v in (look or {}).items() if k in LOOK and v}
+    if name not in PRESETS[1:] and not look and lut is None:
+        return frame
+    t = frame.astype(np.float32) / 255
+    if name in PRESETS[1:]:
+        t = preset(t, name)
+    if lut is not None:
+        t = np.asarray(Image.fromarray(u8(t * 255)).filter(lut), np.float32) / 255
+    if look:
+        t = correct(t, look)
+    return u8(t * 255)
 
 
 def apply(frame, style, when, text):
