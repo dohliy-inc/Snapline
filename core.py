@@ -73,7 +73,6 @@ GRAIN_TAPS /= GRAIN_TAPS.sum()
 GRAIN_GAIN = 0.873
 GRAIN_MIN = 0.3
 GRAIN_TILE, GRAIN_STEP = 64, 160
-GRAIN_SPREAD = 32
 MARKS = (("hide", "hidden"), ("drop", "dropped"))
 LOG_FONT = "arialbd.ttf"
 LOG_SIZE = 18 / 1440
@@ -589,8 +588,7 @@ def regrain(small, big):
     add = max(0.0, grain(big) ** 2 - grain(small) ** 2) ** 0.5 / GRAIN_GAIN
     if add < GRAIN_MIN:
         return small
-    noise = np.asarray(Image.effect_noise(small.shape[1::-1], GRAIN_SPREAD), np.float32)
-    noise = (noise - noise.mean()) * (add / GRAIN_SPREAD)
+    noise = styles.noise(small.shape[0], small.shape[1], add)
     return np.clip((small + noise[..., None]).round(), 0, 255).astype(np.uint8)
 
 

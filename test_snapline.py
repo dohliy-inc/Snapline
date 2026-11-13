@@ -1,4 +1,5 @@
 import ctypes
+import hashlib
 import json
 import os
 import re
@@ -29,6 +30,7 @@ import core
 import styles
 
 SAMPLES = Path(__file__).resolve().parent / "tests" / "fixtures"
+GOLDEN = SAMPLES.parent / "golden.json"
 A, S, O, SP, AC = chat.AME, chat.SYSTEM, chat.OOC, chat.SPEECH, chat.ACTION
 
 
@@ -589,6 +591,65 @@ def check_styles():
     assert len(styles.apply(plain, "cctv", None, "")[1]) == 1
 
 
+def golden_cases(out):
+    cfg = make_cfg(out)
+    names = []
+    for i in range(2):
+        state = {"session": core.Session()}
+        state["session"].name = f"SS_2026-01-01_00-00-0{i}"
+        core.handle(load("real_bg.webp"), state, cfg)
+        core.handle(load("real_chat_ic.png"), state, cfg)
+        names.append(state["session"].name)
+    shot = core.load_shot(out, names[0], cfg)
+    bg, rows, base = shot["bg"], shot["rows"], shot["edit"]
+    pm = chat.classify(chat.extract_rows(load("real_chat_pm.png")))
+    for r in pm:
+        r["keep"] = True
+    words = [dict(r, hide=list(chat.words(r)[:2]) if i == 2 else [], drop=list(chat.words(r)[1:3]) if i == 0 else [])
+             for i, r in enumerate(rows)]
+    gradient = np.dstack([*np.meshgrid(np.linspace(0, 255, 600), np.linspace(255, 0, 400)), np.full((400, 600), 90.0)])
+    ov = core.add_overlay(out, names[0], Image.fromarray(gradient.astype(np.uint8)))
+    ov.update(x=0.62, y=0.6, w=0.3, soft=0.3, crop=core.crop_for((600, 400), 1.0))
+    when = datetime(2026, 1, 1, 0, 0, 0)
+    scene = core.load_shot(out, names[1], cfg)
+    scene["edit"]["scene"] = {"shots": names, "seams": [dict(core.SEAM)]}
+    scene["edit"]["home"] = names[0]
+    yield "square", lambda: core.render(bg, rows, base)[0]
+    yield "frame_800", lambda: core.render(bg, rows, dict(base, format="800x800"))[0]
+    yield "wide_zoom", lambda: core.render(bg, rows, dict(base, format="16:9", zoom=1.6, center=[0.3, 0.6], size="hd"))[0]
+    yield "parts", lambda: core.render(load("real_bg.webp"), pm, dict(core.new_edit(cfg, pm), breaks=[2, 4], pos="bottom-right",
+                                                                      text_scale=1.2))[0]
+    yield "words", lambda: core.render(bg, words, base)[0]
+    yield "join", lambda: core.render(bg, rows, dict(base, join={"side": "bottom", "size": 0.4, "fade": 0.3}))[0]
+    yield "overlay", lambda: core.render(bg, rows, dict(base, overlays=[ov]), out / "src")[0]
+    yield "rough", lambda: core.render(bg, rows, base, rough=40)[0]
+    yield "cctv", lambda: core.render(bg, rows, dict(base, style="cctv", style_text="CAM 7"), when=when)[0]
+    yield "body", lambda: core.render(bg, rows, dict(base, format="16:9", style="body"), when=when)[0]
+    yield "scene", lambda: core.render_shot(scene)[0]
+
+
+def digest(img):
+    return f"{img.shape[1]}x{img.shape[0]}:" + hashlib.sha256(np.ascontiguousarray(img).tobytes()).hexdigest()[:20]
+
+
+def check_golden(write=False):
+    with tempfile.TemporaryDirectory() as tmp:
+        got = {name: render() for name, render in golden_cases(Path(tmp))}
+    sums = {name: digest(img) for name, img in got.items()}
+    if write:
+        GOLDEN.write_text(json.dumps(sums, indent=1) + chr(10), encoding="utf-8")
+        return
+    want = json.loads(GOLDEN.read_text(encoding="utf-8"))
+    bad = sorted(n for n in want.keys() | sums.keys() if want.get(n) != sums.get(n))
+    if bad:
+        dump = Path(tempfile.mkdtemp(prefix="snapline_golden_"))
+        for n in bad:
+            if n in got:
+                Image.fromarray(got[n]).save(dump / f"{n}.png")
+        raise AssertionError(f"golden renders changed: {bad}; actual images in {dump}; "
+                             f"after checking them run: python test_snapline.py --golden")
+
+
 def check_watermark():
     bg, shot = load("real_bg.webp"), load("real_chat_ic.png")
     mark = core.watermark(shot)
@@ -791,6 +852,10 @@ def check_log():
 
 
 if __name__ == "__main__":
+    if "--golden" in sys.argv:
+        check_golden(write=True)
+        print("golden renders written to", GOLDEN)
+        sys.exit(0)
     check_rows()
     check_format()
     check_watermark()
@@ -808,6 +873,7 @@ if __name__ == "__main__":
     check_quality()
     check_grain()
     check_styles()
+    check_golden()
     check_scene()
     check_log()
     print("ok")

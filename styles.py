@@ -5,7 +5,7 @@ STYLES = ("none", "cctv", "body")
 LABELS = {"cctv": "CAM 01", "body": "UNIT 1"}
 TEXT_MAX = 40
 LUMA = np.array([0.299, 0.587, 0.114], np.float32)
-SPREAD = 32
+TRIANGLE = np.float32(6 ** 0.5)
 INK, SHADE, REC = (238, 242, 238), (0, 0, 0), (225, 30, 30)
 CCTV_SIDE = 300
 CCTV_TINT = np.array([0.88, 1.0, 0.92], np.float32)
@@ -16,9 +16,18 @@ def u8(a):
     return np.clip(np.round(a), 0, 255).astype(np.uint8)
 
 
+def mix(x):
+    x = x ^ (x >> np.uint32(16))
+    x = x * np.uint32(0x7FEB352D)
+    x = x ^ (x >> np.uint32(15))
+    x = x * np.uint32(0x846CA68B)
+    return x ^ (x >> np.uint32(16))
+
+
 def noise(h, w, sigma):
-    n = np.asarray(Image.effect_noise((w, h), SPREAD), np.float32)
-    return (n - n.mean()) * (sigma / SPREAD)
+    i = np.arange(h * w, dtype=np.uint32) * np.uint32(2)
+    u = (mix(i) >> np.uint32(8)).astype(np.float32) + (mix(i + np.uint32(1)) >> np.uint32(8)).astype(np.float32)
+    return ((u / 2 ** 24 - 1) * (sigma * TRIANGLE)).reshape(h, w)
 
 
 def curve(a, lift, gain, gamma):
