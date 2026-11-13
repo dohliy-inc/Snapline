@@ -1,7 +1,7 @@
 import tkinter as tk
 from tkinter import filedialog
 
-import core
+import compose
 import styles
 from theme import FONT, LINE, LOOK_NAMES, PRESET_NAMES, ROW, STYLES, WHITE, px
 
@@ -46,7 +46,7 @@ class StyleTool:
         path = filedialog.askopenfilename(title="LUT для Snapline", filetypes=[("LUT", "*.cube"), ("Все файлы", "*.*")])
         if path:
             try:
-                self.set_lut(core.add_lut(self.shot["out"], path))
+                self.set_lut(compose.add_lut(self.shot["out"], path))
             except (OSError, ValueError) as e:
                 self.note = f"LUT не загрузился: {e}"
                 self.update_meta()

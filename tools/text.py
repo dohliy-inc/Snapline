@@ -1,7 +1,7 @@
 import tkinter as tk
 
 import chat
-import core
+import compose
 from theme import FONT, OUTLINES, SCALES, VIEWS, VOID, WHITE, place_name, px
 from widgets import Corners
 
@@ -25,7 +25,7 @@ class TextTool:
         margin = self.slider(body, 0, 96, edit["margin"], lambda v: self.change_text(margin=int(v)), step=2,
                              fmt=lambda v: f"{v:.0f} px")
         self.sliders["margin"] = (margin, lambda: shot["edit"]["margin"])
-        spots = [pos for _, pos in core.parts(shot["rows"], edit)]
+        spots = [pos for _, pos in compose.parts(shot["rows"], edit)]
         self.field(body, "Где чат" if len(spots) == 1 else "Где части чата")
         for k, pos in enumerate(spots):
             row = tk.Frame(body, bg=VOID)
@@ -106,7 +106,7 @@ class TextTool:
         if part == 0:
             edit["pos"] = pos
         else:
-            spots = core.places(edit, len(core.parts(shot["rows"], edit)))[1:]
+            spots = compose.places(edit, len(compose.parts(shot["rows"], edit)))[1:]
             spots[part - 1] = pos
             edit["places"] = spots
         edit["home"] = None if j == k else names[j]

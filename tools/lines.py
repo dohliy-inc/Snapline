@@ -6,7 +6,9 @@ import numpy as np
 from PIL import Image, ImageTk
 
 import chat
-import core
+import compose
+import config
+import store
 from theme import BLACK, DIM, ERR, FONT, HAIR, ICONS, LINE, MIST, ROW, SLATE, SUB, VOID, WHITE, px, rounded, tick, when
 from widgets import Pill
 
@@ -14,12 +16,12 @@ from widgets import Pill
 class LinesTool:
     def sheet_lines(self, body):
         names, shot = self.scene_names(), self.target
-        log = core.log_path(shot["out"], shot["name"]).exists()
+        log = store.log_path(shot["out"], shot["name"]).exists()
         self.count = tk.Label(body, text=self.count_text(), bg=VOID, fg=WHITE, font=(FONT["semi"], 12), anchor="w")
         self.count.pack(fill="x", pady=(0, px(10)))
         self.buttons(body, (("Как после съёмки", self.reset_lines),) +
                      ((("Чат из другой СС", lambda: self.toggle_tool("carry")),) if not log else ()))
-        source = (("С экрана", self.from_screen),) if log and core.screen_chats(shot["out"], shot["name"]) else ()
+        source = (("С экрана", self.from_screen),) if log and store.screen_chats(shot["out"], shot["name"]) else ()
         self.buttons(body, (("Из чатлога", lambda: self.toggle_tool("logpick")),) + source +
                      ((("Убрать повторы", self.drop_repeats),) if names else ()), 6)
         self.label(body, ("Чат этой СС собран из чатлога. " if log else "") +
@@ -87,7 +89,7 @@ class LinesTool:
             elif y + slot > ay and y < ay + ah:
                 r = shot["rows"][i]
                 if id(shot) not in breaks:
-                    breaks[id(shot)] = core.cuts(shot["rows"], shot["edit"])
+                    breaks[id(shot)] = compose.cuts(shot["rows"], shot["edit"])
                 cuts = breaks[id(shot)]
                 tag = f"row{j}"
                 self.c.create_rectangle(ax, y, ax + aw, y + slot, fill=BLACK, outline="",
@@ -136,8 +138,8 @@ class LinesTool:
         mine = [tuple(span) for span in r.get(key, [])]
         r[other] = [tuple(span) for span in r.get(other, []) if tuple(span) != word]
         r[key] = [span for span in mine if span != word] if word in mine else mine + [word]
-        for name, field in core.MARKS:
-            shot["edit"][field] = core.spans_of(shot["rows"], name)
+        for name, field in compose.MARKS:
+            shot["edit"][field] = compose.spans_of(shot["rows"], name)
         self.draw_lines(self.area())
         self.schedule_save(shot)
 
@@ -192,8 +194,8 @@ class LinesTool:
     def toggle_cut(self, j):
         shot, i = self.items[j][:2]
         rows, edit = shot["rows"], shot["edit"]
-        breaks = core.cuts(rows, edit)
-        spots = core.places(edit, len(breaks) + 1)[1:]
+        breaks = compose.cuts(rows, edit)
+        spots = compose.places(edit, len(breaks) + 1)[1:]
         if i in breaks:
             k = breaks.index(i)
             breaks.pop(k)
@@ -201,10 +203,10 @@ class LinesTool:
         else:
             k = sorted(breaks + [i]).index(i)
             used = [edit["pos"]] + spots
-            order = list(core.SPARE_PLACES[core.corner_of(edit["pos"])]) + list(core.CHAT_POSITIONS)
+            order = list(compose.SPARE_PLACES[compose.corner_of(edit["pos"])]) + list(config.CHAT_POSITIONS)
             free = [c for c in order if c not in used]
             breaks.insert(k, i)
-            spots.insert(k, free[0] if free else core.corner_of(used[k]))
+            spots.insert(k, free[0] if free else compose.corner_of(used[k]))
         edit["breaks"], edit["places"] = breaks, spots
         self.draw_lines(self.area())
         self.count.config(text=self.count_text())
@@ -215,7 +217,7 @@ class LinesTool:
         kept, total = sum(r["keep"] for s in shots for r in s["rows"]), sum(len(s["rows"]) for s in shots)
         if len(shots) > 1:
             return f"В сцене {kept} из {total}"
-        n = len(core.parts(self.shot["rows"], self.shot["edit"]))
+        n = len(compose.parts(self.shot["rows"], self.shot["edit"]))
         return f"В СС {kept} из {total}" + (f" · частей: {n}" if n > 1 else "")
 
     def set_place(self, part, pos):
@@ -224,7 +226,7 @@ class LinesTool:
         if part == 0:
             edit["pos"] = pos
             return
-        spots = core.places(edit, len(core.parts(shot["rows"], edit)))[1:]
+        spots = compose.places(edit, len(compose.parts(shot["rows"], edit)))[1:]
         spots[part - 1] = pos
         edit["places"] = spots
 
@@ -253,7 +255,7 @@ class LinesTool:
         self.c.delete("shot")
         ax, ay, aw, ah = area
         out = self.shot["out"]
-        names = core.donors(out, self.name if self.tool == "scenepick" else self.current(), self.names)
+        names = store.donors(out, self.name if self.tool == "scenepick" else self.current(), self.names)
         if not names:
             self.c.create_text(ax + aw // 2, ay + ah // 2, text="Других СС с исходными кадрами нет", fill=SUB,
                                font=(FONT["ui"], 12), tags=("shot",))
@@ -298,7 +300,7 @@ class LinesTool:
                 self.c.config(cursor="")))
 
     def thumb(self, out, name, size):
-        path = core.shot_image(out, name)
+        path = store.shot_image(out, name)
         try:
             key = (path, path.stat().st_mtime_ns, size)
             if key not in self.thumbs:
@@ -323,7 +325,7 @@ class LinesTool:
         self.c.config(cursor="watch")
         self.c.update_idletasks()
         try:
-            shot = core.load_shot(self.shot["out"], name, self.app.cfg)
+            shot = store.load_shot(self.shot["out"], name, self.app.cfg)
         except (OSError, ValueError):
             shot = None
         self.c.config(cursor="")
@@ -341,7 +343,7 @@ class LinesTool:
         if shot is None:
             return
         try:
-            added = core.carry_chat(shot, name, self.app.cfg)
+            added = store.carry_chat(shot, name, self.app.cfg)
         except (OSError, ValueError) as e:
             self.c.config(cursor="")
             self.note = f"чат не перенёсся: {e}"
@@ -363,14 +365,14 @@ class LinesTool:
             self.c.update_idletasks()
         for name in missing:
             try:
-                shot = core.load_shot(self.shot["out"], name, self.app.cfg)
+                shot = store.load_shot(self.shot["out"], name, self.app.cfg)
             except (OSError, ValueError):
                 shot = None
             self.cache[name] = shot or False
             self.remember(shot)
         self.c.config(cursor="")
         shots, gone = [shot for _, shot in self.members()], 0
-        for shot, dup in zip(shots, core.repeats(shots)):
+        for shot, dup in zip(shots, store.repeats(shots)):
             if dup:
                 for i in dup:
                     shot["rows"][i]["keep"] = False
@@ -385,7 +387,7 @@ class LinesTool:
     def reset_lines(self):
         keep = self.app.cfg["keep"]
         for shot in [s for _, s in self.members() if s] if self.scene_names() else [self.shot]:
-            log = core.log_path(shot["out"], shot["name"]).exists()
+            log = store.log_path(shot["out"], shot["name"]).exists()
             for r in shot["rows"]:
                 r["keep"] = log or r["kind"] in keep
             shot["edit"]["keep"] = [r["keep"] for r in shot["rows"]]

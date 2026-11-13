@@ -1,6 +1,6 @@
 import tkinter as tk
 
-import core
+import store
 from theme import FILES, FONT, VOID, WHITE, px
 
 
@@ -11,9 +11,9 @@ class FileTool:
         self.choice(body, FILES, edit["file"], self.set_file)
         if edit["file"] == "jpg":
             self.field(body, "Качество фона")
-            quality = self.slider(body, 10, 100, edit.get("quality", core.TEXT_QUALITY),
+            quality = self.slider(body, 10, 100, edit.get("quality", store.TEXT_QUALITY),
                                   lambda v: self.change(quality=int(v)), fmt=lambda v: f"{v:.0f}")
-            self.sliders["quality"] = (quality, lambda: self.shot["edit"].get("quality", core.TEXT_QUALITY))
+            self.sliders["quality"] = (quality, lambda: self.shot["edit"].get("quality", store.TEXT_QUALITY))
             self.label(body, "Сжимается только фон, текст чата всегда остаётся чётким.", 4)
         self.file_info = tk.Label(body, text=self.preview_info or "считаю размер…", bg=VOID, fg=WHITE,
                                   font=(FONT["semi"], 12), anchor="w")

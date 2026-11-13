@@ -10,7 +10,8 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 
 import chat
-import core
+import compose
+import config
 import styles
 from theme import (
     CHROME, CHROME_TEXT, DIM, ERR, FONT, FORMATS, LINE, MIST, ROW, SIZES, SLATE, SUB, VOID, WHITE, animations_on, px,
@@ -193,7 +194,7 @@ class Corners(tk.Canvas):
         self.frame = ImageTk.PhotoImage(rounded(self.w, self.h, px(6), None, LINE, 1.2))
         self.create_image(0, 0, anchor="nw", image=self.frame)
         r, inset, self.dots = px(4), px(9), {}
-        for corner in core.CHAT_POSITIONS:
+        for corner in config.CHAT_POSITIONS:
             v, side = corner.split("-")
             x, y = inset if side == "left" else self.w - inset, inset if v == "top" else self.h - inset
             on = corner == value
@@ -213,10 +214,10 @@ class Corners(tk.Canvas):
 
 
 class FramePick(tk.Frame):
-    def __init__(self, parent, value, on_pick, current, wrap, options=FORMATS, limits=core.FRAME_RANGE):
+    def __init__(self, parent, value, on_pick, current, wrap, options=FORMATS, limits=config.FRAME_RANGE):
         super().__init__(parent, bg=parent["bg"])
         self.on_pick, self.current, self.job, self.limits = on_pick, current, None, limits
-        custom = core.exact_of(value)
+        custom = config.exact_of(value)
         self.choice = Choice(self, {**options, "custom": "Свой"}, "custom" if custom else value, self.pick, wrap=wrap)
         self.choice.pack(anchor="w")
         self.line = tk.Frame(self, bg=self["bg"])
@@ -282,7 +283,7 @@ class SizePick(tk.Frame):
     def show(self, fmt):
         self.choice.pack_forget()
         self.note.pack_forget()
-        (self.note if core.exact_of(fmt) else self.choice).pack(anchor="w")
+        (self.note if config.exact_of(fmt) else self.choice).pack(anchor="w")
 
 
 class Slider(tk.Canvas):
@@ -408,7 +409,7 @@ class Painter:
 
     def draw(self, shot, area, tag="shot", edit=None, laps=(0, 0)):
         bg, rows, edit = shot["bg"], shot["rows"], edit or shot["edit"]
-        p = core.plan(bg, edit)
+        p = compose.plan(bg, edit)
         out_w, out_h = p["size"]
         ax, ay, aw, ah = area
         d = min(aw / out_w, ah / out_h)
@@ -423,10 +424,10 @@ class Painter:
             frame = shade(frame, [lap * d for lap in laps])
         it, ib = laps[0] // 2, laps[1] // 2
         inner = out_h - it - ib
-        groups = core.parts(rows, edit)
+        groups = compose.parts(rows, edit)
         key = (id(shot), shot.get("name"), id(rows), len(rows), tuple(r["keep"] for r in rows),
                tuple((tuple(map(tuple, r.get("hide", []))), tuple(map(tuple, r.get("drop", [])))) for r in rows),
-               tuple(core.cuts(rows, edit)), p["outline"], round(p["scale"], 4), inner, p["margin"])
+               tuple(compose.cuts(rows, edit)), p["outline"], round(p["scale"], 4), inner, p["margin"])
         if key != self.key:
             self.layers = [chat.chat_layer(part, p["outline"], p["scale"], inner - 2 * p["margin"])
                            for part, _ in groups]
@@ -442,7 +443,7 @@ class Painter:
             l, t, r, b = p["ext_box"]
             geo["join"] = (ix + l * d, iy + t * d, ix + r * d, iy + b * d)
         self.draw_overlays(shot, geo, tag)
-        spots = core.chat_spots((out_w, inner), [layer for layer, _, _ in self.layers], [pos for _, pos in groups],
+        spots = compose.chat_spots((out_w, inner), [layer for layer, _, _ in self.layers], [pos for _, pos in groups],
                                 pad, p["margin"])
         for k, ((layer, _, _), spot) in enumerate(zip(self.layers, spots)):
             if layer is None:
@@ -467,7 +468,7 @@ class Painter:
         if key != self.join_key:
             bw, bh = p["base"]
             base = self.frame(shot["bg"], p["rect"], (max(1, round(bw * d)), max(1, round(bh * d))))
-            img = core.join_canvas(base, join)
+            img = compose.join_canvas(base, join)
             self.join_key, self.join_img = key, img if img.size == size else img.resize(size, Image.BILINEAR)
         return self.join_img
 
@@ -479,22 +480,22 @@ class Painter:
             self.pieces.clear()
         for k, ov in enumerate(overlays if out else []):
             try:
-                source = core.overlay_image(out / "src" / ov["file"])
+                source = compose.overlay_image(out / "src" / ov["file"])
             except OSError:
                 geo["overlays"].append(None)
                 continue
-            x, y, w, h = core.overlay_box(ov, (out_w, out_h), source.size)
+            x, y, w, h = compose.overlay_box(ov, (out_w, out_h), source.size)
             dx, dy = round(ix + x * d), round(iy + y * d)
             size = (max(1, round(w * d)), max(1, round(h * d)))
-            edges = core.soft_edges((x, y, w, h), (out_w, out_h))
+            edges = compose.soft_edges((x, y, w, h), (out_w, out_h))
             base = (ov["file"], tuple(ov["crop"]), size)
             key = base + (ov.get("soft", 0.0), ov.get("alpha", 1.0), edges)
             if base not in self.pieces:
-                self.pieces[base] = core.overlay_piece(source, ov, size)
+                self.pieces[base] = compose.overlay_piece(source, ov, size)
             if key not in self.soft:
                 if len(self.soft) > 24:
                     self.soft.clear()
-                self.soft[key] = core.soften(self.pieces[base], ov, edges)
+                self.soft[key] = compose.soften(self.pieces[base], ov, edges)
             l, t = max(ix, dx), max(iy, dy)
             r, b = min(ix + dw, dx + size[0]), min(iy + dh, dy + size[1])
             if r <= l or b <= t:

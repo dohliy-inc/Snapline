@@ -7,7 +7,9 @@ from functools import lru_cache
 from PIL import ImageTk
 
 import chat
-import core
+import chatlog
+import compose
+import store
 from theme import BLACK, FONT, LOG_NAMES, LOG_SHOW, MIST, ROW, SLATE, SUB, VOID, WHITE, px, tick
 from widgets import Pill
 
@@ -16,7 +18,7 @@ class LogTool:
     def empty_log(self):
         shot = self.shot
         return (shot is not None and not shot["rows"] and not self.scene_names()
-                and core.log_path(shot["out"], shot["name"]).exists())
+                and store.log_path(shot["out"], shot["name"]).exists())
 
     def sheet_logpick(self, body):
         shot = self.target
@@ -51,7 +53,7 @@ class LogTool:
                     used += w
                 if v["names"]:
                     Pill(body, "Показать всех", lambda: self.log_name(None), kind="ghost").pack(anchor="w")
-        screen = not core.log_path(shot["out"], shot["name"]).exists()
+        screen = not store.log_path(shot["out"], shot["name"]).exists()
         self.label(body, "Строки чатлога за час до и после СС, пунктир — момент съёмки. Отметь нужные и нажми "
                          "«На СС»: они встанут в чат тем же шрифтом и цветом, что в игре. Клик по заголовку куска "
                          "отмечает его целиком." +
@@ -64,7 +66,7 @@ class LogTool:
         for (when, _), (kind, who, _) in zip(v["lines"], v["who"]):
             if who and kind in (chat.SPEECH, chat.ACTION):
                 total[who] = total.get(who, 0) + 1
-                if abs((when - v["at"]).total_seconds()) <= core.LOG_NEAR_S:
+                if abs((when - v["at"]).total_seconds()) <= chatlog.LOG_NEAR_S:
                     near[who] = near.get(who, 0) + 1
         ranked = sorted(total, key=lambda n: (-near.get(n, 0), -total[n], n))
         keep = [n for n in ranked[:LOG_NAMES]] + [n for n in ranked[LOG_NAMES:] if n in v["names"]]
@@ -89,7 +91,7 @@ class LogTool:
         lines, at, keep = v["lines"], v["at"], self.app.cfg["keep"]
         seen = [k for k, (kind, who, _) in enumerate(v["who"])
                 if (v["all"] or kind in keep) and (not v["names"] or who in v["names"])]
-        starts = set(core.log_chunks([lines[k] for k in seen]))
+        starts = set(chatlog.log_chunks([lines[k] for k in seen]))
         items, mark, bounds, chunk = [], None, {}, None
         for n, k in enumerate(seen):
             if mark is None and lines[k][0] > at:
@@ -110,14 +112,14 @@ class LogTool:
         shot, self.logview = self.target, None
         if shot is None:
             return
-        at = core.shot_time(shot["name"]) or datetime.now()
+        at = compose.shot_time(shot["name"]) or datetime.now()
         self.c.config(cursor="watch")
         self.c.update_idletasks()
-        lines = core.read_log(shot["out"], at)
+        lines = chatlog.read_log(shot["out"], at)
         self.c.config(cursor="")
-        saved = {core.log_key(*line) for line in core.picked_log(shot["edit"])}
-        self.logview = {"name": shot["name"], "at": at, "lines": lines, "who": [core.log_who(p) for _, p in lines],
-                        "on": {k for k, line in enumerate(lines) if core.log_key(*line) in saved},
+        saved = {chatlog.log_key(*line) for line in chatlog.picked_log(shot["edit"])}
+        self.logview = {"name": shot["name"], "at": at, "lines": lines, "who": [chatlog.log_who(p) for _, p in lines],
+                        "on": {k for k, line in enumerate(lines) if chatlog.log_key(*line) in saved},
                         "all": False, "names": set()}
         self.log_refilter()
 
@@ -141,7 +143,7 @@ class LogTool:
         for kind, k in v["items"]:
             tops.append(y)
             if kind == "line":
-                wraps[k] = [row for _, row in core.log_rows([v["lines"][k]], measure, width)] or [[]]
+                wraps[k] = [row for _, row in chatlog.log_rows([v["lines"][k]], measure, width)] or [[]]
                 y += len(wraps[k]) * lh + px(10)
             else:
                 y += px(40)
@@ -243,7 +245,7 @@ class LogTool:
             return
         picked = [v["lines"][k] for k in sorted(v["on"])]
         try:
-            core.use_log(shot, self.app.cfg, picked)
+            store.use_log(shot, self.app.cfg, picked)
         except (OSError, ValueError) as e:
             self.note = f"строки не встали: {e}"
             self.update_meta()
@@ -254,7 +256,7 @@ class LogTool:
     def from_screen(self):
         shot = self.target
         try:
-            core.use_screen(shot, self.app.cfg)
+            store.use_screen(shot, self.app.cfg)
         except (OSError, ValueError) as e:
             self.note = f"кадры чата не открылись: {e}"
             self.update_meta()

@@ -434,3 +434,83 @@ def compose(frame, rows, outline=1, pos="top-left", margin=24, scale=1.0):
     left, top = place(W, H, layer.shape[1], layer.shape[0], pad, pos, margin)
     box = (left + pad, top + pad, left + layer.shape[1] - pad, top + layer.shape[0] - pad)
     return blend(frame, layer, left, top), painted, box
+
+
+def watermark(chat_img):
+    H, W = chat_img.shape[:2]
+    left, tall = W - round(W * 0.12), round(H * 0.08)
+    for top in (0, H - tall):
+        box = chat_img[top:top + tall, left:].astype(np.float32)
+        ink = box.max(axis=2) > 24
+        for y0, y1 in _runs(ink.any(axis=1)):
+            xs = np.flatnonzero(ink[y0:y1 + 1].any(axis=0))
+            if xs[-1] - xs[0] >= W * 0.05 and y1 - y0 < H * 0.04:
+                return {"t": box[y0:y1 + 1, xs[0]:xs[-1] + 1], "x": left + int(xs[0])}
+    return None
+
+
+def _corr(a, b):
+    a, b = a - a.mean(), b - b.mean()
+    return float((a * b).sum() / (np.sqrt((a * a).sum() * (b * b).sum()) + 1e-6))
+
+
+def _match(region, t):
+    return _corr(region.max(axis=2), t.max(axis=2))
+
+
+def clean_bg(bg, mark, threshold=0.5):
+    if mark is None:
+        return bg
+    t, x = mark["t"], mark["x"]
+    h, w = t.shape[:2]
+    H = bg.shape[0]
+    if x + w > bg.shape[1] or h * 3 > H:
+        return bg
+    reach = max(h * 4, round(H * 0.1))
+    best, at = threshold, None
+    strip, tl = lum(bg[:, x:x + w]).astype(np.float32), t.max(axis=2)
+    for y in list(range(0, reach)) + list(range(H - reach, H - h + 1)):
+        score = _corr(strip[y:y + h], tl)
+        if score > best:
+            best, at = score, y
+    if at is None:
+        return bg
+    by, bx = max(at - 3, 0), max(x - 3, 0)
+    box = bg[by:at + h + 3, bx:x + w + 3].astype(np.float32)
+    region = box[at - by:at - by + h, x - bx:x - bx + w]
+    bright = t.max(axis=2)
+    solid = (bright > 0.7 * 255).any(axis=0)
+    text = ~solid
+    if text.any():
+        tt, seen = t[:, text], region[:, text].copy()
+        if _match(seen, tt) > 0.3:
+            level = tt.max(axis=2, keepdims=True)
+            top = max(float(level.max()), 1.0)
+            best_c, best_s = 255.0, None
+            for c in np.linspace(top + 1, 255, 28):
+                a = np.clip(level / c, 0, 0.9)
+                s = abs(_match(np.clip((seen - tt) / (1 - a), 0, 255), tt))
+                if best_s is None or s < best_s:
+                    best_c, best_s = c, s
+            a = np.clip(level / best_c, 0, 0.9)
+            fixed = np.where(seen >= 250, seen, np.clip((seen - tt) / (1 - a), 0, 255))
+            if abs(_match(fixed, tt)) < 0.3:
+                region[:, text] = fixed
+    cols = np.flatnonzero(solid)
+    if len(cols):
+        _fill(box, at - by, at - by + h, x - bx + max(cols[0] - 4, 0), x - bx + min(cols[-1] + 5, w))
+    out = bg.copy()
+    out[by:by + box.shape[0], bx:bx + box.shape[1]] = np.clip(box.round(), 0, 255).astype(np.uint8)
+    return out
+
+
+def _fill(out, y0, y1, x0, x1, margin=3, steps=150):
+    H, W = out.shape[:2]
+    py0, py1, px0, px1 = max(y0 - margin, 0), min(y1 + margin, H), max(x0 - margin, 0), min(x1 + margin, W)
+    patch = out[py0:py1, px0:px1]
+    mask = np.zeros(patch.shape[:2], bool)
+    mask[y0 - py0:y1 - py0, x0 - px0:x1 - px0] = True
+    patch[mask] = patch[~mask].mean(axis=0)
+    for _ in range(steps):
+        avg = (np.roll(patch, 1, 0) + np.roll(patch, -1, 0) + np.roll(patch, 1, 1) + np.roll(patch, -1, 1)) / 4
+        patch[mask] = avg[mask]

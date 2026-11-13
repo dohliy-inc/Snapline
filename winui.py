@@ -1,8 +1,13 @@
 import ctypes
 import io
+import re
+import time
 import tkinter as tk
 from ctypes import wintypes
 
+from PIL import Image
+
+from config import RELEASES, VERSION
 from theme import VOID, make_icon, px
 
 
@@ -18,6 +23,19 @@ GRIPS = (
     ("topleft", 13, "size_nw_se"), ("topright", 14, "size_ne_sw"), ("bottomleft", 16, "size_ne_sw"),
     ("bottomright", 17, "size_nw_se"),
 )
+
+user32 = ctypes.WinDLL("user32", use_last_error=True)
+kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+user32.OpenClipboard.argtypes = [wintypes.HWND]
+user32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
+user32.SetClipboardData.restype = wintypes.HANDLE
+kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
+kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+kernel32.GlobalLock.restype = ctypes.c_void_p
+kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+kernel32.GlobalFree.argtypes = [wintypes.HGLOBAL]
 
 
 class NCCALCSIZE_PARAMS(ctypes.Structure):
@@ -212,3 +230,74 @@ def already_running():
     kernel32.CreateMutexW.restype = wintypes.HANDLE
     handle = kernel32.CreateMutexW(None, False, "Local\\Snapline.SingleInstance")
     return ctypes.get_last_error() == 183, handle
+
+
+def copy_image(arr):
+    buf = io.BytesIO()
+    Image.fromarray(arr).save(buf, "BMP")
+    data = buf.getvalue()[14:]
+    handle = kernel32.GlobalAlloc(0x0002, len(data))
+    if not handle:
+        raise OSError("не хватило памяти для буфера обмена")
+    ptr = kernel32.GlobalLock(handle)
+    ctypes.memmove(ptr, data, len(data))
+    kernel32.GlobalUnlock(handle)
+    for _ in range(10):
+        if user32.OpenClipboard(None):
+            break
+        time.sleep(0.05)
+    else:
+        kernel32.GlobalFree(handle)
+        raise OSError("буфер обмена занят другой программой")
+    try:
+        user32.EmptyClipboard()
+        if not user32.SetClipboardData(8, handle):
+            kernel32.GlobalFree(handle)
+            raise OSError(f"Windows не принял картинку: {ctypes.WinError(ctypes.get_last_error())}")
+    finally:
+        user32.CloseClipboard()
+
+
+def version_key(version):
+    return tuple(int(n) for n in re.findall(r"\d+", version))
+
+
+def final_url(url, timeout_ms=5000):
+    net = ctypes.WinDLL("wininet", use_last_error=True)
+    net.InternetOpenW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD]
+    net.InternetOpenW.restype = ctypes.c_void_p
+    net.InternetOpenUrlW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+                                     wintypes.DWORD, ctypes.c_size_t]
+    net.InternetOpenUrlW.restype = ctypes.c_void_p
+    net.InternetSetOptionW.argtypes = [ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
+    net.InternetQueryOptionW.argtypes = [ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD)]
+    net.InternetCloseHandle.argtypes = [ctypes.c_void_p]
+    session = net.InternetOpenW(f"Snapline/{VERSION}", 0, None, None, 0)
+    if not session:
+        raise OSError(f"WinINet не открылся: {ctypes.WinError(ctypes.get_last_error())}")
+    try:
+        limit = wintypes.DWORD(timeout_ms)
+        for option in (2, 5, 6):
+            net.InternetSetOptionW(session, option, ctypes.byref(limit), ctypes.sizeof(limit))
+        fresh = "Cache-Control: no-cache\r\n"
+        handle = net.InternetOpenUrlW(session, url, fresh, len(fresh), 0x84080000, 0)
+        if not handle:
+            raise OSError(f"{url} не открылся: {ctypes.WinError(ctypes.get_last_error())}")
+        try:
+            buf, size = ctypes.create_unicode_buffer(2048), wintypes.DWORD(2048 * 2)
+            if not net.InternetQueryOptionW(handle, 34, buf, ctypes.byref(size)):
+                raise OSError(f"адрес ответа не прочитан: {ctypes.WinError(ctypes.get_last_error())}")
+            return buf.value
+        finally:
+            net.InternetCloseHandle(handle)
+    finally:
+        net.InternetCloseHandle(session)
+
+
+def latest_release():
+    try:
+        url = final_url(RELEASES)
+    except OSError:
+        return None
+    m = re.search(r"/releases/tag/v?(\d+(?:\.\d+)*)$", url)
+    return (m[1], url) if m and version_key(m[1]) > version_key(VERSION) else None

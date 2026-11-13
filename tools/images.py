@@ -3,7 +3,8 @@ from tkinter import filedialog
 
 from PIL import Image, ImageGrab
 
-import core
+import compose
+import config
 from theme import CROPS, HANDLES, VOID, WHITE, px
 from widgets import FramePick, Pill
 
@@ -17,7 +18,7 @@ class ImagesTool:
             return
         l, t, r, b = box["x"], box["y"], box["x"] + box["w"], box["y"] + box["h"]
         self.c.create_rectangle(l, t, r - 1, b - 1, outline=WHITE, width=1, dash=(4, 3), tags=("shot",))
-        locked = core.lock_ratio(self.target["edit"]["overlays"][self.active_ov].get("cut", "free")) is not None
+        locked = compose.lock_ratio(self.target["edit"]["overlays"][self.active_ov].get("cut", "free")) is not None
         spots = {"l": (l, (t + b) / 2), "r": (r, (t + b) / 2), "t": ((l + r) / 2, t), "b": ((l + r) / 2, b),
                  "lt": (l, t), "rt": (r, t), "lb": (l, b), "rb": (r, b)}
         k = px(5)
@@ -103,19 +104,19 @@ class ImagesTool:
 
     def add_image(self, image):
         overlays = self.target["edit"].setdefault("overlays", [])
-        if len(overlays) >= core.MAX_OVERLAYS:
-            self.note = f"больше {core.MAX_OVERLAYS} картинок не поместится"
+        if len(overlays) >= compose.MAX_OVERLAYS:
+            self.note = f"больше {compose.MAX_OVERLAYS} картинок не поместится"
             self.update_meta()
             return
         try:
-            ov = core.add_overlay(self.target["out"], self.target["name"], image)
+            ov = compose.add_overlay(self.target["out"], self.target["name"], image)
         except OSError as e:
             self.note = f"картинка не сохранилась: {e}"
             self.update_meta()
             return
-        p = core.plan(self.target["bg"], self.look(self.target)[0])
+        p = compose.plan(self.target["bg"], self.look(self.target)[0])
         if p["ext_box"] and ov["soft"]:
-            core.fit_field(ov, p, image.size)
+            compose.fit_field(ov, p, image.size)
         overlays.append(ov)
         self.active_ov = len(overlays) - 1
         self.redraw()
@@ -127,7 +128,7 @@ class ImagesTool:
 
     def source_size(self, ov):
         try:
-            return core.overlay_image(self.target["out"] / "src" / ov["file"]).size
+            return compose.overlay_image(self.target["out"] / "src" / ov["file"]).size
         except OSError:
             return None
 
@@ -142,15 +143,15 @@ class ImagesTool:
         size = self.source_size(ov)
         if size is None:
             return
-        out_w = core.plan(self.target["bg"], self.look(self.target)[0])["size"][0]
+        out_w = compose.plan(self.target["bg"], self.look(self.target)[0])["size"][0]
         before = ov["w"] * out_w / max(1e-6, ov["crop"][2] - ov["crop"][0])
-        exact = core.exact_of(value)
+        exact = config.exact_of(value)
         if value == "reset":
             ov["crop"], value = [0.0, 0.0, 1.0, 1.0], "free"
         elif exact:
-            ov["crop"] = core.crop_exact(size, exact[0], exact[1], ov["crop"])
+            ov["crop"] = compose.crop_exact(size, exact[0], exact[1], ov["crop"])
         elif value != "free":
-            ov["crop"] = core.crop_for(size, core.lock_ratio(value), ov["crop"])
+            ov["crop"] = compose.crop_for(size, compose.lock_ratio(value), ov["crop"])
         ov["w"] = round(before * (ov["crop"][2] - ov["crop"][0]) / out_w, 4)
         changed, ov["cut"] = ov.get("cut") != value, value
         if changed:
@@ -203,7 +204,7 @@ class ImagesTool:
             T = min(max(T + dy, bounds[1]), B - least)
         if "b" in h:
             B = max(min(B + dy, bounds[3]), T + least)
-        ratio = core.lock_ratio(ov.get("cut", "free"))
+        ratio = compose.lock_ratio(ov.get("cut", "free"))
         if ratio and len(h) == 2:
             w, hh = R - L, B - T
             if abs(dx) >= abs(dy) * ratio:

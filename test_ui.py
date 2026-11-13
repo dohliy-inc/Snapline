@@ -9,8 +9,10 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
+import capture
 import chat
-import core
+import compose
+import config
 import ui
 
 FIXTURES = Path(__file__).resolve().parent / "tests" / "fixtures"
@@ -28,20 +30,20 @@ def load(name):
 def prepare(work):
     shots = work / "out"
     (shots / "chatlog").mkdir(parents=True)
-    core.CONFIG_PATH = work / "config.ini"
-    core.write_raw(dict(core.DEFAULTS, output=str(shots), sound="no", chatlog="no", source="screen", file="jpg",
+    config.CONFIG_PATH = work / "config.ini"
+    config.write_raw(dict(config.DEFAULTS, output=str(shots), sound="no", chatlog="no", source="screen", file="jpg",
                         tray="no", tour="no"))
-    cfg = core.load_config()[1]
+    cfg = config.load_config()[1]
     for name in NAMES:
-        state = {"session": core.Session()}
+        state = {"session": capture.Session()}
         state["session"].name = name
-        core.handle(load("real_bg.webp"), state, cfg)
-        core.handle(load("real_chat_ic.png"), state, cfg)
+        capture.handle(load("real_bg.webp"), state, cfg)
+        capture.handle(load("real_chat_ic.png"), state, cfg)
     (shots / "chatlog" / "2026-01-01.jsonl").write_text(
         "".join(json.dumps({"time": t, "parts": [[text, color]]}, ensure_ascii=False) + "\n" for t, text, color in LOG),
         encoding="utf-8")
-    while not core.EVENTS.empty():
-        core.EVENTS.get()
+    while not config.EVENTS.empty():
+        config.EVENTS.get()
     return shots
 
 
@@ -78,7 +80,7 @@ def expect(ok, what):
 
 
 def scene(feed):
-    feed.set_scene(list(reversed(NAMES)), [dict(core.SEAM)])
+    feed.set_scene(list(reversed(NAMES)), [dict(compose.SEAM)])
     feed.toggle_tool("scene")
 
 

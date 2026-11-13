@@ -9,7 +9,9 @@ from tkinter import filedialog, messagebox
 from PIL import Image, ImageTk
 
 import chatlog
-import core
+import compose
+import config
+import store
 import theme
 from theme import (
     DISCORD, ERR, FILES, FONT, HAIR, KINDS, LINE, MODES, NICKS, OUTLINES, POSITIONS, SCALES, SITE, SOUND, SOURCES,
@@ -19,13 +21,13 @@ from widgets import Choice, FramePick, Loupe, Painter, Pill, SizePick, Slider
 
 
 def chatlog_worker(folder, stop):
-    report = lambda msg: core.EVENTS.put(("chatlog", msg))
+    report = lambda msg: config.EVENTS.put(("chatlog", msg))
     try:
         chatlog.run(chatlog.PORT, f"cfx-nui-{chatlog.RESOURCE}", folder, stop, report)
     except Exception as e:
-        with open(core.ERROR_LOG, "a", encoding="utf-8") as f:
+        with open(config.ERROR_LOG, "a", encoding="utf-8") as f:
             f.write(f"{datetime.now()}\n{traceback.format_exc()}\n")
-        report(f"Чатлог остановился из-за ошибки: {e}. Подробности в {core.ERROR_LOG}")
+        report(f"Чатлог остановился из-за ошибки: {e}. Подробности в {config.ERROR_LOG}")
 
 
 class Settings:
@@ -80,7 +82,7 @@ class Settings:
         line.pack(fill="x")
         text = tk.Frame(line, bg=VOID)
         text.pack(side="left", anchor="w")
-        tk.Label(text, text=f"Snapline {core.VERSION}", bg=VOID, fg=WHITE, font=(FONT["semi"], 11), bd=0, padx=0,
+        tk.Label(text, text=f"Snapline {config.VERSION}", bg=VOID, fg=WHITE, font=(FONT["semi"], 11), bd=0, padx=0,
                  anchor="w").pack(fill="x")
         who = tk.Frame(text, bg=VOID)
         who.pack(fill="x", pady=(px(2), 0))
@@ -90,7 +92,7 @@ class Settings:
         self.update_link = tk.Label(text, bg=VOID, fg=WHITE, font=(FONT["semi"], 9), bd=0, padx=0, cursor="hand2",
                                     anchor="w")
         try:
-            with Image.open(core.RES_DIR / "assets" / "ls_project.png") as im:
+            with Image.open(config.RES_DIR / "assets" / "ls_project.png") as im:
                 im = im.convert("RGBA")
                 h = px(44)
                 im = im.resize((round(im.width * h / im.height), h), Image.LANCZOS)
@@ -312,12 +314,12 @@ class Settings:
             hair.pack_forget()
 
     def frame_now(self):
-        shot = self.sample or core.sample_shot(self.app.cfg)
-        return core.plan(shot["bg"], core.new_edit(self.app.cfg, shot["rows"]))["base"]
+        shot = self.sample or store.sample_shot(self.app.cfg)
+        return compose.plan(shot["bg"], compose.new_edit(self.app.cfg, shot["rows"]))["base"]
 
     def update_src(self):
         try:
-            size, count = core.src_size(self.app.cfg["out"])
+            size, count = store.src_size(self.app.cfg["out"])
         except OSError:
             size, count = 0, 0
         self.src_label.config(text=f"{count} СС · {megabytes(size)}" if size else "Пусто")
@@ -331,7 +333,7 @@ class Settings:
                     "Готовые СС останутся в папке, но поправить их в редакторе будет нельзя.")
         if not messagebox.askyesno("Snapline", question, parent=self.app.root):
             return
-        core.clear_src(self.app.cfg["out"])
+        store.clear_src(self.app.cfg["out"])
         feed = self.app.feed
         feed.cache.clear()
         if feed.index:
@@ -371,7 +373,7 @@ class Settings:
             self.key_sub.config(text="Нажми и выбери новую", fg=SUB)
             return True
         key = e.keysym.upper() if re.fullmatch(r"F\d{1,2}", e.keysym) else TK_KEYS.get(e.keysym)
-        if key not in core.KEYS:
+        if key not in config.KEYS:
             self.key_sub.config(text="Не подойдёт: нужна F1–F24, Pause, Insert, Home, End, PgUp или PgDn", fg=ERR)
             return True
         self.capturing = False
@@ -387,7 +389,7 @@ class Settings:
         if path:
             self.app.set("output", path)
             self.out_label.config(text=str(self.app.cfg["out"]))
-            problem = core.check_out(self.app.cfg)
+            problem = store.check_out(self.app.cfg)
             self.app.feed.message = ("fail", problem) if problem else None
             self.update_src()
             self.app.feed.refresh_names()
@@ -416,7 +418,7 @@ class Settings:
 
             def work():
                 try:
-                    shot = core.sample_shot(cfg)
+                    shot = store.sample_shot(cfg)
                 except (OSError, ValueError):
                     shot = None
                 self.app.inbox.put(("sample_loaded", None, shot))
@@ -447,9 +449,9 @@ class Settings:
             r["keep"] = r["kind"] in cfg["keep"]
             r["hide"] = []
         if cfg["hide_names"]:
-            core.auto_hide(shot["rows"])
-        shot["edit"] = core.new_edit(cfg, shot["rows"])
-        out_w, out_h = core.plan(shot["bg"], shot["edit"])["size"]
+            compose.auto_hide(shot["rows"])
+        shot["edit"] = compose.new_edit(cfg, shot["rows"])
+        out_w, out_h = compose.plan(shot["bg"], shot["edit"])["size"]
         d = min(W / out_w, (H - px(72)) / out_h)
         geo = self.painter.draw(shot, (0, 0, round(out_w * d), round(out_h * d)))
         self.example_geo, self.encoded_arr = geo, None
@@ -460,7 +462,7 @@ class Settings:
 
     def caption(self, size=None):
         shot = self.sample
-        out_w, out_h = core.plan(shot["bg"], shot["edit"])["size"]
+        out_w, out_h = compose.plan(shot["bg"], shot["edit"])["size"]
         weight = f", ≈ {megabytes(size)}" if size else ""
         source = f"твоя СС от {when(shot['name'])}" if shot["name"] else "встроенный кадр"
         return (f"Так будет выглядеть новая СС: {out_w} × {out_h}{weight}. Пример — {source}. "
@@ -484,8 +486,8 @@ class Settings:
 
         def work():
             try:
-                img, _, data = core.encoded(snap)
-                arr = core.decoded(data) if edit["file"] == "jpg" else img
+                img, _, data = store.encoded(snap)
+                arr = store.decoded(data) if edit["file"] == "jpg" else img
                 self.app.inbox.put(("estimated", rev, (arr, len(data))))
             except Exception:
                 self.app.inbox.put(("estimated", rev, None))

@@ -11,9 +11,12 @@ from pathlib import Path
 
 from PIL import ImageTk
 
+import capture
 import chat
-import core
+import config
+import store
 import theme
+import winui
 from feed import Feed
 from settings import Settings
 from theme import FONT, SUB, VOID, WHITE, init_fonts, init_metrics, make_icon, px
@@ -31,10 +34,10 @@ class App:
         init_fonts()
         init_metrics(root)
         try:
-            self.raw, self.cfg = core.load_config()
+            self.raw, self.cfg = config.load_config()
         except ValueError as e:
-            self.raw = dict(core.DEFAULTS)
-            self.cfg = core.parse_config(self.raw)
+            self.raw = dict(config.DEFAULTS)
+            self.cfg = config.parse_config(self.raw)
             self.problem = f"config.ini не прочитан ({e}), взяты настройки по умолчанию"
         else:
             self.problem = None
@@ -54,7 +57,7 @@ class App:
         self.tab = None
         self.show("feed")
         root.bind_all("<Key>", self.key)
-        problem = self.problem or core.check_out(self.cfg)
+        problem = self.problem or store.check_out(self.cfg)
         if problem:
             self.feed.message = ("fail", problem)
         if self.cfg["chatlog"]:
@@ -183,12 +186,12 @@ class App:
     def set(self, key, value):
         raw = dict(self.raw, **{key: value})
         try:
-            cfg = core.parse_config(raw)
+            cfg = config.parse_config(raw)
         except ValueError:
             return False
         self.raw, self.cfg = raw, cfg
         try:
-            core.write_raw(raw)
+            config.write_raw(raw)
         except OSError as e:
             self.feed.message = ("fail", f"Не удалось сохранить настройки: {e}")
         self.settings.draw_example()
@@ -196,18 +199,18 @@ class App:
 
     def crash(self, kind, value, tb):
         try:
-            with open(core.ERROR_LOG, "a", encoding="utf-8") as f:
+            with open(config.ERROR_LOG, "a", encoding="utf-8") as f:
                 f.write(f"{datetime.now()}\n{''.join(traceback.format_exception(kind, value, tb))}\n")
         except OSError:
             pass
-        self.feed.note = f"ошибка, подробности в {core.ERROR_LOG.name}"
+        self.feed.note = f"ошибка, подробности в {config.ERROR_LOG.name}"
         try:
             self.feed.update_meta()
         except tk.TclError:
             pass
 
     def check_update(self):
-        found = core.latest_release()
+        found = winui.latest_release()
         if found:
             self.inbox.put(("update", *found))
 
@@ -226,7 +229,7 @@ class App:
         feed = self.feed
         try:
             while True:
-                event = core.EVENTS.get_nowait()
+                event = config.EVENTS.get_nowait()
                 if event[0] == "busy":
                     feed.busy = event[1]
                     if event[1]:
@@ -296,15 +299,15 @@ def selftest():
                                  root.after(200, check)))
 
     def check():
-        sample = core.RES_DIR / "samples"
-        rows = chat.classify(chat.extract_rows(core.read_image(sample / "example_chat.png")))
+        sample = config.RES_DIR / "samples"
+        rows = chat.classify(chat.extract_rows(store.read_image(sample / "example_chat.png")))
         with tempfile.TemporaryDirectory() as tmp:
             cfg = dict(app.cfg, out=Path(tmp))
-            core.save_src(core.read_image(sample / "example_bg.webp"), cfg, "SS_selftest_bg", core.SRC_BG)
-            core.save_src(core.read_image(sample / "example_chat.png"), cfg, "SS_selftest_chat1", core.SRC_CHAT)
-            shot = core.load_shot(Path(tmp), "SS_selftest", cfg)
-            core.save_shot(shot)
-            saved = core.shot_image(Path(tmp), "SS_selftest").exists() and any(r["keep"] for r in shot["rows"])
+            store.save_src(store.read_image(sample / "example_bg.webp"), cfg, "SS_selftest_bg", store.SRC_BG)
+            store.save_src(store.read_image(sample / "example_chat.png"), cfg, "SS_selftest_chat1", store.SRC_CHAT)
+            shot = store.load_shot(Path(tmp), "SS_selftest", cfg)
+            store.save_shot(shot)
+            saved = store.shot_image(Path(tmp), "SS_selftest").exists() and any(r["keep"] for r in shot["rows"])
         W, H = root.winfo_width(), root.winfo_height()
         grips = dict(zip((name for name, _, _ in GRIPS), (grip for grip, _ in app.frame.grips)))
         order = root.winfo_children()
@@ -324,7 +327,7 @@ def selftest():
     root.after(800, clicks)
     root.mainloop()
     if not result.get("ok"):
-        with open(core.ERROR_LOG, "a", encoding="utf-8") as f:
+        with open(config.ERROR_LOG, "a", encoding="utf-8") as f:
             f.write(f"{datetime.now()} selftest\n{result.get('detail')}\n{''.join(errors)}\n")
     return 0 if result.get("ok") else 2
 
@@ -349,7 +352,7 @@ def main():
     if app.cfg["tray"]:
         app.tray.add()
     stop = threading.Event()
-    threading.Thread(target=core.run, args=(lambda: app.cfg, stop, app.foreground), daemon=True).start()
+    threading.Thread(target=capture.run, args=(lambda: app.cfg, stop, app.foreground), daemon=True).start()
 
     def close():
         stop.set()

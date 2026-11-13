@@ -10,9 +10,13 @@ import time
 import urllib.parse
 import urllib.request
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timedelta
 
-import core
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+
+import chat
+import config
 
 PORT = 13172
 RESOURCE = "lspr"
@@ -24,6 +28,20 @@ RESCAN_S = 10.0
 STATUS_MAX = 512 * 1024
 TAIL_BYTES = 1024 * 1024
 MATCH = 200
+
+LOG_FONT = "arialbd.ttf"
+LOG_SIZE = 18 / 1440
+LOG_PITCH = 21.5 / 1440
+LOG_LEFT = 27 / 1440
+LOG_WIDTH = 0.25
+LOG_SPAN_S = 60 * 60
+LOG_GAP_S = 3 * 60
+LOG_STAMP = "%Y-%m-%d %H:%M:%S"
+LOG_GUESS = (("*", "#c2a2da"), ("((", "#a0a0a0"))
+LOG_TEXT = "#e6e6e6"
+LOG_SAY = re.compile(r"(?:\[!\] )?(?P<who>[^\s:(*>\[][^:()]{1,40}?) (?:говорит|кричит|шепчет)[^:(]*"
+                     r"(?:\((?:к (?P<to>[^)]+)|[^)]*)\))?:")
+LOG_NEAR_S = 10 * 60
 
 INJECT = r"""
 (() => {
@@ -327,11 +345,133 @@ class Log:
         return path
 
 
+def hex_color(text):
+    nums = re.findall(r"\d+", text)
+    if text.startswith("#") or len(nums) < 3:
+        return text if re.fullmatch(r"#[0-9a-fA-F]{6}", text) else LOG_TEXT
+    return "#" + "".join(f"{min(int(v), 255):02x}" for v in nums[:3])
+
+
+def guess_parts(text):
+    color = next((c for mark, c in LOG_GUESS if text.startswith(mark)), LOG_TEXT)
+    return [[text, color]]
+
+
+def log_entry(line, plain):
+    if plain:
+        m = re.match(r"\[(\d\d:\d\d:\d\d)\] (.*)", line)
+        return (m[1], guess_parts(m[2])) if m and m[2].strip() else None
+    try:
+        item = json.loads(line)
+        parts = [[str(t), hex_color(str(c))] for t, c in item["parts"] if str(t)]
+        return (item["time"], parts) if parts else None
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
+def read_log(out, at, span=LOG_SPAN_S):
+    start, end, lines = at - timedelta(seconds=span), at + timedelta(seconds=span), []
+    for day in sorted({start.date(), end.date()}):
+        base = out / "chatlog" / f"{day:%Y-%m-%d}"
+        path = next((p for p in (base.with_suffix(".jsonl"), base.with_suffix(".txt")) if p.exists()), None)
+        if path is None:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            entry = log_entry(line, path.suffix == ".txt")
+            if entry is None:
+                continue
+            when = datetime.combine(day, datetime.strptime(entry[0], "%H:%M:%S").time())
+            if start <= when <= end:
+                lines.append((when, entry[1]))
+    return lines
+
+
+def log_who(parts):
+    text = "".join(t for t, _ in parts).strip()
+    m = LOG_SAY.match(text)
+    if m:
+        return chat.SPEECH, m["who"].strip(), (m["to"] or "").strip() or None
+    m = re.match(r"Вы сказали (.{1,40}?) шепотом:", text)
+    if m:
+        return chat.SPEECH, m[1], m[1]
+    if text.startswith("(("):
+        return chat.OOC, None, None
+    pink =any(c.lower() == LOG_GUESS[0][1] for _, c in parts)
+    words = text.lstrip("*> ").split()
+    if text.startswith("* "):
+        return chat.ACTION, " ".join(words[:2]) or None, None
+    if text.startswith(">"):
+        return (chat.AME, " ".join(words[:2]) or None, None) if pink else (chat.SYSTEM, None, None)
+    m = re.search(r"\*([^*()]{3,40})\)?\s*$", text)
+    if pink and m:
+        return chat.ACTION, m[1].strip(), None
+    return chat.SYSTEM, None, None
+
+
+def log_chunks(lines, gap=LOG_GAP_S):
+    return [k for k in range(len(lines)) if not k or (lines[k][0] - lines[k - 1][0]).total_seconds() > gap]
+
+
+def log_key(when, parts):
+    return f"{when:{LOG_STAMP}}", "".join(text for text, _ in parts)
+
+
+def picked_log(edit):
+    try:
+        return [(datetime.strptime(e["at"], LOG_STAMP), [[str(t), hex_color(str(c))] for t, c in e["parts"]])
+                for e in edit.get("log") or []]
+    except (ValueError, KeyError, TypeError):
+        return []
+
+
+def log_rows(lines, measure, limit):
+    rows = []
+    for when, parts in lines:
+        row, x = [], 0.0
+        words = [(w, c) for text, c in parts for w in re.findall(r"\S+\s*|\s+", text)]
+        while words and not words[0][0].strip():
+            words.pop(0)
+        for word, color in words:
+            if x and x + measure(word.rstrip()) > limit:
+                rows.append((when, row))
+                row, x = [], 0.0
+                word = word.lstrip()
+                if not word:
+                    continue
+            if row and row[-1][2] == color:
+                row[-1][1] += word
+            else:
+                row.append([x, word, color])
+            x += measure(word)
+        if row:
+            rows.append((when, row))
+    return rows
+
+
+def log_frame(lines, size):
+    W, H = size
+    font = ImageFont.truetype(LOG_FONT, max(8, round(LOG_SIZE * H)))
+    pitch, left = LOG_PITCH * H, round(LOG_LEFT * H)
+    rows = log_rows(lines, font.getlength, LOG_WIDTH * W)
+    top, ascent = round(pitch), font.getmetrics()[0]
+    img = Image.new("RGB", (W, max(H, round(2 * top + pitch * len(rows)))))
+    d = ImageDraw.Draw(img)
+    for k, (_, row) in enumerate(rows):
+        base = top + round(k * pitch) + ascent
+        for x, text, color in row:
+            d.text((left + x, base), text.rstrip(), font=font, fill=color, anchor="ls")
+    return np.asarray(img)
+
+
 def parts(line):
-    out = [[text, core.hex_color(str(color))] for text, color in line.get("parts") or [] if text]
+    out = [[text, hex_color(str(color))] for text, color in line.get("parts") or [] if text]
     flat = lambda text: re.sub(r"\s+", " ", text).strip()
     if not out or flat("".join(t for t, _ in out)) != flat(line["text"]):
-        return core.guess_parts(line["text"])
+        return guess_parts(line["text"])
     out[0][0], out[-1][0] = out[0][0].lstrip(), out[-1][0].rstrip()
     return [p for p in out if p[0]]
 
@@ -414,7 +554,7 @@ def main():
     parser.add_argument("--port", type=int, default=PORT)
     parser.add_argument("--resource", default=RESOURCE)
     args = parser.parse_args()
-    _, cfg = core.load_config()
+    _, cfg = config.load_config()
     folder = cfg["out"] / "chatlog"
     say(f"Лог пишется в {folder}")
     try:

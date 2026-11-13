@@ -3,7 +3,7 @@ import tkinter.font as tkfont
 
 from PIL import Image, ImageTk
 
-import core
+import compose
 from theme import FONT, ICONS, SUB, VOID, WHITE, px, when
 from widgets import Pill
 
@@ -11,16 +11,16 @@ from widgets import Pill
 class SceneTool:
     def seams(self):
         given = self.shot["edit"]["scene"].get("seams") or []
-        return [dict(core.SEAM, **(given[k] if k < len(given) else {})) for k in range(len(self.scene_names()) - 1)]
+        return [dict(compose.SEAM, **(given[k] if k < len(given) else {})) for k in range(len(self.scene_names()) - 1)]
 
     def scene_plan(self):
         head = self.shot["edit"]
-        width = core.plan(self.shot["bg"], core.framed(head, head))["size"][0]
-        hs = [core.plan(s["bg"], core.framed(s["edit"], head), width)["size"][1] if s else None
+        width = compose.plan(self.shot["bg"], compose.framed(head, head))["size"][0]
+        hs = [compose.plan(s["bg"], compose.framed(s["edit"], head), width)["size"][1] if s else None
               for _, s in self.members()]
         mine = hs[self.scene_names().index(self.name)]
         hs = [h or mine for h in hs]
-        return width, hs, core.laps_of(hs, self.seams())
+        return width, hs, compose.laps_of(hs, self.seams())
 
     def scene_size(self):
         width, hs, laps = self.scene_plan()
@@ -159,7 +159,7 @@ class SceneTool:
         bg = self.shot["bg"]
         key = ("bg", id(bg), size)
         if key not in self.thumbs:
-            x0, y0, x1, y1 = core.plan(bg, self.shot["edit"])["rect"]
+            x0, y0, x1, y1 = compose.plan(bg, self.shot["edit"])["rect"]
             im = Image.fromarray(bg[y0:y1, x0:x1])
             im.thumbnail(size, Image.BILINEAR, reducing_gap=2.0)
             self.thumbs[key] = ImageTk.PhotoImage(im)
@@ -167,7 +167,7 @@ class SceneTool:
 
     def sheet_scenepick(self, body):
         self.label(body, "Отметь СС и нажми «Готово». Они встанут по времени съёмки и получат формат кадра этой СС, "
-                         f"а строки, которые уже были выше, уберутся сами. До {core.SCENE_MAX} СС.")
+                         f"а строки, которые уже были выше, уберутся сами. До {compose.SCENE_MAX} СС.")
         Pill(body, "Готово", lambda: self.toggle_tool("scene"), kind="ghost").pack(anchor="w", pady=(px(8), 0))
 
     def scene_lists(self):
@@ -184,8 +184,8 @@ class SceneTool:
             k = shots.index(name)
             shots.pop(k)
             seams.pop(max(k - 1, 0))
-        elif len(shots) >= core.SCENE_MAX:
-            self.note = f"в сцену помещается до {core.SCENE_MAX} СС"
+        elif len(shots) >= compose.SCENE_MAX:
+            self.note = f"в сцену помещается до {compose.SCENE_MAX} СС"
             self.update_meta()
             return
         else:
@@ -194,7 +194,7 @@ class SceneTool:
             self.fetch(name)
             self.added.add(name)
             near = max(k - 1, 0)
-            seams.insert(near, dict(seams[min(near, len(seams) - 1)] if seams else core.SEAM))
+            seams.insert(near, dict(seams[min(near, len(seams) - 1)] if seams else compose.SEAM))
         self.set_scene(shots, seams)
         self.draw_donors(self.area())
         self.update_meta()

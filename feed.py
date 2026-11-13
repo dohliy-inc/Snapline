@@ -11,8 +11,11 @@ import tkinter.font as tkfont
 from PIL import Image, ImageEnhance, ImageFilter, ImageTk
 
 import chat
-import core
+import compose
+import config
+import store
 import theme
+import winui
 from theme import (
     DONORS, EDITS, ERR, FONT, FRAMED, ICONS, LINE, MIST, PREVIEWS, RAIL_HINTS, SUB, TOOLS, UNDO_MAX, UNDO_MERGE_S,
     VOID, WHITE, megabytes, px, rounded, when
@@ -98,7 +101,7 @@ class Feed(LinesTool, LogTool, CropTool, TextTool, ImagesTool, SceneTool, FileTo
         self.refresh_names()
 
     def refresh_names(self):
-        self.names = core.list_shots(self.app.cfg["out"])
+        self.names = store.list_shots(self.app.cfg["out"])
         self.media = None
 
     @property
@@ -142,7 +145,7 @@ class Feed(LinesTool, LogTool, CropTool, TextTool, ImagesTool, SceneTool, FileTo
 
         def work():
             try:
-                shot = core.load_shot(cfg["out"], name, cfg)
+                shot = store.load_shot(cfg["out"], name, cfg)
             except Exception:
                 shot = None
             self.app.inbox.put(("loaded", name, shot))
@@ -237,7 +240,7 @@ class Feed(LinesTool, LogTool, CropTool, TextTool, ImagesTool, SceneTool, FileTo
             return self.media[1]
         photo = None
         if self.names:
-            path = core.shot_image(self.app.cfg["out"], self.names[0])
+            path = store.shot_image(self.app.cfg["out"], self.names[0])
             try:
                 key = (path, path.stat().st_mtime)
                 if self.media_src is None or self.media_src[0] != key:
@@ -400,7 +403,7 @@ class Feed(LinesTool, LogTool, CropTool, TextTool, ImagesTool, SceneTool, FileTo
         shot = self.cache.get(name)
         if not shot:
             try:
-                shot = core.load_shot(self.shot["out"], name, self.app.cfg)
+                shot = store.load_shot(self.shot["out"], name, self.app.cfg)
             except (OSError, ValueError):
                 shot = None
             if shot:
@@ -416,10 +419,10 @@ class Feed(LinesTool, LogTool, CropTool, TextTool, ImagesTool, SceneTool, FileTo
         names = self.scene_names()
         if not names or shot.get("name") not in names:
             return shot["edit"], (0, 0)
-        edit = core.framed(shot["edit"], self.shot["edit"])
+        edit = compose.framed(shot["edit"], self.shot["edit"])
         width, _, laps = self.scene_plan()
         k = names.index(shot["name"])
-        f = core.plan(shot["bg"], edit)["size"][0] / width
+        f = compose.plan(shot["bg"], edit)["size"][0] / width
         return edit, (round(laps[k - 1] * f) if k else 0, round(laps[k] * f) if k < len(laps) else 0)
 
     def current(self):
@@ -504,7 +507,7 @@ class Feed(LinesTool, LogTool, CropTool, TextTool, ImagesTool, SceneTool, FileTo
     def draw_saved(self, area, name):
         ax, ay, aw, ah = area
         try:
-            with Image.open(core.shot_image(self.app.cfg["out"], name)) as im:
+            with Image.open(store.shot_image(self.app.cfg["out"], name)) as im:
                 im = im.convert("RGB")
                 im.thumbnail((aw, ah), Image.BILINEAR)
                 self.photos.append(ImageTk.PhotoImage(im))
@@ -517,10 +520,10 @@ class Feed(LinesTool, LogTool, CropTool, TextTool, ImagesTool, SceneTool, FileTo
             return "загружаю…" if self.cache.get(self.name) is None else "только просмотр"
         shot, scene = self.target, self.scene_names()
         if not scene:
-            w, h = core.plan(self.shot["bg"], self.shot["edit"])["size"]
+            w, h = compose.plan(self.shot["bg"], self.shot["edit"])["size"]
             parts = [f"{w} × {h}"]
         elif self.tool in FRAMED and shot is not None and not self.previewing():
-            w, h = core.plan(shot["bg"], self.look(shot)[0])["size"]
+            w, h = compose.plan(shot["bg"], self.look(shot)[0])["size"]
             parts = [f"СС {scene.index(shot['name']) + 1} из {len(scene)}", f"кадр {w} × {h}",
                      "сцена {} × {}".format(*self.scene_size())]
         else:
@@ -778,8 +781,8 @@ class Feed(LinesTool, LogTool, CropTool, TextTool, ImagesTool, SceneTool, FileTo
         def work():
             try:
                 layout = {}
-                img, _, data = core.encoded(snap, layout)
-                arr = core.decoded(data) if snap["edit"]["file"] == "jpg" else img
+                img, _, data = store.encoded(snap, layout)
+                arr = store.decoded(data) if snap["edit"]["file"] == "jpg" else img
                 self.app.inbox.put(("previewed", key, (arr, len(data), layout or None)))
             except Exception as e:
                 self.app.inbox.put(("previewed", key, str(e)))
@@ -1030,7 +1033,7 @@ class Feed(LinesTool, LogTool, CropTool, TextTool, ImagesTool, SceneTool, FileTo
         else:
             look = self.look(shot)[0]
             H, W = shot["bg"].shape[:2]
-            x0, y0, x1, y1 = chat.frame_rect(W, H, core.ratio_of(look["format"]), look["zoom"], look["center"])
+            x0, y0, x1, y1 = chat.frame_rect(W, H, config.ratio_of(look["format"]), look["zoom"], look["center"])
             shot["edit"]["center"] = [round((x0 + x1) / 2 / W, 4), round((y0 + y1) / 2 / H, 4)]
         self.media_redraw()
         if self.tool == "text":
@@ -1245,13 +1248,13 @@ class Feed(LinesTool, LogTool, CropTool, TextTool, ImagesTool, SceneTool, FileTo
         snaps.sort(key=lambda snap: bool(snap["edit"].get("scene")))
         for snap in snaps:
             try:
-                core.save_shot(snap, heads=False)
+                store.save_shot(snap, heads=False)
                 report(snap["name"], None)
             except Exception as e:
                 report(snap["name"], str(e))
         if snaps:
             names = [snap["name"] for snap in snaps]
-            for head in core.refresh_heads(snaps[0]["out"], names, snaps[0].get("cfg"), names):
+            for head in store.refresh_heads(snaps[0]["out"], names, snaps[0].get("cfg"), names):
                 report(head, None)
 
     def saved(self, name, error):
@@ -1268,14 +1271,14 @@ class Feed(LinesTool, LogTool, CropTool, TextTool, ImagesTool, SceneTool, FileTo
     def copy(self):
         name = self.name
         snap = self.snapshot() if self.shot is not None else None
-        path = core.shot_image(self.app.cfg["out"], name)
+        path = store.shot_image(self.app.cfg["out"], name)
         self.note = "копирую…"
         self.update_meta()
 
         def work():
             try:
-                img = core.render_shot(snap)[0] if snap else core.read_image(path)
-                core.copy_image(img)
+                img = store.render_shot(snap)[0] if snap else store.read_image(path)
+                winui.copy_image(img)
                 self.app.inbox.put(("copied", name, None))
             except Exception as e:
                 self.app.inbox.put(("copied", name, str(e)))
@@ -1290,7 +1293,7 @@ class Feed(LinesTool, LogTool, CropTool, TextTool, ImagesTool, SceneTool, FileTo
     def open_folder(self):
         out = self.app.cfg["out"]
         out.mkdir(parents=True, exist_ok=True)
-        path = core.shot_image(out, self.name) if self.name else None
+        path = store.shot_image(out, self.name) if self.name else None
         if path and path.exists():
             subprocess.Popen(["explorer", "/select,", str(path)])
         else:

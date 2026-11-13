@@ -1,4 +1,4 @@
-import core
+import compose
 from theme import FIELD_DEFAULT, SIDES
 from widgets import FramePick, SizePick
 
@@ -9,7 +9,7 @@ class CropTool:
         edit, look = shot["edit"], self.look(shot)[0]
         whole = " · вся сцена" if names else ""
         self.field(body, "Формат" + whole, 0)
-        FramePick(body, look["format"], self.set_frame, lambda: core.plan(shot["bg"], self.look(shot)[0])["base"],
+        FramePick(body, look["format"], self.set_frame, lambda: compose.plan(shot["bg"], self.look(shot)[0])["base"],
                   self.sheet_w).pack(anchor="w")
         self.field(body, "Размер" + whole)
         self.size_pick = SizePick(body, look["size"], self.set_size, self.sheet_w)
@@ -24,7 +24,7 @@ class CropTool:
             self.label(body, "Тёмные полосы сверху и снизу — переходы между СС, чат на них не заходит.", 12)
             return
         join = edit.get("join") or {}
-        side = join.get("side") if join.get("side") in core.JOIN_SIDES else "none"
+        side = join.get("side") if join.get("side") in compose.JOIN_SIDES else "none"
         self.field(body, "Расширить поле кадра", 18)
         self.choice(body, SIDES, side, self.set_field_side)
         if side == "none":

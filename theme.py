@@ -8,7 +8,7 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 import chat
-import core
+import compose
 
 
 VOID = "#0a0a0a"
@@ -126,7 +126,7 @@ def when(name):
 
 def place_name(pos):
     if isinstance(pos, str):
-        return POSITIONS[core.corner_of(pos)].lower()
+        return POSITIONS[compose.corner_of(pos)].lower()
     return next((EDGES[v] for v in pos if isinstance(v, str) and v in EDGES), "своё место")
 
 
@@ -182,7 +182,7 @@ def shade(frame, bands):
     k = np.ones(h, np.float32)
     top, bottom = (min(h, round(b)) for b in bands)
     if top:
-        k[:top] = 0.3 + 0.7 * core.ramp(top)
+        k[:top] = 0.3 + 0.7 * compose.ramp(top)
     if bottom:
-        k[h - bottom:] = np.minimum(k[h - bottom:], 0.3 + 0.7 * core.ramp(bottom)[::-1])
+        k[h - bottom:] = np.minimum(k[h - bottom:], 0.3 + 0.7 * compose.ramp(bottom)[::-1])
     return Image.fromarray((arr * k[:, None, None]).round().astype(np.uint8))
