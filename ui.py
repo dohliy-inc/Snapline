@@ -47,6 +47,8 @@ FORMATS = {"square": "Квадрат", "full": "Экран", "16:9": "16:9", "4:
 SIZES = {"native": "Как снято", "hd": "720", "fhd": "1080", "qhd": "1440", "4k": "2160"}
 FILES = {"jpg": "JPG", "png": "PNG"}
 STYLES = {"none": "Нет", "cctv": "Камера наблюдения", "body": "Бодикам"}
+UNDO_MAX = 200
+UNDO_MERGE_S = 0.8
 NICKS = {"no": "Показывать", "yes": "Прятать"}
 CROPS = {"free": "Свободно", "1:1": "Квадрат", "4:3": "4:3", "3:4": "3:4", "16:9": "16:9", "9:16": "9:16"}
 HANDLES = ("l", "r", "t", "b", "lt", "rt", "lb", "rb")
@@ -709,6 +711,7 @@ class Feed:
         self.note = ""
         self.save_job = None
         self.saves = {}
+        self.history, self.future, self.known, self.last_push, self.replaying = [], [], {}, None, False
         self.whole = False
         self.save_queue = queue.Queue()
         threading.Thread(target=self.save_loop, daemon=True).start()
@@ -818,6 +821,7 @@ class Feed:
         if self.cache.get(name):
             return
         self.cache[name] = shot or False
+        self.remember(shot)
         keep = set(self.scene_names()) | {self.name}
         while len(self.cache) > 6 + len(keep):
             old = next((n for n in self.cache if n not in keep), None)
@@ -837,6 +841,7 @@ class Feed:
             self.c.after_cancel(self.save_job)
             self.save_job = None
         self.cache.pop(name, None)
+        self.forget(name)
         self.refresh_names()
         if self.drag is None:
             self.index, self.tool, self.offset = 1, None, 0
@@ -1047,6 +1052,7 @@ class Feed:
                 shot = None
             if shot:
                 self.cache[name] = shot
+                self.remember(shot)
         return shot or None
 
     def fetch_scene(self):
@@ -2595,6 +2601,7 @@ class Feed:
             except (OSError, ValueError):
                 shot = None
             self.cache[name] = shot or False
+            self.remember(shot)
         self.c.config(cursor="")
         shots, gone = [shot for _, shot in self.members()], 0
         for shot, dup in zip(shots, core.repeats(shots)):
@@ -3079,12 +3086,74 @@ class Feed:
         shot = shot or self.target
         if shot is None:
             return
+        self.record(shot)
         self.note = "сохраняю…"
         self.update_meta()
         if self.save_job:
             self.c.after_cancel(self.save_job)
         self.saves[shot["name"]] = shot
         self.save_job = self.c.after(450, self.save_now)
+
+    @staticmethod
+    def state_of(shot):
+        edit = json.loads(json.dumps(shot["edit"]))
+        marks = json.loads(json.dumps([[r["keep"], r.get("hide") or [], r.get("drop") or []] for r in shot["rows"]]))
+        return {"edit": edit, "marks": marks, "key": json.dumps([edit, marks], sort_keys=True)}
+
+    def remember(self, shot):
+        if shot and shot["name"] not in self.known:
+            self.known[shot["name"]] = self.state_of(shot)
+
+    def forget(self, name):
+        self.known.pop(name, None)
+        self.history = [h for h in self.history if h[0] != name]
+        self.future = [h for h in self.future if h[0] != name]
+
+    def record(self, shot):
+        name, new = shot["name"], self.state_of(shot)
+        old = self.known.get(name)
+        self.known[name] = new
+        if self.replaying or old is None or old["key"] == new["key"]:
+            return
+        if len(old["marks"]) != len(new["marks"]):
+            self.forget(name)
+            self.known[name] = new
+            return
+        keys = {k for k in old["edit"].keys() | new["edit"].keys() if old["edit"].get(k) != new["edit"].get(k)}
+        keys |= {"marks"} if old["marks"] != new["marks"] else set()
+        now = time.monotonic()
+        last = self.last_push
+        if not (last and last[0] == name and last[1] == keys and now - last[2] < UNDO_MERGE_S):
+            self.history.append((name, old))
+            del self.history[:-UNDO_MAX]
+        self.last_push = (name, keys, now)
+        self.future.clear()
+
+    def undo(self, back=True):
+        src, dst = (self.history, self.future) if back else (self.future, self.history)
+        scope = {self.name, *self.scene_names()}
+        k = next((k for k in range(len(src) - 1, -1, -1) if src[k][0] in scope), None)
+        shot = None if k is None else self.member(src[k][0])
+        if shot is None:
+            self.note = "нечего отменять" if back else "нечего вернуть"
+            self.update_meta()
+            return
+        name, state = src.pop(k)
+        dst.append((name, self.known.get(name) or self.state_of(shot)))
+        shot["edit"].clear()
+        shot["edit"].update(json.loads(json.dumps(state["edit"])))
+        for r, (keep, hide, drop) in zip(shot["rows"], state["marks"]):
+            r["keep"], r["hide"], r["drop"] = keep, [tuple(w) for w in hide], [tuple(w) for w in drop]
+        self.last_push, self.replaying = None, True
+        try:
+            self.schedule_save(shot)
+        finally:
+            self.replaying = False
+        self.note = "отменено" if back else "возвращено"
+        self.close_popup()
+        self.redraw()
+        if self.previewing():
+            self.want_preview()
 
     def flush_save(self):
         if self.save_job:
@@ -3184,6 +3253,8 @@ class Feed:
             self.toggle_tool(self.tool)
         elif e.keycode == 67 and e.state & 0x4 and self.index > 0:
             self.copy()
+        elif e.keycode in (89, 90) and e.state & 0x4 and self.shot is not None and self.drag is None:
+            self.undo(back=e.keycode == 90 and not e.state & 0x1)
         elif 49 <= e.keycode < 49 + len(TOOLS) and self.shot is not None and self.index > 0:
             self.toggle_tool(TOOLS[e.keycode - 49])
 

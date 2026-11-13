@@ -54,6 +54,16 @@ def popup_hide(feed):
     feed.popup_pick("hide")
 
 
+class Key:
+    def __init__(self, keycode, state):
+        self.keycode, self.state, self.keysym, self.widget = keycode, state, "", None
+
+
+def expect(ok, what):
+    if not ok:
+        raise AssertionError(what)
+
+
 def scene(feed):
     feed.set_scene(list(reversed(NAMES)), [dict(core.SEAM)])
     feed.toggle_tool("scene")
@@ -82,9 +92,16 @@ def main():
         (lambda: feed.log_show("all"), 600),
         (lambda: feed.toggle_tool("crop"), 1000),
         (lambda: feed.set_frame("800x800"), 1500),
+        (lambda: feed.key(Key(90, 0x4)), 1200),
+        (lambda: expect(feed.shot["edit"]["format"] != "800x800", "Ctrl+Z did not undo the frame"), 100),
+        (lambda: feed.key(Key(89, 0x4)), 1200),
+        (lambda: expect(feed.shot["edit"]["format"] == "800x800", "Ctrl+Y did not redo the frame"), 100),
         (lambda: feed.set_frame("square"), 1000),
         (lambda: feed.toggle_tool("text"), 1000),
-        (lambda: feed.change_text(text_scale=1.3), 800),
+        (lambda: [feed.change_text(text_scale=v) for v in (1.1, 1.2, 1.3)], 800),
+        (lambda: feed.undo(), 800),
+        (lambda: expect(feed.shot["edit"]["text_scale"] not in (1.1, 1.2, 1.3), "slider burst is not one undo step"), 100),
+        (lambda: feed.undo(back=False), 800),
         (lambda: feed.toggle_tool("images"), 1000),
         (lambda: feed.add_image(Image.new("RGB", (400, 300), (40, 120, 200))), 1200),
         (lambda: feed.change_ov(alpha=0.8), 800),
