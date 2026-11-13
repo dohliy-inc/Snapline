@@ -26,6 +26,7 @@ from PIL import Image
 import chat
 import chatlog
 import core
+import styles
 
 SAMPLES = Path(__file__).resolve().parent / "tests" / "fixtures"
 A, S, O, SP, AC = chat.AME, chat.SYSTEM, chat.OOC, chat.SPEECH, chat.ACTION
@@ -565,6 +566,29 @@ def check_grain():
     assert np.abs(kept.mean((0, 1)) - plain.mean((0, 1))).max() < 0.5
 
 
+def check_styles():
+    cfg = make_cfg(".")
+    bg, shot = load("real_bg.webp"), load("real_chat_ic.png")
+    rows = chat.classify(chat.extract_rows(shot), cfg["keep"])
+    edit = core.new_edit(cfg, rows)
+    plain = core.render(bg, rows, edit)[0]
+    when = datetime(2026, 11, 13, 2, 16, 56)
+    for style in ("cctv", "body"):
+        frame, p = core.backdrop(bg, edit)
+        styled, marks = styles.apply(frame, style, when, None)
+        assert styled.shape == frame.shape and styled.dtype == np.uint8 and len(marks) == 3, (style, marks)
+        found = []
+        core.paint_chat(styled, rows, edit, p, boxes=list(marks), found=found)
+        _, x, y, w, h = found[0]
+        pad = p["outline"] + 2
+        assert not any(b[0] < x + w - pad and x + pad < b[2] and b[1] < y + h - pad and y + pad < b[3]
+                       for b in marks), (style, found, marks)
+        out = core.render(bg, rows, dict(edit, style=style, style_text="CAM 7"), when=when)[0]
+        assert out.shape == plain.shape and np.abs(out.astype(int) - plain.astype(int)).mean() > 5
+    assert styles.apply(plain, "none", when, None)[0] is plain
+    assert len(styles.apply(plain, "cctv", None, "")[1]) == 1
+
+
 def check_watermark():
     bg, shot = load("real_bg.webp"), load("real_chat_ic.png")
     mark = core.watermark(shot)
@@ -783,6 +807,7 @@ if __name__ == "__main__":
     check_join()
     check_quality()
     check_grain()
+    check_styles()
     check_scene()
     check_log()
     print("ok")

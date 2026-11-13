@@ -18,6 +18,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageGrab
 
 import chat
+import styles
 
 VERSION = "1.4"
 RELEASES = "https://github.com/dohliy-inc/Snapline/releases/latest"
@@ -60,7 +61,7 @@ SRC_BG = (".jpg", {"quality": 95, "subsampling": 0})
 SRC_CHAT = (".webp", {"lossless": True, "quality": 0, "method": 1})
 CHAT_POSITIONS = ("top-left", "top-right", "bottom-left", "bottom-right")
 LAYOUT_KEYS = ("format", "zoom", "center", "pos", "places", "size", "file", "quality", "text_scale", "outline",
-               "margin", "overlays", "join", "scene")
+               "margin", "overlays", "join", "scene", "style", "style_text")
 JOIN_SIDES = {"left": Image.Transpose.FLIP_LEFT_RIGHT, "right": None, "top": Image.Transpose.TRANSVERSE,
               "bottom": Image.Transpose.TRANSPOSE}
 MAX_OVERLAYS = 4
@@ -701,23 +702,31 @@ def stack(frames, seams):
     return out, {"tops": tops, "heights": hs, "laps": laps}
 
 
-def render(bg, rows, edit, src=None, rough=None, scene=None, layout=None):
+def styled(frame, edit, when):
+    return styles.apply(frame, edit.get("style"), when, edit.get("style_text"))
+
+
+def render(bg, rows, edit, src=None, rough=None, scene=None, layout=None, when=None):
     if rows and bg.shape[1] != rows[0]["screen_w"]:
         raise ValueError(f"фон шириной {bg.shape[1]} px, а чат снят на экране {rows[0]['screen_w']} px")
     if not scene:
         frame, p = backdrop(bg, edit, src)
+        frame, marks = styled(frame, edit, when)
         if rough:
             frame = jpeg_pass(frame, rough)
-        img, painted = paint_chat(frame, rows, edit, p)
+        img, painted = paint_chat(frame, rows, edit, p, boxes=marks)
         return (frame.copy() if img is frame else img), painted
     frame, p = backdrop(bg, framed(edit, edit), src)
-    frames = []
+    frames, marks = [], []
     for other in scene[0]:
         if other is None:
-            frames.append((frame, p, rows, edit))
+            f, q, r, e, t = frame, p, rows, edit, when
         else:
             f, q = backdrop(other["bg"], framed(other["edit"], edit), other["out"] / "src", frame.shape[1])
-            frames.append((f, q, other["rows"], other["edit"]))
+            r, e, t = other["rows"], other["edit"], shot_time(other.get("name"))
+        f, b = styled(f, edit, t)
+        frames.append((f, q, r, e))
+        marks.append(b)
     img, where = stack([f for f, _, _, _ in frames], scene[1])
     if layout is not None:
         layout.update(where)
@@ -727,6 +736,7 @@ def render(bg, rows, edit, src=None, rough=None, scene=None, layout=None):
     for k, ((f, _, _, _), top) in enumerate(zip(frames, where["tops"])):
         a, b = inset(where["laps"], k)
         spans.append((top + a, top + f.shape[0] - b))
+        taken[k] = [(x0, y0 - a, x1, y1 - a) for x0, y0, x1, y1 in marks[k]]
     homes = scene[2] if len(scene) > 2 else list(range(len(frames)))
     for k, (f, q, r, e) in enumerate(frames):
         found = []
@@ -1145,7 +1155,8 @@ def scenes_with(out, name):
 
 
 def render_shot(shot, rough=None, layout=None):
-    return render(shot["bg"], shot["rows"], shot["edit"], shot["out"] / "src", rough, scene_of(shot), layout)
+    return render(shot["bg"], shot["rows"], shot["edit"], shot["out"] / "src", rough, scene_of(shot), layout,
+                  shot_time(shot.get("name")))
 
 
 def donors(out, name, names, limit=12):

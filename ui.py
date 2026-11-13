@@ -25,6 +25,7 @@ from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageGra
 import chat
 import chatlog
 import core
+import styles
 
 VOID = "#0a0a0a"
 BLACK = "#000000"
@@ -45,6 +46,7 @@ CHROME_TEXT = {"min": "–", "max": "□", "restore": "❐", "close": "×"}
 FORMATS = {"square": "Квадрат", "full": "Экран", "16:9": "16:9", "4:3": "4:3", "4:5": "4:5"}
 SIZES = {"native": "Как снято", "hd": "720", "fhd": "1080", "qhd": "1440", "4k": "2160"}
 FILES = {"jpg": "JPG", "png": "PNG"}
+STYLES = {"none": "Нет", "cctv": "Камера наблюдения", "body": "Бодикам"}
 NICKS = {"no": "Показывать", "yes": "Прятать"}
 CROPS = {"free": "Свободно", "1:1": "Квадрат", "4:3": "4:3", "3:4": "3:4", "16:9": "16:9", "9:16": "9:16"}
 HANDLES = ("l", "r", "t", "b", "lt", "rt", "lb", "rb")
@@ -734,6 +736,7 @@ class Feed:
         self.preview_info = None
         self.preview_rev = 0
         self.preview_job = None
+        self.style_job = None
         self.preview_photo = None
         self.preview_rect = None
         self.preview_view = None
@@ -1838,7 +1841,19 @@ class Feed:
 
     def sheet_file(self, body):
         edit = self.shot["edit"]
-        self.field(body, "Формат", 0)
+        style = edit.get("style") if edit.get("style") in STYLES else "none"
+        self.field(body, "Стиль · тест", 0)
+        self.choice(body, STYLES, style, self.set_style)
+        if style != "none":
+            self.field(body, "Надпись")
+            entry = tk.Entry(body, bg=ROW, fg=WHITE, insertbackground=WHITE, relief="flat", font=(FONT["ui"], 10),
+                             highlightthickness=1, highlightbackground=LINE, highlightcolor=WHITE)
+            text = edit.get("style_text")
+            entry.insert(0, styles.LABELS[style] if text is None else text)
+            entry.pack(fill="x", ipady=px(4))
+            entry.bind("<KeyRelease>", lambda _: self.typed_style(entry))
+            self.label(body, "Дата и время — из момента съёмки. Чат остаётся чётким и обходит надписи.", 6)
+        self.field(body, "Формат")
         self.choice(body, FILES, edit["file"], self.set_file)
         if edit["file"] == "jpg":
             self.field(body, "Качество фона")
@@ -1854,6 +1869,16 @@ class Feed:
     def set_file(self, value):
         self.change(file=value)
         self.redraw()
+
+    def set_style(self, value):
+        self.change(style=value, style_text=None)
+        self.redraw()
+
+    def typed_style(self, entry):
+        if self.style_job:
+            self.c.after_cancel(self.style_job)
+        self.style_job = self.c.after(300, lambda: entry.winfo_exists() and self.change(
+            style_text=entry.get().strip()[:styles.TEXT_MAX]))
 
     def sheet_scene(self, body):
         scene, names = self.shot["edit"].get("scene"), self.scene_names()
