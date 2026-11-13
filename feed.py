@@ -27,6 +27,7 @@ from tools.logpick import LogTool
 from tools.scene import SceneTool
 from tools.style import StyleTool
 from tools.text import TextTool
+from tour import Tour
 
 
 class Feed(LinesTool, LogTool, CropTool, TextTool, ImagesTool, SceneTool, FileTool, StyleTool, BlurTool):
@@ -57,6 +58,7 @@ class Feed(LinesTool, LogTool, CropTool, TextTool, ImagesTool, SceneTool, FileTo
         self.hint_photo = None
         self.active_ov = 0
         self.active_blur = 0
+        self.tour = None
         self.loading = set()
         self.offset = 0
         self.last_wheel = 0.0
@@ -165,6 +167,8 @@ class Feed(LinesTool, LogTool, CropTool, TextTool, ImagesTool, SceneTool, FileTo
             self.cache.pop(old)
         if name == self.name:
             self.shot = shot
+            if shot and self.tour is None and self.app.cfg["tour"]:
+                self.tour = Tour(self, lambda: self.app.set("tour", "no"))
             self.redraw()
             self.fetch_next()
         elif self.shot is not None and self.drag is None and name in self.scene_names() and self.tool in EDITS:
@@ -206,6 +210,18 @@ class Feed(LinesTool, LogTool, CropTool, TextTool, ImagesTool, SceneTool, FileTo
             self.draw_ready(W, H)
         else:
             self.draw_item(W, H)
+        if self.tour:
+            self.tour.draw()
+
+    def start_tour(self):
+        if not self.names:
+            self.note = "Сначала сними СС: обучение проходит по редактору"
+            return
+        self.tour = Tour(self, lambda: self.app.set("tour", "no"))
+        if self.index == 0:
+            self.go(1)
+        else:
+            self.redraw()
 
     def text(self, x, y, s, font, fill=WHITE, width=None, tags=("cap",)):
         item = self.c.create_text(x, y, text=s, font=font, fill=fill, anchor="nw", width=width, tags=tags)
@@ -533,9 +549,9 @@ class Feed(LinesTool, LogTool, CropTool, TextTool, ImagesTool, SceneTool, FileTo
         elif self.empty_log():
             hint = "Чат пока пустой: открой «Строки» клавишей 1 и отметь нужные строки чатлога."
         elif self.scene_names():
-            hint = "Это сцена из нескольких СС. Инструменты — справа или клавишами 1–6, колесо листает СС."
+            hint = "Это сцена из нескольких СС. Инструменты — справа или клавишами 1–8, колесо листает СС."
         else:
-            hint = "Инструменты — справа или клавишами 1–6. Колесо листает СС."
+            hint = "Инструменты — справа или клавишами 1–8. Колесо листает СС."
         self.text(x, y, hint, (FONT["ui"], 10), SUB, width)
         self.lift_block("cap", H - theme.PAD - px(12))
 
@@ -744,6 +760,8 @@ class Feed(LinesTool, LogTool, CropTool, TextTool, ImagesTool, SceneTool, FileTo
             if bar.winfo_exists():
                 bar.set(value())
         self.update_meta()
+        if self.tour:
+            self.tour.draw()
 
     def want_preview(self):
         self.preview_rev += 1
@@ -803,7 +821,7 @@ class Feed(LinesTool, LogTool, CropTool, TextTool, ImagesTool, SceneTool, FileTo
 
     def press(self, e):
         tags = self.tags_here()
-        if any(t.startswith(("rail", "nav", "older")) for t in tags) or self.shot is None or self.index == 0:
+        if any(t.startswith(("rail", "nav", "older", "tour")) for t in tags) or self.shot is None or self.index == 0:
             return
         row = next((t for t in tags if re.fullmatch(r"row\d+", t)), None)
         cut = next((t for t in tags if re.fullmatch(r"cut\d+", t)), None)
@@ -1024,6 +1042,8 @@ class Feed(LinesTool, LogTool, CropTool, TextTool, ImagesTool, SceneTool, FileTo
             return
         tags = self.tags_here()
         rail = next((t[5:] for t in tags if t.startswith("rail-")), None)
+        if any(t.startswith("tour") for t in tags):
+            return
         if rail or any(t.startswith(("rail", "nav", "older")) for t in tags):
             self.loupe.hide()
             self.hint(RAIL_HINTS.get(rail))
@@ -1281,6 +1301,8 @@ class Feed(LinesTool, LogTool, CropTool, TextTool, ImagesTool, SceneTool, FileTo
             self.go(self.index - 1)
         elif e.keysym in ("Down", "Next"):
             self.go(self.index + 1)
+        elif e.keysym == "Escape" and self.tour:
+            self.tour.finish()
         elif e.keysym == "Escape" and self.popup:
             self.close_popup()
         elif e.keysym == "Escape" and self.tool:

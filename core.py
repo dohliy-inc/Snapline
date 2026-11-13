@@ -50,6 +50,7 @@ DEFAULTS = {
     "source": "screen",
     "tray": "yes",
     "tray_hint": "yes",
+    "tour": "yes",
 }
 SIZES = {"native": None, "hd": 720, "fhd": 1080, "qhd": 1440, "4k": 2160}
 SIDE_RANGE = (360, 4320)
@@ -281,6 +282,7 @@ def parse_config(raw):
         "source": source,
         "tray": _bool(raw, "tray"),
         "tray_hint": _bool(raw, "tray_hint"),
+        "tour": _bool(raw, "tour"),
     }
 
 

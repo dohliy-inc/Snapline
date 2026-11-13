@@ -174,6 +174,12 @@ class App:
             self.settings.update_src()
             self.settings.draw_example()
 
+    def start_tour(self):
+        self.set("tour", "yes")
+        self.show("feed")
+        self.feed.start_tour()
+        self.feed.update_meta()
+
     def set(self, key, value):
         raw = dict(self.raw, **{key: value})
         try:

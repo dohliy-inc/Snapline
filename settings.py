@@ -252,6 +252,9 @@ class Settings:
                                       justify="left", wraplength=self.list_w - self.label_w - px(10))
         self.chatlog_state.pack(fill="x", pady=(px(4), 0))
         Pill(control, "Открыть", self.open_chatlog, kind="ghost").pack(anchor="w", pady=(px(8), 0))
+        self.section(f, "Помощь")
+        control, _, _ = self.row(f, "Обучение", "Короткий тур по редактору на последней СС")
+        Pill(control, "Показать", self.app.start_tour, kind="ghost").pack(anchor="w")
 
     def set_chatlog(self, value):
         self.app.set("chatlog", value)

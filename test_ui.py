@@ -30,7 +30,7 @@ def prepare(work):
     (shots / "chatlog").mkdir(parents=True)
     core.CONFIG_PATH = work / "config.ini"
     core.write_raw(dict(core.DEFAULTS, output=str(shots), sound="no", chatlog="no", source="screen", file="jpg",
-                        tray="no"))
+                        tray="no", tour="no"))
     cfg = core.load_config()[1]
     for name in NAMES:
         state = {"session": core.Session()}
@@ -146,6 +146,19 @@ def main():
         (lambda: feed.set_whole("one"), 1000),
         (lambda: feed.toggle_tool("text"), 800),
         (lambda: app.show("settings"), 1000),
+        (lambda: app.start_tour(), 1500),
+        (lambda: expect(feed.tour is not None and feed.tour.k == 0 and feed.c.find_withtag("tour"), "tour did not start"), 100),
+        (lambda: feed.tour.next(), 600),
+        (lambda: feed.toggle_tool("lines"), 1200),
+        (lambda: expect(feed.tour.k == 2, f"tour did not move on after opening Lines: step {feed.tour.k}"), 100),
+        (lambda: [feed.tour.next() for _ in range(4)], 800),
+        (lambda: expect(feed.tour.k == 6 and feed.c.find_withtag("tour-next"), "tour did not reach the last step"), 100),
+        (lambda: feed.tour.next(), 600),
+        (lambda: expect(feed.tour is None and not app.cfg["tour"], "finishing the tour did not save it as done"), 100),
+        (lambda: app.start_tour(), 1200),
+        (lambda: feed.key(Key(27, 0, "Escape")), 600),
+        (lambda: expect(feed.tour is None and not feed.c.find_withtag("tour"), "Escape did not close the tour"), 100),
+        (lambda: feed.toggle_tool("lines"), 800),
         (lambda: app.show("feed"), 800),
         (lambda: feed.go(2), 1500),
     ]
