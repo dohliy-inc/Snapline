@@ -615,6 +615,13 @@ def check_scene():
         box = [c for c in there["chats"] if c[0] == 1][0]
         theirs = [c for c in there["chats"] if c[0] == 2][0]
         assert theirs[3] >= box[3] + box[5] - 2 * there["pads"][1] and box[3] + there["pads"][1] > 2448, (box, theirs)
+        cut = len(whole["rows"]) // 2
+        split, apart = dict(whole, edit=dict(whole["edit"], breaks=[cut], home=[None, last])), {}
+        core.render_shot(split, layout=apart)
+        mine = sorted((c for c in apart["chats"] if c[0] == 1), key=lambda c: c[1])
+        assert cut and len(mine) == 2 and 1296 <= mine[0][3] < 2448 <= mine[1][3] + apart["pads"][1], mine
+        assert core.homes_of(whole["rows"], {"breaks": [cut], "home": [None]}) == [None, None]
+        assert core.homes_of(whole["rows"], {"breaks": [cut], "home": last}) == [last, last]
         seam, where = dict(whole, edit=dict(whole["edit"], pos=[0.1, 1.02])), {}
         core.render_shot(seam, layout=where)
         box = [c for c in where["chats"] if c[0] == 1][0]

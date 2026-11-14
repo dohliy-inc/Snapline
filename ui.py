@@ -2115,13 +2115,15 @@ class Feed:
                                    fill=WHITE if name == current else SUB, tags=("shot", tag))
                 if shot and shot["rows"]:
                     names, home = self.scene_names(), f"home{j}"
-                    at = shot["edit"].get("home")
-                    n = names.index(at) + 1 if at in names else k + 1
-                    self.c.create_text(ax + aw - px(16), y + slot / 2 + px(2), text=f"чат на СС {n}", anchor="e",
-                                       font=(FONT["semi"], 9), fill=WHITE if n != k + 1 else SUB, tags=("shot", home))
+                    at = sorted({names.index(h) + 1 if h in names else k + 1
+                                 for h in core.homes_of(shot["rows"], shot["edit"])})
+                    moved = at != [k + 1]
+                    self.c.create_text(ax + aw - px(16), y + slot / 2 + px(2),
+                                       text="чат на СС " + ", ".join(map(str, at)), anchor="e",
+                                       font=(FONT["semi"], 9), fill=WHITE if moved else SUB, tags=("shot", home))
                     self.c.tag_bind(home, "<Enter>", lambda _, t=home: (self.c.itemconfig(t, fill=WHITE),
                                                                         self.c.config(cursor="hand2")))
-                    self.c.tag_bind(home, "<Leave>", lambda _, t=home, c=WHITE if n != k + 1 else SUB: (
+                    self.c.tag_bind(home, "<Leave>", lambda _, t=home, c=WHITE if moved else SUB: (
                         self.c.itemconfig(t, fill=c), self.c.config(cursor="")))
                 self.c.tag_bind(tag, "<Enter>", lambda _: self.c.config(cursor="hand2"))
                 self.c.tag_bind(tag, "<Leave>", lambda _: self.c.config(cursor=""))
@@ -2397,10 +2399,12 @@ class Feed:
         rows, edit = shot["rows"], shot["edit"]
         breaks = core.cuts(rows, edit)
         spots = core.places(edit, len(breaks) + 1)[1:]
+        homes = core.homes_of(rows, edit)
         if i in breaks:
             k = breaks.index(i)
             breaks.pop(k)
             spots.pop(k)
+            homes.pop(k + 1)
         else:
             k = sorted(breaks + [i]).index(i)
             used = [edit["pos"]] + spots
@@ -2408,7 +2412,10 @@ class Feed:
             free = [c for c in order if c not in used]
             breaks.insert(k, i)
             spots.insert(k, free[0] if free else core.corner_of(used[k]))
+            homes.insert(k + 1, homes[k])
         edit["breaks"], edit["places"] = breaks, spots
+        if isinstance(edit.get("home"), list):
+            edit["home"] = homes
         self.draw_lines(self.area())
         self.count.config(text=self.count_text())
         self.schedule_save(shot)
@@ -2867,10 +2874,13 @@ class Feed:
             spots = core.places(edit, len(core.parts(shot["rows"], edit)))[1:]
             spots[part - 1] = pos
             edit["places"] = spots
-        edit["home"] = None if j == k else names[j]
+        at = core.homes_of(shot["rows"], edit)
+        at[part] = None if j == k else names[j]
+        edit["home"] = at if len(set(at)) > 1 else at[0]
         self.schedule_save(shot)
         self.want_preview()
-        self.note = f"чат СС {k + 1} теперь на СС {j + 1}" if j != k else ""
+        what = f"часть {part + 1} чата СС {k + 1}" if len(at) > 1 else f"чат СС {k + 1}"
+        self.note = f"{what} теперь на СС {j + 1}" if j != k else ""
         self.update_meta()
 
     def next_home(self, j):
@@ -2878,7 +2888,7 @@ class Feed:
         names = [n for n, _ in self.loaded_members()]
         if shot is None or len(names) < 2:
             return
-        at = shot["edit"].get("home")
+        at = core.homes_of(shot["rows"], shot["edit"])[0]
         now = names.index(at) if at in names else names.index(name)
         to = names[(now + 1) % len(names)]
         shot["edit"]["home"] = None if to == name else to

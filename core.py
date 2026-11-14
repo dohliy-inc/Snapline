@@ -19,7 +19,7 @@ from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageGrab
 
 import chat
 
-VERSION = "1.4"
+VERSION = "1.4.1"
 RELEASES = "https://github.com/dohliy-inc/Snapline/releases/latest"
 APP_DIR = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent
 RES_DIR = Path(getattr(sys, "_MEIPASS", APP_DIR))
@@ -364,6 +364,13 @@ def places(edit, count):
     return [first] + extra[:count - 1]
 
 
+def homes_of(rows, edit):
+    count, home = len(cuts(rows, edit)) + 1, edit.get("home")
+    if not isinstance(home, list):
+        return [home] * count
+    return (home + home[-1:] * count)[:count] if home else [None] * count
+
+
 def parts(rows, edit):
     bounds = [0] + cuts(rows, edit) + [len(rows)]
     spans = list(zip(bounds, bounds[1:]))
@@ -642,13 +649,15 @@ def chat_spots(size, layers, spots, pad, margin, boxes=None, span=None):
 
 
 def paint_chat(img, rows, edit, p, window=None, boxes=None, found=None):
-    y0, y1 = window or (0, img.shape[0])
     groups = parts(rows, edit)
-    made = [chat.chat_layer(part, p["outline"], p["scale"], y1 - y0 - 2 * p["margin"]) for part, _ in groups]
-    spots = chat_spots((img.shape[1], y1 - y0), [m[0] for m in made], [pos for _, pos in groups], p["outline"] + 2,
-                       p["margin"], boxes, (-y0, img.shape[0] - y0) if window else None)
+    boxes = [] if boxes is None else boxes
+    wins, held = (window, boxes) if isinstance(window, list) else ([window] * len(groups), [boxes] * len(groups))
     painted = 0
-    for k, ((layer, n, _), spot) in enumerate(zip(made, spots)):
+    for k, ((part, pos), win, taken) in enumerate(zip(groups, wins, held)):
+        y0, y1 = win or (0, img.shape[0])
+        layer, n, _ = chat.chat_layer(part, p["outline"], p["scale"], y1 - y0 - 2 * p["margin"])
+        spot = chat_spots((img.shape[1], y1 - y0), [layer], [pos], p["outline"] + 2, p["margin"], taken,
+                          (-y0, img.shape[0] - y0) if win else None)[0]
         if layer is not None:
             img, painted = chat.blend(img, layer, spot[0], spot[1] + y0), painted + n
             if found is not None:
@@ -729,8 +738,10 @@ def render(bg, rows, edit, src=None, rough=None, scene=None, layout=None):
         spans.append((top + a, top + f.shape[0] - b))
     homes = scene[2] if len(scene) > 2 else list(range(len(frames)))
     for k, (f, q, r, e) in enumerate(frames):
-        found = []
-        img, n = paint_chat(img, r, e, q, spans[homes[k]], taken.setdefault(homes[k], []), found)
+        found, want = [], len(cuts(r, e)) + 1
+        at = homes[k] if isinstance(homes[k], list) else [homes[k]]
+        at = (at + at[-1:] * want)[:want]
+        img, n = paint_chat(img, r, e, q, [spans[h] for h in at], [taken.setdefault(h, []) for h in at], found)
         chats += [(k,) + box for box in found]
         painted = n if e is edit else painted
     if layout is not None:
@@ -1118,8 +1129,8 @@ def scene_of(shot):
             seams.append(dict(SEAM, **given[k - 1]) if k - 1 < len(given) else dict(SEAM))
         frames.append(other)
         names.append(n)
-    homes = [names.index(h) if h in names else k
-             for k, h in enumerate((f or shot)["edit"].get("home") for f in frames)]
+    homes = [[names.index(h) if h in names else k for h in homes_of(s["rows"], s["edit"])]
+             for k, s in enumerate(f or shot for f in frames)]
     return (frames, seams, homes, names) if len(frames) > 1 else None
 
 
