@@ -76,13 +76,15 @@ class LinesTool:
                                    fill=WHITE if name == current else SUB, tags=("shot", tag))
                 if shot and shot["rows"]:
                     names, home = self.scene_names(), f"home{j}"
-                    at = shot["edit"].get("home")
-                    n = names.index(at) + 1 if at in names else k + 1
-                    self.c.create_text(ax + aw - px(16), y + slot / 2 + px(2), text=f"чат на СС {n}", anchor="e",
-                                       font=(FONT["semi"], 9), fill=WHITE if n != k + 1 else SUB, tags=("shot", home))
+                    at = sorted({names.index(h) + 1 if h in names else k + 1
+                                 for h in compose.homes_of(shot["rows"], shot["edit"])})
+                    moved = at != [k + 1]
+                    self.c.create_text(ax + aw - px(16), y + slot / 2 + px(2),
+                                       text="чат на СС " + ", ".join(map(str, at)), anchor="e",
+                                       font=(FONT["semi"], 9), fill=WHITE if moved else SUB, tags=("shot", home))
                     self.c.tag_bind(home, "<Enter>", lambda _, t=home: (self.c.itemconfig(t, fill=WHITE),
                                                                         self.c.config(cursor="hand2")))
-                    self.c.tag_bind(home, "<Leave>", lambda _, t=home, c=WHITE if n != k + 1 else SUB: (
+                    self.c.tag_bind(home, "<Leave>", lambda _, t=home, c=WHITE if moved else SUB: (
                         self.c.itemconfig(t, fill=c), self.c.config(cursor="")))
                 self.c.tag_bind(tag, "<Enter>", lambda _: self.c.config(cursor="hand2"))
                 self.c.tag_bind(tag, "<Leave>", lambda _: self.c.config(cursor=""))
@@ -196,10 +198,12 @@ class LinesTool:
         rows, edit = shot["rows"], shot["edit"]
         breaks = compose.cuts(rows, edit)
         spots = compose.places(edit, len(breaks) + 1)[1:]
+        homes = compose.homes_of(rows, edit)
         if i in breaks:
             k = breaks.index(i)
             breaks.pop(k)
             spots.pop(k)
+            homes.pop(k + 1)
         else:
             k = sorted(breaks + [i]).index(i)
             used = [edit["pos"]] + spots
@@ -207,7 +211,10 @@ class LinesTool:
             free = [c for c in order if c not in used]
             breaks.insert(k, i)
             spots.insert(k, free[0] if free else compose.corner_of(used[k]))
+            homes.insert(k + 1, homes[k])
         edit["breaks"], edit["places"] = breaks, spots
+        if isinstance(edit.get("home"), list):
+            edit["home"] = homes
         self.draw_lines(self.area())
         self.count.config(text=self.count_text())
         self.schedule_save(shot)
@@ -334,7 +341,9 @@ class LinesTool:
             self.update_meta()
             return
         self.tool = "images"
-        self.add_image(Image.fromarray(shot["bg"]))
+        bg = shot["bg"]
+        whole = (0, 0, bg.shape[1], bg.shape[0])
+        self.add_image(Image.fromarray(compose.bg_part(bg, whole, shot["edit"].get("mirror"))))
 
     def carry(self, name):
         self.c.config(cursor="watch")
@@ -399,7 +408,7 @@ class LinesTool:
         names = [n for n, _ in self.loaded_members()]
         if shot is None or len(names) < 2:
             return
-        at = shot["edit"].get("home")
+        at = compose.homes_of(shot["rows"], shot["edit"])[0]
         now = names.index(at) if at in names else names.index(name)
         to = names[(now + 1) % len(names)]
         shot["edit"]["home"] = None if to == name else to

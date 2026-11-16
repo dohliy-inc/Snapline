@@ -10,7 +10,9 @@ from PIL import Image
 
 import chat
 import chatlog
-from compose import MARKS, SCENE_MAX, SEAM, apply_keep, auto_hide, cuts, new_edit, render, shot_time, spans_of
+from compose import (
+    MARKS, SCENE_MAX, SEAM, apply_keep, auto_hide, cuts, homes_of, new_edit, render, shot_time, spans_of,
+)
 from config import FILE_TYPES, RES_DIR, log
 
 TEXT_QUALITY = 92
@@ -191,8 +193,8 @@ def scene_of(shot):
             seams.append(dict(SEAM, **given[k - 1]) if k - 1 < len(given) else dict(SEAM))
         frames.append(other)
         names.append(n)
-    homes = [names.index(h) if h in names else k
-             for k, h in enumerate((f or shot)["edit"].get("home") for f in frames)]
+    homes = [[names.index(h) if h in names else k for h in homes_of(s["rows"], s["edit"])]
+             for k, s in enumerate(f or shot for f in frames)]
     return (frames, seams, homes, names) if len(frames) > 1 else None
 
 
@@ -301,6 +303,10 @@ def save_shot(shot, heads=True):
 
 def refresh_heads(out, names, cfg, skip=()):
     heads = sorted({h for n in names for h in scenes_with(out, n)} - set(skip)) if cfg else []
+    return rerender(out, heads, cfg)
+
+
+def rerender(out, heads, cfg):
     for head in heads:
         try:
             whole = load_shot(out, head, cfg)
@@ -311,6 +317,32 @@ def refresh_heads(out, names, cfg, skip=()):
         except (OSError, ValueError) as e:
             log(f"Сцена {head} не обновилась: {e}", "fail")
     return heads
+
+
+def shot_paths(out, name):
+    own = re.compile(rf"{re.escape(name)}(_bg|_chat\d+|_log|_ov\d+)?")
+    return ([p for p in out.glob(f"{name}.*") if p.suffix[1:].lower() in FILE_TYPES] +
+            [p for p in (out / "src").glob(f"{name}*") if own.fullmatch(p.stem)])
+
+
+def drop_member(edit, name):
+    shots, seams = list(edit["scene"]["shots"]), list(edit["scene"]["seams"])
+    k = shots.index(name)
+    del shots[k]
+    if seams:
+        del seams[min(k, len(seams) - 1)]
+    edit["scene"] = {**edit["scene"], "shots": shots, "seams": seams} if len(shots) > 1 else None
+    return edit
+
+
+def delete_shot(out, name, cfg, recycle):
+    heads = scenes_with(out, name)
+    with FILES:
+        recycle(shot_paths(out, name))
+        for head in heads:
+            edit = drop_member(saved_edit(out, head), name)
+            shot_files(out, head)[2].write_text(json.dumps(edit, ensure_ascii=False), encoding="utf-8")
+    return rerender(out, heads, cfg)
 
 
 def sample_shot(cfg):

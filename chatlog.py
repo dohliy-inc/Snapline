@@ -284,6 +284,16 @@ def drain(target, token, have=0):
     return got
 
 
+def look(pages):
+    views = []
+    for page, context, url in pages:
+        try:
+            views.append((page.evaluate("window.__snaplog && window.__snaplog.dump()", context) or {}, url))
+        except (OSError, RuntimeError, ValueError) as e:
+            views.append(({"path": f"не прочиталось: {e}"}, url))
+    return views
+
+
 def fresh(batch, known):
     tail = list(known)[-MATCH:]
     for j in range(len(batch) - 1, -1, -1) if tail else ():
@@ -338,10 +348,13 @@ class Log:
         except OSError:
             pass
 
-    def dump(self, info, url):
+    def dump(self, views):
         path = self.folder / "dom.html"
-        path.write_text(f"<!-- {url}\n{info.get('path')} -->\n{info.get('html') or ''}", encoding="utf-8",
-                        errors="replace")
+        text = "\n".join(f"<!-- {url}\n{info.get('path')} -->\n{info.get('html') or ''}" for info, url in views)
+        try:
+            path.write_text(text, encoding="utf-8", errors="replace")
+        except OSError:
+            pass
         return path
 
 
@@ -511,13 +524,14 @@ def run(port, mark, folder, stop, report=say):
                     if chat is None:
                         note("Чат пока не найден: напиши что-нибудь в игре, чтобы появились строки")
                         if time.monotonic() - since > RESCAN_S:
+                            log.dump(look(pages))
                             break
                         stop.wait(POLL_S)
                         continue
                     for page, _, _ in pages:
                         if page is not chat[0]:
                             page.ws.close()
-                    log.dump(chat[0].evaluate("window.__snaplog.dump()", chat[1]), chat[2])
+                    log.dump(look([chat]))
                     log.status(f"Страница чата: {chat[2]}")
                     note(f"Чат найден, пишу. Строк в логе: {total}")
                 else:

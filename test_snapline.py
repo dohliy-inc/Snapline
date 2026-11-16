@@ -500,6 +500,69 @@ def check_order():
         assert store.list_shots(out) == names[::-1] + ["SS_моя"], store.list_shots(out)
 
 
+def check_mirror_delete():
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp)
+        cfg = make_cfg(out)
+        bg = load("real_bg.webp")
+        edit = compose.new_edit(cfg, [])
+        plain = compose.render(bg, [], edit)[0]
+        assert np.array_equal(compose.render(bg, [], dict(edit, mirror=True))[0], plain[:, ::-1])
+        assert compose.mirror_blurs([{"x": 0.1, "y": 0.2, "w": 0.3, "h": 0.1}], compose.plan(bg, edit))[0]["x"] == 0.6
+        assert compose.tilt_zoom((100, 100), 45) > 1.414 and compose.tilt_zoom((160, 90), 0) == 1.0
+        band = np.zeros((400, 400, 3), np.uint8)
+        band[195:205] = 255
+        bent = np.asarray(compose.tilt_image(Image.fromarray(band), 20, (400, 400)))
+        assert bent[236, 300].min() > 200 and bent[164, 100].min() > 200 and bent[200, 300].max() < 50
+        white = np.asarray(compose.tilt_image(Image.new("RGB", (160, 90), (255, 255, 255)), 25, (160, 90)))
+        assert white.min() > 250, white.min()
+        steep = compose.render(bg, [], dict(edit, tilt=10))[0]
+        assert steep.shape == plain.shape and not np.array_equal(steep, plain)
+        half = np.zeros((20, 40, 4), np.uint8)
+        half[..., 3] = 255
+        half[:, :20, 0] = half[:, 20:, 2] = 255
+        ov = dict(compose.add_overlay(out, "SS_m", Image.fromarray(half)), crop=[0.0, 0.0, 0.5, 1.0], w=0.2)
+        src = out / "src" / ov["file"]
+        compose.flip_overlay(ov)
+        assert ov["crop"] == [0.5, 0.0, 1.0, 1.0] and compose.overlay_image(src, ov=ov).getpixel((0, 0))[2] > 200
+        compose.flip_overlay(ov)
+        assert ov["crop"] == [0.0, 0.0, 0.5, 1.0] and not ov["flip"] and ov["angle"] == 0
+        whole = compose.overlay_image(src, ov=ov)
+        up = np.asarray(compose.spin(whole, 90)).astype(int)
+        assert up.shape[:2] == (40, 20) and up[3, 10, 0] > 200 and up[-4, 10, 2] > 200, up[[3, -4], 10]
+        tilt = np.asarray(compose.spin(whole, 30))
+        assert tilt.shape[1] > 44 and tilt[0, 0, 3] == 0 and tilt[tilt.shape[0] // 2, tilt.shape[1] // 2, 3] == 255
+        ov["angle"] = 30
+        compose.flip_overlay(ov)
+        assert ov["angle"] == -30 and compose.wrap_angle(180) == -180 and compose.wrap_angle(-190) == 170
+        assert np.allclose(compose.turned(1, 0, 90), (0, 1))
+        flat = dict(ov, crop=[0.0, 0.0, 1.0, 1.0], flip=False, soft=0.0, angle=45)
+        steep = compose.render(bg, [], dict(edit, overlays=[flat]), out / "src")[0].astype(int)
+        x, y, w, h = compose.overlay_box(flat, plain.shape[1::-1], whole.size)
+        cx, cy = x + w / 2, y + h / 2
+        vx, vy = compose.turned(-w / 4, 0, 45)
+        rx, ry = round(cx + vx), round(cy + vy)
+        assert steep[ry, rx, 0] > 200 and steep[ry, rx, 2] < 80, steep[ry, rx]
+        assert np.array_equal(steep[y + 2, x + 2], plain[y + 2, x + 2]), (steep[y + 2, x + 2], plain[y + 2, x + 2])
+        scene = {"shots": ["a", "b", "c"], "seams": [{"k": 0}, {"k": 1}]}
+        drop = lambda name: store.drop_member({"scene": json.loads(json.dumps(scene))}, name)["scene"]
+        assert drop("b") == {"shots": ["a", "c"], "seams": [{"k": 0}]}
+        assert drop("a")["seams"] == [{"k": 1}] and drop("c")["seams"] == [{"k": 0}]
+        for name in ("SS_a.jpg", "SS_ab.jpg"):
+            Image.new("RGB", (4, 4)).save(out / name)
+        for name in ("SS_a_bg.jpg", "SS_a_chat1.webp", "SS_a_ov1.png", "SS_a_log.png", "SS_a.json", "SS_ab_bg.jpg"):
+            (out / "src" / name).write_bytes(b"{}")
+        (out / "src" / "SS_b.json").write_text(json.dumps({"scene": {"shots": ["SS_b", "SS_a"], "seams": [{}]}}),
+                                               encoding="utf-8")
+        mine = ["SS_a.jpg", "SS_a.json", "SS_a_bg.jpg", "SS_a_chat1.webp", "SS_a_log.png", "SS_a_ov1.png"]
+        assert sorted(p.name for p in store.shot_paths(out, "SS_a")) == mine
+        gone = []
+        trash = lambda paths: [(gone.append(p.name), p.unlink()) for p in paths]
+        assert store.delete_shot(out, "SS_a", cfg, trash) == ["SS_b"]
+        assert sorted(gone) == mine and store.saved_edit(out, "SS_b")["scene"] is None
+        assert (out / "SS_ab.jpg").exists() and (out / "src" / "SS_ab_bg.jpg").exists()
+
+
 def check_join():
     with tempfile.TemporaryDirectory() as tmp:
         out = Path(tmp)
@@ -539,6 +602,13 @@ def check_join():
         edit["overlays"][0].update(soft=0.0, alpha=0.5)
         img = compose.render(bg, [], edit, out / "src")[0].astype(int)
         assert abs(img[720, 360] - (plain[720, 360] + np.array((200, 30, 30))) / 2).max() <= 2
+        dots = np.repeat(((np.indices((300, 300)) // 10).sum(0) % 2 * 255).astype(np.uint8)[..., None], 3, 2)
+        edit["overlays"] = [dict(compose.add_overlay(out, "SS_j", Image.fromarray(dots)), x=0.5, y=0.5, w=1.0, soft=0.0)]
+        sharp = compose.render(bg, [], edit, out / "src")[0].astype(int)
+        hid = compose.render(bg, [], dict(edit, blurs=[{"x": 0.4, "y": 0.4, "w": 0.2, "h": 0.2, "mode": "blur",
+                                                        "power": 0.8}]), out / "src")[0].astype(int)
+        assert np.abs(hid[600:840, 600:840] - sharp[600:840, 600:840]).mean() > 10
+        assert np.array_equal(hid[:500], sharp[:500])
 
 
 def check_quality():
@@ -742,6 +812,13 @@ def check_scene():
         box = [c for c in there["chats"] if c[0] == 1][0]
         theirs = [c for c in there["chats"] if c[0] == 2][0]
         assert theirs[3] >= box[3] + box[5] - 2 * there["pads"][1] and box[3] + there["pads"][1] > 2448, (box, theirs)
+        cut = len(whole["rows"]) // 2
+        split, apart = dict(whole, edit=dict(whole["edit"], breaks=[cut], home=[None, last])), {}
+        store.render_shot(split, layout=apart)
+        mine = sorted((c for c in apart["chats"] if c[0] == 1), key=lambda c: c[1])
+        assert cut and len(mine) == 2 and 1296 <= mine[0][3] < 2448 <= mine[1][3] + apart["pads"][1], mine
+        assert compose.homes_of(whole["rows"], {"breaks": [cut], "home": [None]}) == [None, None]
+        assert compose.homes_of(whole["rows"], {"breaks": [cut], "home": last}) == [last, last]
         seam, where = dict(whole, edit=dict(whole["edit"], pos=[0.1, 1.02])), {}
         store.render_shot(seam, layout=where)
         box = [c for c in where["chats"] if c[0] == 1][0]
@@ -912,6 +989,7 @@ if __name__ == "__main__":
     check_reflow()
     check_carry()
     check_order()
+    check_mirror_delete()
     check_join()
     check_quality()
     check_grain()

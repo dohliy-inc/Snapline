@@ -1,4 +1,5 @@
 import io
+import math
 import re
 from datetime import datetime
 from functools import lru_cache
@@ -14,11 +15,12 @@ from config import CHAT_POSITIONS, exact_of, ratio_of, side_of
 REFERENCE_SIDE = 1440
 
 LAYOUT_KEYS = ("format", "zoom", "center", "pos", "places", "size", "file", "quality", "text_scale", "outline",
-               "margin", "overlays", "join", "scene", "style", "style_text", "preset", "look", "lut")
+               "margin", "overlays", "join", "scene", "style", "style_text", "preset", "look", "lut", "mirror", "tilt")
 LUT_DIR = "luts"
 JOIN_SIDES = {"left": Image.Transpose.FLIP_LEFT_RIGHT, "right": None, "top": Image.Transpose.TRANSVERSE,
               "bottom": Image.Transpose.TRANSPOSE}
 MAX_OVERLAYS = 4
+TILT_MAX = 30
 SCENE_MAX = 8
 SEAM = {"fade": 0.2, "blur": 0.6, "dark": 0.3}
 LUMA = np.array([0.299, 0.587, 0.114], np.float32)
@@ -106,6 +108,13 @@ def places(edit, count):
     return [first] + extra[:count - 1]
 
 
+def homes_of(rows, edit):
+    count, home = len(cuts(rows, edit)) + 1, edit.get("home")
+    if not isinstance(home, list):
+        return [home] * count
+    return (home + home[-1:] * count)[:count] if home else [None] * count
+
+
 def parts(rows, edit):
     bounds = [0] + cuts(rows, edit) + [len(rows)]
     spans = list(zip(bounds, bounds[1:]))
@@ -146,14 +155,75 @@ def plan(bg, edit, width=None):
     }
 
 
+def bg_part(bg, rect, mirror=False):
+    x0, y0, x1, y1 = rect
+    if not mirror:
+        return bg[y0:y1, x0:x1]
+    W = bg.shape[1]
+    return np.ascontiguousarray(bg[y0:y1, W - x1:W - x0][:, ::-1])
+
+
 @lru_cache(maxsize=16)
-def _overlay(path, stamp, mode):
+def _overlay(path, stamp, mode, flip):
     with Image.open(path) as im:
-        return im.convert(mode)
+        im = im.convert(mode)
+    return im.transpose(Image.Transpose.FLIP_LEFT_RIGHT) if flip else im
 
 
-def overlay_image(path, mode="RGBA"):
-    return _overlay(str(path), path.stat().st_mtime_ns, mode)
+def overlay_image(path, mode="RGBA", ov=None):
+    return _overlay(str(path), path.stat().st_mtime_ns, mode, bool((ov or {}).get("flip")))
+
+
+def wrap_angle(angle):
+    return round((angle + 180) % 360 - 180, 2)
+
+
+def flip_overlay(ov):
+    l, t, r, b = ov["crop"]
+    ov.update(crop=[round(1 - r, 5), t, round(1 - l, 5), b], flip=not ov.get("flip"),
+              angle=wrap_angle(-ov.get("angle", 0)))
+
+
+def turned(x, y, angle):
+    a = math.radians(angle)
+    return x * math.cos(a) - y * math.sin(a), x * math.sin(a) + y * math.cos(a)
+
+
+def tilt_zoom(size, angle):
+    if not angle:
+        return 1.0
+    (w, h), c, s = size, abs(math.cos(math.radians(angle))), abs(math.sin(math.radians(angle)))
+    return max(c + h / w * s, w / h * s + c) * 1.002
+
+
+def tilt_image(img, angle, size):
+    if not angle:
+        return img if img.size == size else img.resize(size, Image.BICUBIC)
+    (W, H), (w, h) = img.size, size
+    k = img.width / (w * tilt_zoom(size, angle))
+    a, b = turned(k, 0, -angle)
+    d, e = turned(0, k, -angle)
+    return img.transform(size, Image.Transform.AFFINE, (a, d, W / 2 - a * w / 2 - d * h / 2,
+                                                        b, e, H / 2 - b * w / 2 - e * h / 2), Image.BICUBIC)
+
+
+def spin(piece, angle):
+    if not angle % 360:
+        return piece
+    if not angle % 90:
+        return piece.rotate(-angle, expand=True)
+    padded = Image.new("RGBa", (piece.width + 4, piece.height + 4))
+    padded.paste(piece.convert("RGBa"), (2, 2))
+    return padded.rotate(-angle, Image.BICUBIC, expand=True).convert("RGBA")
+
+
+def spun_edges(ov, box, out_size):
+    return soft_edges(box, out_size) if not ov.get("angle", 0) % 360 else (True,) * 4
+
+
+def mirror_blurs(blurs, p):
+    at, bw, W = p["at"][0], p["base"][0], p["size"][0]
+    return [dict(b, x=round((2 * at + bw) / W - b["x"] - b["w"], 5)) for b in blurs]
 
 
 def add_overlay(out, name, image):
@@ -306,12 +376,13 @@ def paste_overlays(frame, overlays, src):
     img = Image.fromarray(frame).convert("RGBA")
     for ov in overlays:
         try:
-            source = overlay_image(src / ov["file"])
+            source = overlay_image(src / ov["file"], ov=ov)
         except OSError:
             continue
         x, y, w, h = overlay_box(ov, img.size, source.size)
-        piece = soften(overlay_piece(source, ov, (w, h)), ov, soft_edges((x, y, w, h), img.size))
-        img.paste(piece, (x, y), piece)
+        piece = soften(overlay_piece(source, ov, (w, h)), ov, spun_edges(ov, (x, y, w, h), img.size))
+        piece = spin(piece, ov.get("angle", 0))
+        img.paste(piece, (round(x + (w - piece.width) / 2), round(y + (h - piece.height) / 2)), piece)
     return np.asarray(img.convert("RGB"))
 
 
@@ -341,17 +412,18 @@ def shrink(img, size):
 
 def backdrop(bg, edit, src=None, width=None):
     p = plan(bg, edit, width)
-    x0, y0, x1, y1 = p["rect"]
-    frame = bg[y0:y1, x0:x1]
+    frame = bg_part(bg, p["rect"], edit.get("mirror"))
+    if edit.get("tilt"):
+        frame = np.asarray(tilt_image(Image.fromarray(frame), edit["tilt"], (frame.shape[1], frame.shape[0])))
     if (frame.shape[1], frame.shape[0]) != p["base"]:
         frame = (shrink(frame, p["base"]) if p["base"][0] < frame.shape[1]
                  else np.asarray(Image.fromarray(frame).resize(p["base"], Image.BICUBIC)))
     if p["size"] != p["base"]:
         frame = np.asarray(join_canvas(Image.fromarray(frame), edit["join"]))
-    if edit.get("blurs"):
-        frame = np.asarray(styles.obscure(Image.fromarray(frame), edit["blurs"]))
     if src is not None and edit.get("overlays"):
         frame = paste_overlays(frame, edit["overlays"], src)
+    if edit.get("blurs"):
+        frame = np.asarray(styles.obscure(Image.fromarray(frame), edit["blurs"]))
     if width and frame.shape[1] != width:
         frame = shrink(frame, (width, max(1, round(frame.shape[0] * width / frame.shape[1]))))
     return frame, p
@@ -385,13 +457,15 @@ def chat_spots(size, layers, spots, pad, margin, boxes=None, span=None):
 
 
 def paint_chat(img, rows, edit, p, window=None, boxes=None, found=None):
-    y0, y1 = window or (0, img.shape[0])
     groups = parts(rows, edit)
-    made = [chat.chat_layer(part, p["outline"], p["scale"], y1 - y0 - 2 * p["margin"]) for part, _ in groups]
-    spots = chat_spots((img.shape[1], y1 - y0), [m[0] for m in made], [pos for _, pos in groups], p["outline"] + 2,
-                       p["margin"], boxes, (-y0, img.shape[0] - y0) if window else None)
+    boxes = [] if boxes is None else boxes
+    wins, held = (window, boxes) if isinstance(window, list) else ([window] * len(groups), [boxes] * len(groups))
     painted = 0
-    for k, ((layer, n, _), spot) in enumerate(zip(made, spots)):
+    for k, ((part, pos), win, taken) in enumerate(zip(groups, wins, held)):
+        y0, y1 = win or (0, img.shape[0])
+        layer, n, _ = chat.chat_layer(part, p["outline"], p["scale"], y1 - y0 - 2 * p["margin"])
+        spot = chat_spots((img.shape[1], y1 - y0), [layer], [pos], p["outline"] + 2, p["margin"], taken,
+                          (-y0, img.shape[0] - y0) if win else None)[0]
         if layer is not None:
             img, painted = chat.blend(img, layer, spot[0], spot[1] + y0), painted + n
             if found is not None:
@@ -509,8 +583,10 @@ def render(bg, rows, edit, src=None, rough=None, scene=None, layout=None, when=N
         taken[k] = [(x0, y0 - a, x1, y1 - a) for x0, y0, x1, y1 in marks[k]]
     homes = scene[2] if len(scene) > 2 else list(range(len(frames)))
     for k, (f, q, r, e) in enumerate(frames):
-        found = []
-        img, n = paint_chat(img, r, e, q, spans[homes[k]], taken.setdefault(homes[k], []), found)
+        found, want = [], len(cuts(r, e)) + 1
+        at = homes[k] if isinstance(homes[k], list) else [homes[k]]
+        at = (at + at[-1:] * want)[:want]
+        img, n = paint_chat(img, r, e, q, [spans[h] for h in at], [taken.setdefault(h, []) for h in at], found)
         chats += [(k,) + box for box in found]
         painted = n if e is edit else painted
     if layout is not None:

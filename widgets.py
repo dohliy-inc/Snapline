@@ -394,18 +394,25 @@ class Painter:
         self.pieces = {}
         self.soft = {}
 
-    def frame(self, bg, rect, size):
+    def frame(self, bg, rect, size, mirror=False, tilt=0):
+        if tilt:
+            k = compose.tilt_zoom(size, tilt)
+            return compose.tilt_image(self.frame(bg, rect, (round(size[0] * k), round(size[1] * k)), mirror), tilt, size)
         x0, y0, x1, y1 = rect
+        if mirror:
+            x0, x1 = bg.shape[1] - x1, bg.shape[1] - x0
         d = size[0] / (x1 - x0)
         if d >= 1:
-            return Image.fromarray(bg[y0:y1, x0:x1]).resize(size, Image.BILINEAR)
-        if self.scaled is None or self.scaled[0] is not bg or self.scaled[1] != d:
-            H, W = bg.shape[:2]
-            whole = Image.fromarray(bg).resize((max(1, round(W * d)), max(1, round(H * d))), Image.BILINEAR,
-                                               reducing_gap=2.0)
-            self.scaled = (bg, d, whole)
-        part = self.scaled[2].crop((round(x0 * d), round(y0 * d), round(x1 * d), round(y1 * d)))
-        return part if part.size == size else part.resize(size, Image.BILINEAR)
+            part = Image.fromarray(bg[y0:y1, x0:x1]).resize(size, Image.BILINEAR)
+        else:
+            if self.scaled is None or self.scaled[0] is not bg or self.scaled[1] != d:
+                H, W = bg.shape[:2]
+                whole = Image.fromarray(bg).resize((max(1, round(W * d)), max(1, round(H * d))), Image.BILINEAR,
+                                                   reducing_gap=2.0)
+                self.scaled = (bg, d, whole)
+            part = self.scaled[2].crop((round(x0 * d), round(y0 * d), round(x1 * d), round(y1 * d)))
+            part = part if part.size == size else part.resize(size, Image.BILINEAR)
+        return part.transpose(Image.Transpose.FLIP_LEFT_RIGHT) if mirror else part
 
     def draw(self, shot, area, tag="shot", edit=None, laps=(0, 0)):
         bg, rows, edit = shot["bg"], shot["rows"], edit or shot["edit"]
@@ -416,10 +423,20 @@ class Painter:
         dw, dh = max(1, round(out_w * d)), max(1, round(out_h * d))
         ix, iy = ax + (aw - dw) // 2, ay + (ah - dh) // 2
         if p["size"] == p["base"]:
-            frame = self.frame(bg, p["rect"], (dw, dh))
+            frame = self.frame(bg, p["rect"], (dw, dh), edit.get("mirror"), edit.get("tilt", 0))
         else:
             frame = self.joined(shot, p, d, (dw, dh))
-        frame = styles.obscure(frame, edit.get("blurs"))
+        geo = {"img": (ix, iy, dw, dh), "d": d, "out": (out_w, out_h), "plan": p, "pad": p["outline"] + 2,
+               "chats": [], "overlays": [], "join": None, "inset": (laps[0] // 2, laps[1] // 2)}
+        pieces = self.overlay_pieces(shot, geo)
+        if edit.get("blurs") and pieces:
+            frame = frame.copy()
+            for _, piece, (l, t, _, _) in pieces:
+                frame.paste(piece, (l - ix, t - iy), piece)
+            frame = styles.obscure(frame, edit["blurs"])
+            pieces = [(k, frame.crop((l - ix, t - iy, r - ix, b - iy)), (l, t, r, b)) for k, _, (l, t, r, b) in pieces]
+        else:
+            frame = styles.obscure(frame, edit.get("blurs"))
         if any(laps):
             frame = shade(frame, [lap * d for lap in laps])
         it, ib = laps[0] // 2, laps[1] // 2
@@ -436,13 +453,13 @@ class Painter:
         self.c.delete(tag)
         self.photos = [ImageTk.PhotoImage(frame)]
         self.c.create_image(ix, iy, anchor="nw", image=self.photos[0], tags=(tag,))
-        pad = p["outline"] + 2
-        geo = {"img": (ix, iy, dw, dh), "d": d, "out": (out_w, out_h), "plan": p, "pad": pad, "chats": [],
-               "painted": sum(n for _, n, _ in self.layers), "overlays": [], "join": None, "inset": (it, ib)}
+        pad, geo["painted"] = geo["pad"], sum(n for _, n, _ in self.layers)
         if p["ext_box"]:
             l, t, r, b = p["ext_box"]
             geo["join"] = (ix + l * d, iy + t * d, ix + r * d, iy + b * d)
-        self.draw_overlays(shot, geo, tag)
+        for k, piece, (l, t, _, _) in pieces:
+            self.photos.append(ImageTk.PhotoImage(piece))
+            self.c.create_image(l, t, anchor="nw", image=self.photos[-1], tags=(tag, tag + "-ov", f"{tag}-ov{k}"))
         spots = compose.chat_spots((out_w, inner), [layer for layer, _, _ in self.layers], [pos for _, pos in groups],
                                 pad, p["margin"])
         for k, ((layer, _, _), spot) in enumerate(zip(self.layers, spots)):
@@ -464,44 +481,46 @@ class Painter:
 
     def joined(self, shot, p, d, size):
         join = shot["edit"]["join"]
-        key = (id(shot["bg"]), p["rect"], size, json.dumps(join, sort_keys=True))
+        mirror, tilt = bool(shot["edit"].get("mirror")), shot["edit"].get("tilt", 0)
+        key = (id(shot["bg"]), p["rect"], size, json.dumps(join, sort_keys=True), mirror, tilt)
         if key != self.join_key:
             bw, bh = p["base"]
-            base = self.frame(shot["bg"], p["rect"], (max(1, round(bw * d)), max(1, round(bh * d))))
+            base = self.frame(shot["bg"], p["rect"], (max(1, round(bw * d)), max(1, round(bh * d))), mirror, tilt)
             img = compose.join_canvas(base, join)
             self.join_key, self.join_img = key, img if img.size == size else img.resize(size, Image.BILINEAR)
         return self.join_img
 
-    def draw_overlays(self, shot, geo, tag):
-        out, overlays = shot.get("out"), shot["edit"].get("overlays", [])
+    def overlay_pieces(self, shot, geo):
+        pieces, out, overlays = [], shot.get("out"), shot["edit"].get("overlays", [])
         ix, iy, dw, dh = geo["img"]
         d, (out_w, out_h) = geo["d"], geo["out"]
         if len(self.pieces) > 12:
             self.pieces.clear()
         for k, ov in enumerate(overlays if out else []):
             try:
-                source = compose.overlay_image(out / "src" / ov["file"])
+                source = compose.overlay_image(out / "src" / ov["file"], ov=ov)
             except OSError:
                 geo["overlays"].append(None)
                 continue
             x, y, w, h = compose.overlay_box(ov, (out_w, out_h), source.size)
             dx, dy = round(ix + x * d), round(iy + y * d)
             size = (max(1, round(w * d)), max(1, round(h * d)))
-            edges = compose.soft_edges((x, y, w, h), (out_w, out_h))
-            base = (ov["file"], tuple(ov["crop"]), size)
-            key = base + (ov.get("soft", 0.0), ov.get("alpha", 1.0), edges)
+            edges, angle = compose.spun_edges(ov, (x, y, w, h), (out_w, out_h)), ov.get("angle", 0)
+            base = (ov["file"], tuple(ov["crop"]), size, bool(ov.get("flip")))
+            key = base + (ov.get("soft", 0.0), ov.get("alpha", 1.0), edges, angle)
             if base not in self.pieces:
                 self.pieces[base] = compose.overlay_piece(source, ov, size)
             if key not in self.soft:
                 if len(self.soft) > 24:
                     self.soft.clear()
-                self.soft[key] = compose.soften(self.pieces[base], ov, edges)
-            l, t = max(ix, dx), max(iy, dy)
-            r, b = min(ix + dw, dx + size[0]), min(iy + dh, dy + size[1])
+                self.soft[key] = compose.spin(compose.soften(self.pieces[base], ov, edges), angle)
+            piece = self.soft[key]
+            px0, py0 = round(dx + (size[0] - piece.width) / 2), round(dy + (size[1] - piece.height) / 2)
+            l, t = max(ix, px0), max(iy, py0)
+            r, b = min(ix + dw, px0 + piece.width), min(iy + dh, py0 + piece.height)
             if r <= l or b <= t:
                 geo["overlays"].append(None)
                 continue
-            photo = ImageTk.PhotoImage(self.soft[key].crop((l - dx, t - dy, r - dx, b - dy)))
-            self.photos.append(photo)
-            self.c.create_image(l, t, anchor="nw", image=photo, tags=(tag, tag + "-ov", f"{tag}-ov{k}"))
-            geo["overlays"].append({"x": dx, "y": dy, "w": size[0], "h": size[1], "box": (l, t, r, b)})
+            pieces.append((k, piece.crop((l - px0, t - py0, r - px0, b - py0)), (l, t, r, b)))
+            geo["overlays"].append({"x": dx, "y": dy, "w": size[0], "h": size[1], "box": (l, t, r, b), "angle": angle})
+        return pieces

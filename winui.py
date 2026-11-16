@@ -54,6 +54,45 @@ class NOTIFYICONDATAW(ctypes.Structure):
                 ("dwInfoFlags", wintypes.DWORD), ("guidItem", ctypes.c_byte * 16), ("hBalloonIcon", wintypes.HICON)]
 
 
+class SHFILEOPSTRUCTW(ctypes.Structure):
+    _fields_ = [("hwnd", wintypes.HWND), ("wFunc", wintypes.UINT), ("pFrom", wintypes.LPCWSTR),
+                ("pTo", wintypes.LPCWSTR), ("fFlags", wintypes.WORD), ("fAnyOperationsAborted", wintypes.BOOL),
+                ("hNameMappings", ctypes.c_void_p), ("lpszProgressTitle", wintypes.LPCWSTR)]
+
+
+FO_DELETE = 3
+FOF_RECYCLE_QUIET = 0x0040 | 0x0010 | 0x0004 | 0x0400
+
+
+def recycle(paths):
+    paths = [str(p.resolve()) for p in paths if p.exists()]
+    if not paths:
+        return
+    op = SHFILEOPSTRUCTW(wFunc=FO_DELETE, pFrom="\0".join(paths) + "\0", fFlags=FOF_RECYCLE_QUIET)
+    code = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
+    if code or op.fAnyOperationsAborted:
+        raise OSError(f"Windows не убрал файлы в корзину, код {code:#x}")
+
+
+def show_file(path):
+    shell = ctypes.WinDLL("shell32")
+    shell.ILCreateFromPathW.argtypes = [wintypes.LPCWSTR]
+    shell.ILCreateFromPathW.restype = ctypes.c_void_p
+    shell.ILFree.argtypes = [ctypes.c_void_p]
+    shell.SHOpenFolderAndSelectItems.argtypes = [ctypes.c_void_p, wintypes.UINT, ctypes.c_void_p, wintypes.DWORD]
+    shell.SHOpenFolderAndSelectItems.restype = ctypes.c_long
+    ctypes.windll.ole32.CoInitialize(None)
+    item = shell.ILCreateFromPathW(str(path.resolve()))
+    if not item:
+        raise OSError(f"Windows не нашёл {path}")
+    try:
+        code = shell.SHOpenFolderAndSelectItems(item, 0, None, 0)
+    finally:
+        shell.ILFree(item)
+    if code:
+        raise OSError(f"проводник не открылся, код {code & 0xFFFFFFFF:#x}")
+
+
 class Tray:
     def __init__(self, hwnd):
         self.hwnd, self.on = hwnd, False

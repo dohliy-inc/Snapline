@@ -49,6 +49,7 @@ class Feed(LinesTool, LogTool, CropTool, TextTool, ImagesTool, SceneTool, FileTo
         self.note = ""
         self.save_job = None
         self.saves = {}
+        self.doomed = None
         self.history, self.future, self.known, self.last_push, self.replaying = [], [], {}, None, False
         self.whole = False
         self.save_queue = queue.Queue()
@@ -116,7 +117,7 @@ class Feed(LinesTool, LogTool, CropTool, TextTool, ImagesTool, SceneTool, FileTo
         index = max(0, min(index, len(self.names)))
         if index == self.index and (index == 0 or self.shot is not None):
             return
-        self.index, self.tool, self.offset, self.note = index, None, 0, ""
+        self.index, self.tool, self.offset, self.note, self.doomed = index, None, 0, "", None
         self.open_current()
 
     def open_current(self):
@@ -358,6 +359,8 @@ class Feed(LinesTool, LogTool, CropTool, TextTool, ImagesTool, SceneTool, FileTo
         if self.shot is not None or view_only:
             tools.append(("copy", "Копировать", self.copy, False))
         tools.append(("folder", "В папке", self.open_folder, False))
+        if name is not None:
+            tools.append(("delete", "Точно?" if self.doomed == name else "Удалить", self.delete, False))
         self.rail(W, H, tools)
 
     def draw_media(self, area):
@@ -612,7 +615,7 @@ class Feed(LinesTool, LogTool, CropTool, TextTool, ImagesTool, SceneTool, FileTo
             tool = "scenepick"
         if tool == "lines" and self.tool not in ("lines", "logpick") and self.empty_log():
             tool = "logpick"
-        was = self.previewing()
+        was, self.doomed = self.previewing(), None
         old, self.tool = self.tool, None if self.tool == tool else tool
         self.offset = 0
         self.loupe.hide()
@@ -963,8 +966,9 @@ class Feed(LinesTool, LogTool, CropTool, TextTool, ImagesTool, SceneTool, FileTo
             elif geo["overlays"][self.drag["part"]]:
                 box = geo["overlays"][self.drag["part"]]
                 l, t, r, b = self.drag["crop"]
-                sx = min(max(-(e.x - self.drag["x"]) * (r - l) / box["w"], -l), 1 - r)
-                sy = min(max(-(e.y - self.drag["y"]) * (b - t) / box["h"], -t), 1 - b)
+                mx, my = compose.turned(e.x - self.drag["x"], e.y - self.drag["y"], -ov.get("angle", 0))
+                sx = min(max(-mx * (r - l) / box["w"], -l), 1 - r)
+                sy = min(max(-my * (b - t) / box["h"], -t), 1 - b)
                 ov["crop"] = [round(l + sx, 4), round(t + sy, 4), round(r + sx, 4), round(b + sy, 4)]
                 ov["cut"] = ov.get("cut", "free")
             if not self.pending_media:
@@ -975,8 +979,12 @@ class Feed(LinesTool, LogTool, CropTool, TextTool, ImagesTool, SceneTool, FileTo
             H, W = shot["bg"].shape[:2]
             x0, y0, x1, y1 = geo["plan"]["rect"]
             k = (x1 - x0) / (geo["plan"]["base"][0] * geo["d"])
-            cx = self.drag["center"][0] - (e.x - self.drag["x"]) * k / W
-            cy = self.drag["center"][1] - (e.y - self.drag["y"]) * k / H
+            mx, my, tilt = e.x - self.drag["x"], e.y - self.drag["y"], self.look(shot)[0].get("tilt", 0)
+            if tilt:
+                z = compose.tilt_zoom(geo["plan"]["base"], tilt)
+                mx, my = (v / z for v in compose.turned(mx, my, -tilt))
+            cx = self.drag["center"][0] - mx * k / W
+            cy = self.drag["center"][1] - my * k / H
             shot["edit"]["center"] = [cx, cy]
             if not self.pending_media:
                 self.pending_media = True
@@ -1241,7 +1249,53 @@ class Feed(LinesTool, LogTool, CropTool, TextTool, ImagesTool, SceneTool, FileTo
 
     def save_loop(self):
         while True:
-            self.store(self.save_queue.get(), lambda *a: self.app.inbox.put(("saved",) + a))
+            job = self.save_queue.get()
+            if callable(job):
+                job()
+            else:
+                self.store(job, lambda *a: self.app.inbox.put(("saved",) + a))
+
+    def delete(self):
+        name = self.name
+        if self.doomed != name:
+            self.doomed = name
+            self.note = "нажми «Точно?», и СС с исходниками уйдёт в корзину"
+            self.redraw()
+            return
+        self.doomed = None
+        self.saves.pop(name, None)
+        self.flush_save()
+        out, cfg = self.app.cfg["out"], self.app.cfg
+        self.note = "удаляю…"
+        self.update_meta()
+
+        def work():
+            try:
+                heads = store.delete_shot(out, name, cfg, winui.recycle)
+                self.app.inbox.put(("deleted", name, heads))
+            except Exception as e:
+                self.app.inbox.put(("deleted", name, str(e)))
+
+        self.save_queue.put(work)
+
+    def deleted(self, name, result):
+        if isinstance(result, str):
+            self.note = f"не удалилось: {result}"
+            self.update_meta()
+            return
+        for gone in [name, *result]:
+            self.cache.pop(gone, None)
+            self.forget(gone)
+        here = self.name
+        self.refresh_names()
+        if here == name:
+            self.index = min(self.index, len(self.names))
+        elif here in self.names:
+            self.index = self.names.index(here) + 1
+        self.tool, self.offset = None, 0
+        self.open_current()
+        self.note = "СС в корзине, вернуть можно оттуда"
+        self.update_meta()
 
     @staticmethod
     def store(snaps, report):
@@ -1295,7 +1349,10 @@ class Feed(LinesTool, LogTool, CropTool, TextTool, ImagesTool, SceneTool, FileTo
         out.mkdir(parents=True, exist_ok=True)
         path = store.shot_image(out, self.name) if self.name else None
         if path and path.exists():
-            subprocess.Popen(["explorer", "/select,", str(path)])
+            try:
+                winui.show_file(path)
+            except OSError:
+                subprocess.Popen(["explorer", "/select,", str(path)])
         else:
             os.startfile(out)
 

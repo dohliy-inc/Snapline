@@ -109,8 +109,11 @@ class TextTool:
             spots = compose.places(edit, len(compose.parts(shot["rows"], edit)))[1:]
             spots[part - 1] = pos
             edit["places"] = spots
-        edit["home"] = None if j == k else names[j]
+        at = compose.homes_of(shot["rows"], edit)
+        at[part] = None if j == k else names[j]
+        edit["home"] = at if len(set(at)) > 1 else at[0]
         self.schedule_save(shot)
         self.want_preview()
-        self.note = f"чат СС {k + 1} теперь на СС {j + 1}" if j != k else ""
+        what = f"часть {part + 1} чата СС {k + 1}" if len(at) > 1 else f"чат СС {k + 1}"
+        self.note = f"{what} теперь на СС {j + 1}" if j != k else ""
         self.update_meta()

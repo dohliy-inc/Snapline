@@ -14,9 +14,11 @@ import chat
 import compose
 import config
 import ui
+import winui
 
 FIXTURES = Path(__file__).resolve().parent / "tests" / "fixtures"
 NAMES = ("SS_2026-01-01_12-00-00", "SS_2026-01-01_12-05-00")
+DOOMED = "SS_2026-01-01_11-00-00"
 LOG = [("11:58:10", "* Malachy Doyle стоит возле своего автомобиля.", "#c2a2da"),
        ("11:59:02", "Mia Lopez говорит: Ты видел, кто к нам заехал?", "#e6e6e6"),
        ("12:01:30", "Victor Hale говорит (тихо): Видел. Не смотри туда.", "#e6e6e6"),
@@ -34,7 +36,7 @@ def prepare(work):
     config.write_raw(dict(config.DEFAULTS, output=str(shots), sound="no", chatlog="no", source="screen", file="jpg",
                         tray="no", tour="no"))
     cfg = config.load_config()[1]
-    for name in NAMES:
+    for name in NAMES + (DOOMED,):
         state = {"session": capture.Session()}
         state["session"].name = name
         capture.handle(load("real_bg.webp"), state, cfg)
@@ -79,6 +81,35 @@ def expect(ok, what):
         raise AssertionError(what)
 
 
+def tilted_pan(feed):
+    cx, cy = feed.shot["edit"]["center"]
+    drag(feed, (0.5, 0.5), (0.6, 0.5))
+    nx, ny = feed.shot["edit"]["center"]
+    expect(nx < cx - 0.01 and ny > cy + 0.005, f"pan under tilt went the wrong way: {(cx, cy)} -> {(nx, ny)}")
+
+
+def crop_turned(feed):
+    ov, box = feed.shot["edit"]["overlays"][0], feed.painter.geo["overlays"][0]
+    x0, y0 = ov["x"], ov["y"]
+    feed.drag = {"kind": "crop", "handle": "r", "part": 0, "x": 500, "y": 500, "crop": list(ov["crop"]),
+                 "box": dict(box), "size": feed.source_size(ov)}
+    point = type("Point", (), {"x": 500, "y": 500 - box["w"] / 4})()
+    feed.drag_crop(point, feed.painter.geo)
+    feed.drag = None
+    expect(ov["crop"][2] < 0.9 and ov["y"] < y0 - 0.01 and abs(ov["x"] - x0) < 0.002,
+           f"cropping a turned picture went the wrong way: {ov}")
+
+
+def grab_picture(feed):
+    ov, box = feed.shot["edit"]["overlays"][0], feed.painter.geo["overlays"][0]
+    x, y, x0 = box["x"] + box["w"] // 2, box["y"] + box["h"] // 2, ov["x"]
+    feed.c.event_generate("<Motion>", x=x, y=y)
+    feed.c.event_generate("<ButtonPress-1>", x=x, y=y)
+    feed.c.event_generate("<Motion>", x=x + 40, y=y, state=0x100)
+    feed.c.event_generate("<ButtonRelease-1>", x=x + 40, y=y, state=0x100)
+    expect(ov["x"] > x0 + 0.01, f"the picture did not follow the mouse: {x0} -> {ov['x']}")
+
+
 def scene(feed):
     feed.set_scene(list(reversed(NAMES)), [dict(compose.SEAM)])
     feed.toggle_tool("scene")
@@ -89,6 +120,7 @@ def main():
     work = Path(tempfile.mkdtemp(prefix="snapline_ui_"))
     shots = prepare(work)
     ui.App.check_update = lambda self: None
+    winui.recycle = lambda paths: [p.unlink() for p in paths]
     root = tk.Tk()
     root.attributes("-toolwindow", True)
     root.attributes("-alpha", 0.0)
@@ -112,6 +144,15 @@ def main():
         (lambda: feed.key(Key(89, 0x4)), 1200),
         (lambda: expect(feed.shot["edit"]["format"] == "800x800", "Ctrl+Y did not redo the frame"), 100),
         (lambda: feed.set_frame("square"), 1000),
+        (lambda: feed.mirror_frame(), 1000),
+        (lambda: expect(feed.shot["edit"]["mirror"], "mirror did not turn on"), 100),
+        (lambda: feed.mirror_frame(), 800),
+        (lambda: feed.change(zoom=1.5, tilt=30), 1000),
+        (lambda: tilted_pan(feed), 1200),
+        (lambda: feed.mirror_frame(), 800),
+        (lambda: expect(feed.shot["edit"]["tilt"] == -30 and feed.shot["edit"]["mirror"], "mirror kept the tilt sign"), 100),
+        (lambda: feed.mirror_frame(), 600),
+        (lambda: feed.change(zoom=1.0, tilt=0, center=[0.5, 0.5]), 800),
         (lambda: feed.toggle_tool("text"), 1000),
         (lambda: [feed.change_text(text_scale=v) for v in (1.1, 1.2, 1.3)], 800),
         (lambda: feed.undo(), 800),
@@ -120,6 +161,12 @@ def main():
         (lambda: feed.toggle_tool("images"), 1000),
         (lambda: feed.add_image(Image.new("RGB", (400, 300), (40, 120, 200))), 1200),
         (lambda: feed.change_ov(alpha=0.8), 800),
+        (lambda: (feed.flip_ov(), feed.turn_ov()), 1000),
+        (lambda: expect(feed.shot["edit"]["overlays"][0]["flip"] and feed.shot["edit"]["overlays"][0]["angle"] == 90,
+                        "flip or turn did not apply to the picture"), 100),
+        (lambda: crop_turned(feed), 1000),
+        (lambda: feed.change_ov(angle=30), 800),
+        (lambda: grab_picture(feed), 800),
         (lambda: feed.remove_ov(), 800),
         (lambda: feed.toggle_tool("style"), 1500),
         (lambda: feed.change(preset="film"), 1200),
@@ -163,6 +210,11 @@ def main():
         (lambda: feed.toggle_tool("lines"), 800),
         (lambda: app.show("feed"), 800),
         (lambda: feed.go(2), 1500),
+        (lambda: feed.go(3), 1500),
+        (lambda: (feed.delete(), expect(feed.doomed == DOOMED and feed.name == DOOMED, "first click deleted at once")), 600),
+        (lambda: feed.delete(), 2500),
+        (lambda: expect(DOOMED not in feed.names and feed.index == 2 and not (shots / f"{DOOMED}.jpg").exists()
+                        and not list((shots / "src").glob(f"{DOOMED}*")), "delete left the shot behind"), 100),
     ]
     state = {"name": None}
 
@@ -187,7 +239,7 @@ def main():
     assert app.settings.chatlog_stop is None, "chatlog started during the UI test"
     edit = json.loads((shots / "src" / f"{state['name']}.json").read_text(encoding="utf-8"))
     assert edit["format"] == "square" and edit["file"] == "jpg" and edit.get("style") == "none", edit
-    assert edit["hidden"] and edit["text_scale"] == 1.3 and not edit["overlays"], edit
+    assert edit["hidden"] and edit["text_scale"] == 1.3 and not edit["overlays"] and not edit["mirror"], edit
     assert edit["blurs"] and edit["blurs"][0]["mode"] == "pixel" and edit["blurs"][0]["power"] == 0.9, edit["blurs"]
     assert edit["scene"] and edit["scene"]["shots"] == list(reversed(NAMES)), edit["scene"]
     print("ui ok")

@@ -19,7 +19,11 @@ class CropTool:
         zoom = self.slider(body, 1.0, 3.0, edit["zoom"], lambda v: self.change(zoom=v), step=0.05,
                            fmt=lambda v: f"{v:.2f}×")
         self.sliders["zoom"] = (zoom, lambda: shot["edit"]["zoom"])
-        self.buttons(body, (("По центру", lambda: self.change(center=[0.5, 0.5])),), 12)
+        self.field(body, "Наклон")
+        tilt = self.slider(body, -compose.TILT_MAX, compose.TILT_MAX, edit.get("tilt", 0),
+                           lambda v: self.change(tilt=round(v)), fmt=lambda v: f"{v:.0f}°")
+        self.sliders["tilt"] = (tilt, lambda: shot["edit"].get("tilt", 0))
+        self.buttons(body, (("По центру", lambda: self.change(center=[0.5, 0.5])), ("Отразить", self.mirror_frame)), 12)
         if names:
             self.label(body, "Тёмные полосы сверху и снизу — переходы между СС, чат на них не заходит.", 12)
             return
@@ -36,6 +40,13 @@ class CropTool:
         self.field(body, "Мягкий край СС")
         self.slider(body, 0, 100, round(join["fade"] * 100), lambda v: self.change_field(fade=v / 100), fmt=pct)
         self.label(body, "Новое место заполнено размытым продолжением СС.", 10)
+
+    def mirror_frame(self):
+        shot = self.target
+        edit = shot["edit"]
+        blurs = compose.mirror_blurs(edit.get("blurs") or [], compose.plan(shot["bg"], self.look(shot)[0]))
+        self.change(mirror=not edit.get("mirror"), center=[round(1 - edit["center"][0], 5), edit["center"][1]],
+                    tilt=-edit.get("tilt", 0), **({"blurs": blurs} if blurs else {}))
 
     def set_field_side(self, side):
         edit = self.shot["edit"]

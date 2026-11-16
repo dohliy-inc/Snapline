@@ -156,11 +156,11 @@ class SceneTool:
         size = (px(54), px(32))
         if name != self.name:
             return self.thumb(self.shot["out"], name, size)
-        bg = self.shot["bg"]
-        key = ("bg", id(bg), size)
+        bg, edit = self.shot["bg"], self.shot["edit"]
+        key = ("bg", id(bg), size, bool(edit.get("mirror")), edit.get("tilt", 0))
         if key not in self.thumbs:
-            x0, y0, x1, y1 = compose.plan(bg, self.shot["edit"])["rect"]
-            im = Image.fromarray(bg[y0:y1, x0:x1])
+            im = Image.fromarray(compose.bg_part(bg, compose.plan(bg, edit)["rect"], edit.get("mirror")))
+            im = compose.tilt_image(im, edit.get("tilt", 0), im.size)
             im.thumbnail(size, Image.BILINEAR, reducing_gap=2.0)
             self.thumbs[key] = ImageTk.PhotoImage(im)
         return self.thumbs[key]

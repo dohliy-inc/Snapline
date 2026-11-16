@@ -1,3 +1,4 @@
+import math
 from pathlib import Path
 from tkinter import filedialog
 
@@ -17,7 +18,10 @@ class ImagesTool:
         if not box:
             return
         l, t, r, b = box["x"], box["y"], box["x"] + box["w"], box["y"] + box["h"]
-        self.c.create_rectangle(l, t, r - 1, b - 1, outline=WHITE, width=1, dash=(4, 3), tags=("shot",))
+        angle, cx, cy = box.get("angle", 0), (l + r) / 2, (t + b) / 2
+        at = lambda x, y: tuple(c + v for c, v in zip((cx, cy), compose.turned(x - cx, y - cy, angle)))
+        outline = [v for spot in (at(l, t), at(r, t), at(r, b), at(l, b)) for v in spot]
+        self.c.create_polygon(outline, outline=WHITE, fill="", width=1, dash=(4, 3), state="disabled", tags=("shot",))
         locked = compose.lock_ratio(self.target["edit"]["overlays"][self.active_ov].get("cut", "free")) is not None
         spots = {"l": (l, (t + b) / 2), "r": (r, (t + b) / 2), "t": ((l + r) / 2, t), "b": ((l + r) / 2, b),
                  "lt": (l, t), "rt": (r, t), "lb": (l, b), "rb": (r, b)}
@@ -25,11 +29,11 @@ class ImagesTool:
         for name in HANDLES:
             if locked and len(name) == 1:
                 continue
-            x, y = spots[name]
+            x, y = at(*spots[name])
             tag = f"handle-{name}"
             self.c.create_rectangle(x - k, y - k, x + k, y + k, fill=WHITE, outline=VOID, tags=("shot", tag))
             cursor = {"l": "sb_h_double_arrow", "r": "sb_h_double_arrow", "t": "sb_v_double_arrow",
-                      "b": "sb_v_double_arrow"}.get(name, "sizing")
+                      "b": "sb_v_double_arrow"}.get(name, "sizing") if not angle % 180 else "sizing"
             self.c.tag_bind(tag, "<Enter>", lambda _, c=cursor: self.c.config(cursor=c))
             self.c.tag_bind(tag, "<Leave>", lambda _: self.c.config(cursor=""))
 
@@ -50,12 +54,17 @@ class ImagesTool:
             size = self.slider(body, 5, 200, round(ov["w"] * 100), lambda v: self.change_ov(w=round(v / 100, 4)),
                                fmt=pct)
             self.sliders["ov"] = (size, lambda: round(self.target["edit"]["overlays"][self.active_ov]["w"] * 100))
+            self.field(body, "Угол")
+            spin = self.slider(body, -180, 180, round(ov.get("angle", 0)), lambda v: self.change_ov(angle=round(v)),
+                               fmt=lambda v: f"{v:.0f}°")
+            self.sliders["angle"] = (spin, lambda: round(self.target["edit"]["overlays"][self.active_ov].get("angle", 0)))
             self.field(body, "Мягкие края")
             self.slider(body, 0, 100, round(ov.get("soft", 0.0) * 100), lambda v: self.change_ov(soft=v / 100),
                         fmt=pct)
             self.field(body, "Прозрачность")
             self.slider(body, 0, 90, round((1 - ov.get("alpha", 1.0)) * 100),
                         lambda v: self.change_ov(alpha=round(1 - v / 100, 2)), fmt=pct)
+            self.buttons(body, (("Отразить", self.flip_ov), ("Повернуть на 90°", self.turn_ov)), 12)
             self.field(body, "Обрезка")
             FramePick(body, ov.get("cut", "free"), self.crop_ov, self.crop_size, self.sheet_w, CROPS,
                       (16, 20000)).pack(anchor="w")
@@ -128,7 +137,7 @@ class ImagesTool:
 
     def source_size(self, ov):
         try:
-            return compose.overlay_image(self.target["out"] / "src" / ov["file"]).size
+            return compose.overlay_image(self.target["out"] / "src" / ov["file"], ov=ov).size
         except OSError:
             return None
 
@@ -160,6 +169,17 @@ class ImagesTool:
             self.media_redraw()
         self.schedule_save()
 
+    def flip_ov(self):
+        compose.flip_overlay(self.target["edit"]["overlays"][self.active_ov])
+        self.media_redraw()
+        self.schedule_save()
+
+    def turn_ov(self):
+        ov = self.target["edit"]["overlays"][self.active_ov]
+        ov["angle"] = compose.wrap_angle(ov.get("angle", 0) + 90)
+        self.media_redraw()
+        self.schedule_save()
+
     def change_ov(self, **values):
         self.target["edit"]["overlays"][self.active_ov].update(values)
         self.media_redraw()
@@ -177,7 +197,10 @@ class ImagesTool:
             return
         (W, H), d = geo["out"], geo["d"]
         near = 0.015 * min(W, H)
-        for key, size, half in (("x", W, box["w"] / d / 2), ("y", H, box["h"] / d / 2)):
+        a = math.radians(box.get("angle", 0))
+        bw = abs(box["w"] * math.cos(a)) + abs(box["h"] * math.sin(a))
+        bh = abs(box["w"] * math.sin(a)) + abs(box["h"] * math.cos(a))
+        for key, size, half in (("x", W, bw / d / 2), ("y", H, bh / d / 2)):
             c = ov[key] * size
             if abs(c - half) < near:
                 ov[key] = round(half / size, 4)
@@ -194,7 +217,9 @@ class ImagesTool:
         k = Wd / max(1e-6, (r - l) * SW)
         L, T, R, B = X, Y, X + Wd, Y + Hd
         bounds = (X - l * SW * k, Y - t * SH * k, R + (1 - r) * SW * k, B + (1 - b) * SH * k)
-        dx, dy, h = (e.x - drag["x"]) / d, (e.y - drag["y"]) / d, drag["handle"]
+        angle = ov.get("angle", 0)
+        dx, dy = compose.turned((e.x - drag["x"]) / d, (e.y - drag["y"]) / d, -angle)
+        h = drag["handle"]
         least = 12 / d
         if "l" in h:
             L = min(max(L + dx, bounds[0]), R - least)
@@ -222,7 +247,8 @@ class ImagesTool:
                       round(min(max(r + (R - X - Wd) / span_x, 0.0), 1.0), 5),
                       round(min(max(b + (B - Y - Hd) / span_y, 0.0), 1.0), 5)]
         ov["w"] = round((R - L) / out_w, 5)
-        ov["x"], ov["y"] = round((L + R) / 2 / out_w, 5), round((T + B) / 2 / out_h, 5)
+        ex, ey = compose.turned((L + R) / 2 - X - Wd / 2, (T + B) / 2 - Y - Hd / 2, angle)
+        ov["x"], ov["y"] = round((X + Wd / 2 + ex) / out_w, 5), round((Y + Hd / 2 + ey) / out_h, 5)
         if not self.pending_media:
             self.pending_media = True
             self.c.after(16, self.flush_media)
