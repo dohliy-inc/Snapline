@@ -338,6 +338,7 @@ unsafe extern "system" fn tray_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
 
 pub fn start_tray(tx: Sender<TrayEvent>, ctx: eframe::egui::Context, png: Vec<u8>, size: i32) {
     TRAY_TX.get_or_init(|| std::sync::Mutex::new(None)).lock().unwrap().replace((tx, ctx));
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
     std::thread::spawn(move || unsafe {
         let instance = GetModuleHandleW(None).unwrap_or_default();
         let class = w!("SnaplineTray");
@@ -348,12 +349,14 @@ pub fn start_tray(tx: Sender<TrayEvent>, ctx: eframe::egui::Context, png: Vec<u8
         let _ = windows::Win32::UI::WindowsAndMessaging::ChangeWindowMessageFilterEx(
             hwnd, show_msg(), windows::Win32::UI::WindowsAndMessaging::MSGFLT_ALLOW, None);
         tray_state().lock().unwrap().replace(TrayState { hwnd, icon: icon_handle(&png, size), on: false });
+        let _ = ready_tx.send(());
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
     });
+    let _ = ready_rx.recv();
 }
 
 pub fn tray_show(on: bool) {

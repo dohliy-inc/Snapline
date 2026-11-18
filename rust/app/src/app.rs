@@ -122,8 +122,8 @@ impl App {
             });
         }
         let mut feed = Feed::new(&cfg, tx.clone(), cc.egui_ctx.clone());
-        feed.news = cfg.seen != config::VERSION && !feed.names.is_empty();
-        let fresh = cfg.seen != config::VERSION && feed.names.is_empty();
+        feed.news = cfg.seen != config::NEWS_VERSION && !feed.names.is_empty();
+        let fresh = cfg.seen != config::NEWS_VERSION && feed.names.is_empty();
         if let Some(p) = problem.or_else(|| engine::store::check_out(&cfg)) {
             feed.message = Some(("fail".into(), p));
         }
@@ -143,7 +143,7 @@ impl App {
             win::tray_show(true);
         }
         if fresh && app.probe.is_none() {
-            app.set("seen", config::VERSION);
+            app.set("seen", config::NEWS_VERSION);
         }
         app
     }
@@ -614,7 +614,7 @@ impl eframe::App for App {
             self.tab = Tab::Settings;
         }
         if let Some(tour) = self.feed.news_closed.take() {
-            self.set("seen", config::VERSION);
+            self.set("seen", config::NEWS_VERSION);
             if tour {
                 self.apply(vec![Action::Tour]);
             } else {

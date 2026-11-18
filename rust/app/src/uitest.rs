@@ -37,7 +37,7 @@ pub fn prepare() -> PathBuf {
     std::fs::create_dir_all(shots.join("chatlog")).unwrap();
     let mut raw = Raw::default();
     for (k, v) in [("sound", "no"), ("chatlog", "no"), ("source", "screen"), ("file", "jpg"), ("tray", "no"), ("tour", "no"),
-                   ("seen", engine::config::VERSION)] {
+                   ("seen", engine::config::NEWS_VERSION)] {
         raw.set(k, v);
     }
     raw.set("output", shots.to_string_lossy().to_string());
