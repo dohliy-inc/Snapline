@@ -6,3 +6,4 @@ dist/
 icon.ico
 config.ini
 error.log
+rust/target/
