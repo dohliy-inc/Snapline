@@ -483,7 +483,7 @@ dependencies = [
 
 [[package]]
 name = "engine"
-version = "2.0.1"
+version = "2.0.2"
 dependencies = [
  "ab_glyph",
  "chrono",
@@ -1931,7 +1931,7 @@ dependencies = [
 
 [[package]]
 name = "snapline"
-version = "2.0.1"
+version = "2.0.2"
 dependencies = [
  "ab_glyph",
  "chrono",

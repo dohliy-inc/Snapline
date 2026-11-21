@@ -272,12 +272,32 @@ pub fn steps() -> Vec<Step> {
             a.feed.change(|e| e.file = "jpg".into());
             Ok(())
         }), 20),
+        Do("style second", Box::new(|a| {
+            a.feed.go(2);
+            Ok(())
+        }), 10),
+        Wait("second for style", Box::new(loaded)),
+        Do("style it", Box::new(|a| {
+            a.feed.change(|e| e.preset = Some("noir".into()));
+            expect(edit_of(a).preset.as_deref() == Some("noir"), "style did not apply")
+        }), 30),
+        Do("back to first", Box::new(|a| {
+            a.feed.go(1);
+            Ok(())
+        }), 10),
+        Wait("first again", Box::new(loaded)),
         Do("scene", Box::new(|a| {
             let shots: Vec<String> = NAMES.iter().rev().map(|s| s.to_string()).collect();
             a.feed.set_scene(shots, vec![SeamPart::of(Seam::default())]);
             a.feed.toggle_tool("scene");
             Ok(())
         }), 40),
+        Do("scene keeps style", Box::new(|a| {
+            let name = a.feed.names[1].clone();
+            let cached = a.feed.shot_of(&name).and_then(|s| s.edit.preset.clone());
+            let json = std::fs::read_to_string(a.cfg.out.join("src").join(format!("{name}.json"))).unwrap_or_default();
+            expect(cached.as_deref() == Some("noir") && json.contains("noir"), &format!("scene lost the style of {name}: memory {cached:?}"))
+        }), 4),
         Do("text whole", Box::new(|a| {
             a.feed.toggle_tool("text");
             a.feed.set_whole("all");
@@ -315,6 +335,9 @@ pub fn steps() -> Vec<Step> {
             Ok(())
         }), 10),
         Wait("second shot", Box::new(loaded)),
+        Do("reopen keeps style", Box::new(|a| {
+            expect(edit_of(a).preset.as_deref() == Some("noir"), "editor reopened the version before the style change")
+        }), 2),
         Do("go 3", Box::new(|a| {
             a.feed.go(3);
             Ok(())

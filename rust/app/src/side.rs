@@ -93,7 +93,7 @@ Ctrl+Z — отменить · Ctrl+C — скопировать СС"
         let mut go = None;
         let widest = (start..start + count)
             .filter_map(|i| { let n = self.names[i].clone(); self.thumb(&out, &n, (THUMB.0 as u32, THUMB.1 as u32)) })
-            .map(|t| t.size_vec2().x)
+            .map(|t| t.size_vec2().x / ui.ctx().pixels_per_point())
             .fold(0.0f32, f32::max)
             .max(THUMB.1);
         for (k, idx) in (start..start + count).enumerate() {
@@ -107,8 +107,8 @@ Ctrl+Z — отменить · Ctrl+C — скопировать СС"
             let frame = Rect::from_min_size(Pos2::new(x, y), vec2(THUMB.0, THUMB.1));
             match self.thumb(&out, &shot_name, (THUMB.0 as u32, THUMB.1 as u32)) {
                 Some(tex) => {
-                    let size = tex.size_vec2();
-                    let pic = Rect::from_min_size(Pos2::new(frame.left(), frame.center().y - size.y / 2.0), size);
+                    let size = self.shown(&tex);
+                    let pic = Rect::from_min_size(self.snap(Pos2::new(frame.left(), frame.center().y - size.y / 2.0)), size);
                     let dim = if current { 255 } else { (150.0 + 105.0 * t) as u8 };
                     p.image(tex.id(), pic, full_uv(), Color32::from_gray(dim));
                     if current {

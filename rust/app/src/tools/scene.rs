@@ -122,7 +122,8 @@ impl Feed {
             let (row, _) = ui.allocate_exact_size(vec2(w, 36.0), Sense::hover());
             let mut x = row.left();
             if let Some(t) = self.frame_thumb(name) {
-                let r = Rect::from_min_size(Pos2::new(x, row.center().y - t.size_vec2().y / 2.0), t.size_vec2());
+                let size = self.shown(&t);
+                let r = Rect::from_min_size(self.snap(Pos2::new(x, row.center().y - size.y / 2.0)), size);
                 let resp = ui.interact(r, Id::unique(("scene-thumb", k)), Sense::click());
                 ui.painter().image(t.id(), r, full_uv(), Color32::WHITE);
                 if resp.clicked() {
@@ -131,7 +132,7 @@ impl Feed {
                 if resp.hovered() {
                     self.hint_text = Some("Показать эту СС в сцене крупно".into());
                 }
-                x += t.size_vec2().x + 8.0;
+                x += size.x + 8.0;
             }
             let text = format!("{}. {}{}", k + 1, theme::when(name), if *name == mine { " · эта" } else { "" });
             let tr = ui.painter().text(Pos2::new(x, row.center().y), Align2::LEFT_CENTER, text, theme::ui(10.0), if *name == mine { WHITE } else { SUB });
@@ -231,6 +232,8 @@ impl Feed {
     }
 
     pub fn thumb(&mut self, out: &std::path::Path, name: &str, size: (u32, u32)) -> Option<TextureHandle> {
+        let ppp = self.ctx.pixels_per_point();
+        let size = ((size.0 as f32 * ppp).round() as u32, (size.1 as f32 * ppp).round() as u32);
         let path = store::shot_image(out, name);
         let key = format!("thumb:{}:{:?}:{}x{}", path.display(), crate::feed::stamp(&path), size.0, size.1);
         if let Some(t) = self.thumbs.get(&key) {
@@ -250,13 +253,14 @@ impl Feed {
 
     pub fn frame_thumb(&mut self, name: &str) -> Option<TextureHandle> {
         let size = (54, 32);
+        let ppp = self.ctx.pixels_per_point();
         let shot = self.shot.as_ref()?;
         if Some(name) != shot.name.as_deref() {
             let out = shot.out.clone();
             return self.thumb(&out, name, size);
         }
         let edit = &shot.edit;
-        let key = format!("bg:{}:{}:{}", std::sync::Arc::as_ptr(&shot.bg) as usize, edit.mirror, edit.tilt());
+        let key = format!("bg:{}:{}:{}:{}", std::sync::Arc::as_ptr(&shot.bg) as usize, edit.mirror, edit.tilt(), ppp);
         if let Some(t) = self.thumbs.get(&key) {
             return Some(t.clone());
         }
@@ -264,7 +268,7 @@ impl Feed {
         let part = compose::bg_part(&shot.bg, p.rect, edit.mirror);
         let dims = part.dimensions();
         let part = compose::tilt_image(&part, edit.tilt(), dims);
-        let k = (size.0 as f32 / part.width() as f32).min(size.1 as f32 / part.height() as f32);
+        let k = (size.0 as f32 * ppp / part.width() as f32).min(size.1 as f32 * ppp / part.height() as f32);
         let small = engine::img::resize(&part, ((part.width() as f32 * k).round() as u32).max(1), ((part.height() as f32 * k).round() as u32).max(1),
                                         engine::img::Filter::Bilinear);
         let t = texture(&self.ctx, "frame-thumb", &small);

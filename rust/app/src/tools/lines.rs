@@ -101,7 +101,7 @@ impl Feed {
             }
         }
         let mut img = RgbImage::from_raw(cw as u32, r.h as u32, data)?;
-        if s < 1.0 {
+        if s < 0.999 {
             img = engine::img::resize(&img, ((cw as f32 * s).round() as u32).max(1), ((r.h as f32 * s).round() as u32).max(1), engine::img::Filter::Lanczos);
         }
         if self.thumbs.len() > 400 {
@@ -121,7 +121,8 @@ impl Feed {
             Some((r.glyphs[r.glyphs.len() - 1].1 + 8, r.pitch))
         }).collect();
         let widest = rows.iter().map(|(w, _)| *w).max().unwrap_or(1) as f32;
-        let s = 1f32.min((area.width() - 104.0) / widest);
+        let ppp = ui.ctx().pixels_per_point();
+        let s = (1.0 / ppp).min((area.width() - 104.0) / widest);
         self.lines_x0 = area.left() + 48.0;
         self.lines_s = s;
         let slot = 28f32.max((rows.iter().map(|(_, p)| *p).fold(0.0, f64::max) as f32 * s).round() + 12.0);
@@ -178,9 +179,10 @@ impl Feed {
                         clip.rect_filled(row_rect, CornerRadius::ZERO, ROW);
                     }
                     widgets::tick(ui, Rect::from_center_size(Pos2::new(area.left() + 16.0 + 9.0, y + slot / 2.0), vec2(18.0, 18.0)), r.keep);
-                    if let Some(t) = self.row_texture(&it.name, i, s) {
-                        let size = t.size_vec2();
-                        let pic = Rect::from_min_size(Pos2::new(area.left() + 48.0, y + slot / 2.0 - size.y / 2.0), size);
+                    if let Some(t) = self.row_texture(&it.name, i, s * ppp) {
+                        let size = t.size_vec2() / ppp;
+                        let top = ((y + slot / 2.0 - size.y / 2.0) * ppp).round() / ppp;
+                        let pic = Rect::from_min_size(Pos2::new(((area.left() + 48.0) * ppp).round() / ppp, top), size);
                         clip.image(t.id(), pic, full_uv(), Color32::WHITE);
                         if !r.keep {
                             clip.line_segment([Pos2::new(pic.left(), y + slot / 2.0), Pos2::new(pic.right(), y + slot / 2.0)], Stroke::new(1.0, LINE));

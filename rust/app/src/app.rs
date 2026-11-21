@@ -96,6 +96,9 @@ impl App {
                 (raw, cfg, Some(format!("config.ini не прочитан ({e}), взяты настройки по умолчанию")))
             }
         };
+        if let Some(zoom) = probe.as_ref().and(std::env::var("SNAPLINE_ZOOM").ok()).and_then(|z| z.parse::<f32>().ok()) {
+            cc.egui_ctx.set_zoom_factor(zoom);
+        }
         let (tx, rx) = channel();
         let (tray_tx, tray_rx) = channel();
         let icon = crate::art::make_icon(32);

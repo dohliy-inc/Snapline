@@ -123,11 +123,13 @@ impl Painter {
         let bg = &shot.bg;
         let p = compose::plan(bg.dimensions(), edit, None);
         let (out_w, out_h) = p.size;
-        let d = (area.width() / out_w as f32).min(area.height() / out_h as f32);
-        let (dw, dh) = (((out_w as f32 * d).round() as u32).max(1), ((out_h as f32 * d).round() as u32).max(1));
-        let ix = area.left() + ((area.width() - dw as f32) / 2.0).floor();
-        let iy = area.top() + ((area.height() - dh as f32) / 2.0).floor();
-        let img_rect = Rect::from_min_size(Pos2::new(ix, iy), vec2(dw as f32, dh as f32));
+        let k = ctx.pixels_per_point();
+        let dp = (area.width() * k / out_w as f32).min(area.height() * k / out_h as f32);
+        let d = dp / k;
+        let (dw, dh) = (((out_w as f32 * dp).round() as u32).max(1), ((out_h as f32 * dp).round() as u32).max(1));
+        let ix = (area.left() * k + (area.width() * k - dw as f32) / 2.0).floor() / k;
+        let iy = (area.top() * k + (area.height() * k - dh as f32) / 2.0).floor() / k;
+        let img_rect = Rect::from_min_size(Pos2::new(ix, iy), vec2(dw as f32 / k, dh as f32 / k));
         let edit_key = serde_json::to_string(&(&edit.format, edit.zoom, edit.center, &edit.size, &edit.join, &edit.overlays,
                                                edit.mirror, edit.tilt, &edit.blurs)).unwrap_or_default();
         let fkey = key_of((std::sync::Arc::as_ptr(bg) as usize, edit_key, dw, dh, laps, (ix * 4.0) as i64, (iy * 4.0) as i64));
@@ -136,32 +138,33 @@ impl Painter {
                 frame_at(bg, p.rect, (dw, dh), edit.mirror, edit.tilt())
             } else {
                 let (bw, bh) = p.base;
-                let base = frame_at(bg, p.rect, (((bw as f32 * d).round() as u32).max(1), ((bh as f32 * d).round() as u32).max(1)),
+                let base = frame_at(bg, p.rect, (((bw as f32 * dp).round() as u32).max(1), ((bh as f32 * dp).round() as u32).max(1)),
                                     edit.mirror, edit.tilt());
                 let joined = edit.join.as_ref().map(|j| compose::join_canvas(&base, j)).unwrap_or(base);
                 if joined.dimensions() == (dw, dh) { joined } else { img::resize(&joined, dw, dh, Filter::Bilinear) }
             };
-            let (pieces, ovs) = self.overlay_pieces(shot, edit, img_rect, d, (out_w, out_h));
+            let (pieces, ovs) = self.overlay_pieces(shot, edit, img_rect, dp, k, (out_w, out_h));
             let blurs = edit.blurs.clone().unwrap_or_default();
             let mut textures = Vec::new();
             if !blurs.is_empty() && !pieces.is_empty() {
                 let mut canvas = img::to_rgba(&frame);
                 for (_, piece, r) in &pieces {
-                    img::paste_rgba(&mut canvas, piece, (r.left() - ix) as i64, (r.top() - iy) as i64);
+                    img::paste_rgba(&mut canvas, piece, ((r.left() - ix) * k).round() as i64, ((r.top() - iy) * k).round() as i64);
                 }
                 frame = engine::styles::obscure(&img::to_rgb(&canvas), &blurs);
-                for (k, _, r) in &pieces {
-                    let crop = img::crop(&frame, (r.left() - ix) as u32, (r.top() - iy) as u32, (r.right() - ix) as u32, (r.bottom() - iy) as u32);
-                    textures.push((*k, rgb_texture(&ctx, "piece", &crop), *r));
+                let px = |v: f32| (v * k).round() as u32;
+                for (n, _, r) in &pieces {
+                    let crop = img::crop(&frame, px(r.left() - ix), px(r.top() - iy), px(r.right() - ix), px(r.bottom() - iy));
+                    textures.push((*n, rgb_texture(&ctx, "piece", &crop), *r));
                 }
             } else {
                 frame = engine::styles::obscure(&frame, &blurs);
-                for (k, piece, r) in &pieces {
-                    textures.push((*k, rgba_texture(&ctx, "piece", piece), *r));
+                for (n, piece, r) in &pieces {
+                    textures.push((*n, rgba_texture(&ctx, "piece", piece), *r));
                 }
             }
             if laps != (0, 0) {
-                shade(&mut frame, (laps.0 as f32 * d, laps.1 as f32 * d));
+                shade(&mut frame, (laps.0 as f32 * dp, laps.1 as f32 * dp));
             }
             self.frame = Some((fkey, rgb_texture(&ctx, "frame", &frame), textures, ovs));
         }
@@ -200,14 +203,14 @@ impl Painter {
         let mut boxes = Vec::new();
         let spots = compose::chat_spots((out_w as i64, inner as i64), &dims, &spots_pos, pad, p.margin, &mut boxes, None);
         let mut chats = Vec::new();
-        for (k, (layer, spot)) in layers.iter().zip(spots).enumerate() {
+        for (n, (layer, spot)) in layers.iter().zip(spots).enumerate() {
             let (Some(layer), Some((left, top))) = (layer, spot) else {
                 chats.push(None);
                 continue;
             };
             let (lw, lh) = (layer.width(), layer.height());
-            let size = (((lw as f32 * d).round() as u32).max(1), ((lh as f32 * d).round() as u32).max(1));
-            let skey = key_of((lkey, k, size));
+            let size = (((lw as f32 * dp).round() as u32).max(1), ((lh as f32 * dp).round() as u32).max(1));
+            let skey = key_of((lkey, n, size));
             let tex = match self.small.iter().find(|(key, _)| *key == skey) {
                 Some((_, t)) => t.clone(),
                 None => {
@@ -217,14 +220,15 @@ impl Painter {
                     t
                 }
             };
-            let (mut cx, mut cy) = (ix + (left as f32 * d).round(), iy + ((top + it as i64) as f32 * d).round());
+            let (mut cx, mut cy) = (ix + (left as f32 * dp).round() / k, iy + ((top + it as i64) as f32 * dp).round() / k);
             if let Some((part, at)) = moving {
-                if part == k {
-                    (cx, cy) = (at.x, at.y);
+                if part == n {
+                    (cx, cy) = ((at.x * k).round() / k, (at.y * k).round() / k);
                 }
             }
-            ui.painter().image(tex.id(), Rect::from_min_size(Pos2::new(cx, cy), vec2(size.0 as f32, size.1 as f32)), full, Color32::WHITE);
-            chats.push(Some(ChatGeo { x: cx, y: cy, w: size.0 as f32, h: size.1 as f32, lw: lw as f32, lh: lh as f32 }));
+            let (sw, sh) = (size.0 as f32 / k, size.1 as f32 / k);
+            ui.painter().image(tex.id(), Rect::from_min_size(Pos2::new(cx, cy), vec2(sw, sh)), full, Color32::WHITE);
+            chats.push(Some(ChatGeo { x: cx, y: cy, w: sw, h: sh, lw: lw as f32, lh: lh as f32 }));
         }
         let join = p.ext_box.map(|(l, t, r, b)| Rect::from_min_max(Pos2::new(ix + l as f32 * d, iy + t as f32 * d),
                                                                      Pos2::new(ix + r as f32 * d, iy + b as f32 * d)));
@@ -234,20 +238,22 @@ impl Painter {
         geo
     }
 
-    fn overlay_pieces(&self, shot: &Shot, edit: &Edit, img: Rect, d: f32, out: (u32, u32))
+    fn overlay_pieces(&self, shot: &Shot, edit: &Edit, img: Rect, dp: f32, k: f32, out: (u32, u32))
                       -> (Vec<(usize, RgbaImage, Rect)>, Vec<Option<OvGeo>>) {
+        let img = Rect::from_min_max((img.min.to_vec2() * k).to_pos2(), (img.max.to_vec2() * k).to_pos2());
+        let pt = |r: Rect| Rect::from_min_max((r.min.to_vec2() / k).to_pos2(), (r.max.to_vec2() / k).to_pos2());
         let mut pieces = Vec::new();
         let mut geos = Vec::new();
         let src = shot.src();
-        for (k, ov) in edit.overlays.iter().enumerate() {
+        for (n, ov) in edit.overlays.iter().enumerate() {
             let Some(source) = compose::overlay_image(&src.join(&ov.file), ov.flipped()) else {
                 geos.push(None);
                 continue;
             };
             let (x, y, w, h) = compose::overlay_box(ov, out, source.dimensions());
-            let dx = (img.left() + x as f32 * d).round();
-            let dy = (img.top() + y as f32 * d).round();
-            let size = (((w as f32 * d).round() as u32).max(1), ((h as f32 * d).round() as u32).max(1));
+            let dx = (img.left() + x as f32 * dp).round();
+            let dy = (img.top() + y as f32 * dp).round();
+            let size = (((w as f32 * dp).round() as u32).max(1), ((h as f32 * dp).round() as u32).max(1));
             let edges = compose::spun_edges(ov, (x, y, w, h), out);
             let piece = compose::spin(&compose::soften(&compose::overlay_piece(&source, ov, size), ov, edges), ov.turn());
             let px0 = (dx + (size.0 as f32 - piece.width() as f32) / 2.0).round();
@@ -262,8 +268,8 @@ impl Painter {
             }
             let crop = img::crop_rgba(&piece, (l - px0) as u32, (t - py0) as u32, (r - px0) as u32, (b - py0) as u32);
             let rect = Rect::from_min_max(Pos2::new(l, t), Pos2::new(r, b));
-            pieces.push((k, crop, rect));
-            geos.push(Some(OvGeo { x: dx, y: dy, w: size.0 as f32, h: size.1 as f32, b: rect, angle: ov.turn() }));
+            pieces.push((n, crop, pt(rect)));
+            geos.push(Some(OvGeo { x: dx / k, y: dy / k, w: size.0 as f32 / k, h: size.1 as f32 / k, b: pt(rect), angle: ov.turn() }));
         }
         (pieces, geos)
     }

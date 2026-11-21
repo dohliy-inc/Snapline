@@ -81,6 +81,7 @@ pub struct Feed {
     pub message: Option<(String, String)>,
     pub note: String,
     pub saves: HashMap<String, Shot>,
+    pub writing: HashSet<String>,
     pub save_due: Option<Instant>,
     pub jobs: Sender<Job>,
     last_wheel: Instant,
@@ -198,6 +199,7 @@ impl Feed {
             message: None,
             note: String::new(),
             saves: HashMap::new(),
+            writing: HashSet::new(),
             save_due: None,
             jobs,
             last_wheel: Instant::now(),
@@ -291,8 +293,17 @@ impl Feed {
         self.open_current();
     }
 
+    fn sync_current(&mut self) {
+        if let Some(shot) = &self.shot {
+            if let Some(name) = shot.name.clone() {
+                self.cache.insert(name, Some(shot.clone()));
+            }
+        }
+    }
+
     pub fn open_current(&mut self) {
         self.flush_save();
+        self.sync_current();
         self.shot = None;
         self.preview = None;
         self.preview_info = None;
@@ -350,7 +361,7 @@ impl Feed {
                     self.remember(s);
                 }
                 let here = self.name();
-                let keep: HashSet<String> = self.scene_names().into_iter().chain(here.clone()).collect();
+                let keep: HashSet<String> = self.scene_names().into_iter().chain(here.clone()).chain(self.saves.keys().cloned()).chain(self.writing.iter().cloned()).collect();
                 while self.cache.len() > 6 + keep.len() {
                     let Some(old) = self.cache.keys().find(|n| !keep.contains(*n)).cloned() else { break };
                     self.cache.remove(&old);
@@ -364,6 +375,7 @@ impl Feed {
                 }
             }
             Msg::Saved(name, error) => {
+                self.writing.remove(&name);
                 self.ready = None;
                 self.saved = None;
                 if Some(&name) == self.name().as_ref() || Some(&name) == self.part.as_ref() {
@@ -640,6 +652,9 @@ impl Feed {
 
     pub fn schedule_save(&mut self, name: &str) {
         self.record(name);
+        if self.name().as_deref() == Some(name) {
+            self.sync_current();
+        }
         let Some(shot) = self.shot_of(name) else { return };
         let snap = shot.clone();
         self.note = "сохраняю…".into();
@@ -674,6 +689,7 @@ impl Feed {
         self.save_due = None;
         let names: Vec<String> = self.saves.keys().cloned().collect();
         let snaps: Vec<Shot> = names.iter().filter_map(|n| self.saves.get(n)).map(|s| self.snapshot(Some(s), true)).collect();
+        self.writing.extend(names);
         self.saves.clear();
         if !snaps.is_empty() {
             let _ = self.jobs.send(Job::Save(snaps));
@@ -1417,7 +1433,8 @@ impl Feed {
             }
         }
         let img = image::open(&path).ok()?.to_rgb8();
-        let k = (area.width() / img.width() as f32).min(area.height() / img.height() as f32).min(1.0);
+        let ppp = self.ctx.pixels_per_point();
+        let k = (area.width() * ppp / img.width() as f32).min(area.height() * ppp / img.height() as f32).min(1.0);
         let small = engine::img::resize(&img, (img.width() as f32 * k).round().max(1.0) as u32,
                                         (img.height() as f32 * k).round().max(1.0) as u32, engine::img::Filter::Bilinear);
         let t = texture(&self.ctx, "saved", &small);
@@ -1428,7 +1445,10 @@ impl Feed {
     pub fn draw_saved(&mut self, ui: &Ui, area: Rect, name: &str) {
         match self.saved_texture(name, area) {
             Some(t) => {
-                let rect = Rect::from_center_size(area.center(), t.size_vec2());
+                let ppp = ui.ctx().pixels_per_point();
+                let size = t.size_vec2() / ppp;
+                let min = ((area.center() - size / 2.0).to_vec2() * ppp).round() / ppp;
+                let rect = Rect::from_min_size(min.to_pos2(), size);
                 ui.painter().image(t.id(), rect, full_uv(), Color32::WHITE);
             }
             None => {
@@ -1543,6 +1563,15 @@ impl Feed {
             _ => {}
         }
         self.mark_overlay(ui, geo);
+    }
+
+    pub fn shown(&self, t: &TextureHandle) -> egui::Vec2 {
+        t.size_vec2() / self.ctx.pixels_per_point()
+    }
+
+    pub fn snap(&self, at: Pos2) -> Pos2 {
+        let ppp = self.ctx.pixels_per_point();
+        Pos2::new((at.x * ppp).round() / ppp, (at.y * ppp).round() / ppp)
     }
 
     pub fn draw_preview(&mut self, ui: &Ui, rect: Rect) {
