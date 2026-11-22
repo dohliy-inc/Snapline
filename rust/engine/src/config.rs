@@ -6,7 +6,7 @@ use regex::Regex;
 
 use crate::chat::Kind;
 
-pub const VERSION: &str = "2.0.2";
+pub const VERSION: &str = "2.0.3";
 pub const NEWS_VERSION: &str = "2.0";
 
 #[derive(Clone, Debug, PartialEq)]
@@ -227,7 +227,7 @@ pub fn look_of(raw: &Raw) -> Result<std::collections::BTreeMap<String, f64>, Str
         let (key, value) = part.split_once(':').ok_or_else(bad)?;
         let key = key.trim().to_lowercase();
         let value: f64 = value.trim().parse().map_err(|_| bad())?;
-        if !crate::styles::LOOK.contains(&key.as_str()) || !(-100.0..=100.0).contains(&value) {
+        if !(crate::styles::LOOK.contains(&key.as_str()) || key == crate::styles::GRAIN) || !(-100.0..=100.0).contains(&value) {
             return Err(bad());
         }
         if value != 0.0 {

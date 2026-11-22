@@ -397,12 +397,12 @@ impl Settings {
         let mut moved = None;
         let mut done = None;
         let mut reset = false;
-        Self::row(ui, "Коррекция", Some("Яркость, контраст и остальное поверх цвета"), SUB, |ui| {
+        Self::row(ui, "Коррекция", Some("Яркость, контраст, зерно и остальное поверх цвета"), SUB, |ui| {
             for (k, (key, title)) in theme::LOOK_NAMES.iter().enumerate() {
                 widgets::label(ui, title, if k == 0 { 0.0 } else { 6.0 });
                 let value = look.get(*key).copied().unwrap_or(0.0);
-                let s = widgets::slider(ui, Id::unique(("set-look", *key)), -100.0, 100.0, value, 1.0,
-                                        &|v| if v.round() != 0.0 { format!("{v:+.0}") } else { "0".into() }, w - 20.0);
+                let lo = theme::look_range(key);
+                let s = widgets::slider(ui, Id::unique(("set-look", *key)), lo, 100.0, value, 1.0, &|v| theme::look_value(v, lo), w - 20.0);
                 if s.moved {
                     moved = Some((key.to_string(), s.value.round()));
                 }

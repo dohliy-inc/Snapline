@@ -11,6 +11,8 @@ use crate::text::{self, Face};
 pub const STYLES: [&str; 3] = ["none", "cctv", "body"];
 pub const PRESETS: [&str; 7] = ["none", "film", "warm", "cold", "faded", "noir", "sepia"];
 pub const LOOK: [&str; 6] = ["bright", "contrast", "sat", "temp", "shadows", "highlights"];
+pub const GRAIN: &str = "grain";
+const GRAIN_MAX: f32 = 10.0;
 pub const LUT_SIDES: (usize, usize) = (2, 65);
 pub const BLUR_MODES: [&str; 2] = ["blur", "pixel"];
 pub const BLUR_MAX: usize = 12;
@@ -72,6 +74,20 @@ pub fn noise(h: usize, w: usize, sigma: f32) -> Vec<f32> {
             (u / 16777216.0 - 1.0) * k
         })
         .collect()
+}
+
+pub fn grain(mut img: RgbImage, amount: f64) -> RgbImage {
+    if amount <= 0.0 {
+        return img;
+    }
+    let sigma = amount.min(100.0) as f32 / 100.0 * GRAIN_MAX;
+    let grain = noise(img.height() as usize, img.width() as usize, sigma);
+    for (p, n) in img.pixels_mut().zip(grain) {
+        for c in 0..3 {
+            p[c] = py::u8c(p[c] as f32 + n);
+        }
+    }
+    img
 }
 
 fn curve(v: f32, lift: f32, gain: f32, gamma: f32) -> f32 {

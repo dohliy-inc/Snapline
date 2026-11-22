@@ -23,8 +23,8 @@ impl Feed {
         for (key, title) in theme::LOOK_NAMES {
             widgets::label(ui, title, 2.0);
             let value = look.get(*key).copied().unwrap_or(0.0);
-            let bar = widgets::slider(ui, Id::unique(("look", *key)), -100.0, 100.0, value, 1.0,
-                                      &|v| if v.round() != 0.0 { format!("{v:+.0}") } else { "0".into() }, w);
+            let lo = theme::look_range(key);
+            let bar = widgets::slider(ui, Id::unique(("look", *key)), lo, 100.0, value, 1.0, &|v| theme::look_value(v, lo), w);
             if bar.moved {
                 let k = key.to_string();
                 let v = bar.value.round();

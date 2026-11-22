@@ -19,11 +19,6 @@ pub const JOIN_SIDES: [&str; 4] = ["left", "right", "top", "bottom"];
 pub const MAX_OVERLAYS: usize = 4;
 pub const TILT_MAX: f64 = 30.0;
 pub const SCENE_MAX: usize = 8;
-const GRAIN_TAPS: [f32; 7] = [0.004433048, 0.054005582, 0.24203623, 0.39905027, 0.24203623, 0.054005582, 0.004433048];
-const GRAIN_GAIN: f64 = 0.873;
-const GRAIN_MIN: f64 = 0.3;
-const GRAIN_TILE: usize = 64;
-const GRAIN_STEP: usize = 160;
 
 pub fn spare_places(corner: &str) -> [&'static str; 2] {
     match corner {
@@ -504,74 +499,6 @@ pub fn paste_overlays(frame: &RgbImage, overlays: &[Overlay], src: &Path) -> Rgb
     img::to_rgb(&canvas)
 }
 
-pub fn grain(frame: &RgbImage) -> f64 {
-    let (w, h) = (frame.width() as usize, frame.height() as usize);
-    let s = GRAIN_TILE;
-    let mut d: Vec<f32> = Vec::new();
-    for a in (0..(h.saturating_sub(s) + 1).max(1)).step_by(GRAIN_STEP) {
-        for b in (0..(w.saturating_sub(s) + 1).max(1)).step_by(GRAIN_STEP) {
-            let (th, tw) = ((h - a).min(s), (w - b).min(s));
-            let y: Vec<f32> = (0..th * tw).map(|i| {
-                let p = frame.get_pixel((b + i % tw) as u32, (a + i / tw) as u32);
-                p[0] as f32 * styles::LUMA[0] + p[1] as f32 * styles::LUMA[1] + p[2] as f32 * styles::LUMA[2]
-            }).collect();
-            let refl = |i: i64, n: usize| -> usize {
-                let n = n as i64;
-                let mut i = i;
-                if n == 1 {
-                    return 0;
-                }
-                while i < 0 || i >= n {
-                    if i < 0 { i = -i; }
-                    if i >= n { i = 2 * (n - 1) - i; }
-                }
-                i as usize
-            };
-            let mut row = vec![0f32; th * tw];
-            for yy in 0..th {
-                for xx in 0..tw {
-                    row[yy * tw + xx] = GRAIN_TAPS.iter().enumerate()
-                        .map(|(k, t)| t * y[yy * tw + refl(xx as i64 + k as i64 - 3, tw)]).sum();
-                }
-            }
-            for yy in 0..th {
-                for xx in 0..tw {
-                    let soft: f32 = GRAIN_TAPS.iter().enumerate()
-                        .map(|(k, t)| t * row[refl(yy as i64 + k as i64 - 3, th) * tw + xx]).sum();
-                    d.push((y[yy * tw + xx] - soft).abs());
-                }
-            }
-        }
-    }
-    if d.is_empty() {
-        return 0.0;
-    }
-    let mid = d.len() / 2;
-    let (_, m, _) = d.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
-    *m as f64 * 1.4826
-}
-
-pub fn regrain(small: RgbImage, big: &RgbImage) -> RgbImage {
-    let add = (grain(big).powi(2) - grain(&small).powi(2)).max(0.0).sqrt() / GRAIN_GAIN;
-    if add < GRAIN_MIN {
-        return small;
-    }
-    let (w, h) = (small.width() as usize, small.height() as usize);
-    let noise = styles::noise(h, w, add as f32);
-    let mut out = small;
-    for (i, p) in out.pixels_mut().enumerate() {
-        for c in 0..3 {
-            p[c] = py::u8c(p[c] as f32 + noise[i]);
-        }
-    }
-    out
-}
-
-pub fn shrink(frame: &RgbImage, size: (u32, u32)) -> RgbImage {
-    let out = img::resize(frame, size.0, size.1, Filter::Lanczos);
-    if size.0 < frame.width() { regrain(out, frame) } else { out }
-}
-
 pub fn backdrop(bg: &RgbImage, edit: &Edit, src: Option<&Path>, width: Option<u32>) -> (RgbImage, Plan) {
     let p = plan(bg.dimensions(), edit, width);
     let mut frame = bg_part(bg, p.rect, edit.mirror);
@@ -580,7 +507,8 @@ pub fn backdrop(bg: &RgbImage, edit: &Edit, src: Option<&Path>, width: Option<u3
         frame = tilt_image(&frame, edit.tilt(), size);
     }
     if frame.dimensions() != p.base {
-        frame = if p.base.0 < frame.width() { shrink(&frame, p.base) } else { img::resize(&frame, p.base.0, p.base.1, Filter::Bicubic) };
+        let filter = if p.base.0 < frame.width() { Filter::Lanczos } else { Filter::Bicubic };
+        frame = img::resize(&frame, p.base.0, p.base.1, filter);
     }
     if p.size != p.base {
         if let Some(join) = &edit.join {
@@ -598,7 +526,7 @@ pub fn backdrop(bg: &RgbImage, edit: &Edit, src: Option<&Path>, width: Option<u3
     if let Some(width) = width {
         if frame.width() != width {
             let h = py::round(frame.height() as f64 * width as f64 / frame.width() as f64).max(1) as u32;
-            frame = shrink(&frame, (width, h));
+            frame = img::resize(&frame, width, h, Filter::Lanczos);
         }
     }
     (frame, p)
@@ -786,6 +714,7 @@ pub fn lut_of(edit: &Edit, src: Option<&Path>) -> Option<Arc<Lut>> {
 pub fn styled(frame: &RgbImage, edit: &Edit, when: Option<NaiveDateTime>, src: Option<&Path>) -> (RgbImage, Vec<Box4>) {
     let lut = lut_of(edit, src);
     let graded = styles::grade(frame, edit.preset.as_deref(), edit.look.as_ref(), lut.as_deref());
+    let graded = styles::grain(graded, edit.look.as_ref().and_then(|l| l.get(styles::GRAIN)).copied().unwrap_or(0.0));
     styles::apply(graded, edit.style.as_deref(), when, edit.style_text.as_deref())
 }
 

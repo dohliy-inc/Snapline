@@ -67,7 +67,15 @@ pub const PRESET_NAMES: &[(&str, &str)] = &[("none", "Нет"), ("film", "Кин
                                              ("faded", "Выцветший"), ("noir", "Нуар"), ("sepia", "Сепия")];
 pub const BLUR_NAMES: &[(&str, &str)] = &[("blur", "Размытие"), ("pixel", "Пиксели")];
 pub const LOOK_NAMES: &[(&str, &str)] = &[("bright", "Яркость"), ("contrast", "Контраст"), ("sat", "Насыщенность"),
-                                           ("temp", "Температура"), ("shadows", "Тени"), ("highlights", "Света")];
+                                           ("temp", "Температура"), ("shadows", "Тени"), ("highlights", "Света"), ("grain", "Зерно")];
+pub fn look_range(key: &str) -> f64 {
+    if key == engine::styles::GRAIN { 0.0 } else { -100.0 }
+}
+
+pub fn look_value(v: f64, lo: f64) -> String {
+    if v.round() == 0.0 { "0".into() } else if lo < 0.0 { format!("{v:+.0}") } else { format!("{v:.0}") }
+}
+
 pub const NICKS: &[(&str, &str)] = &[("no", "Показывать"), ("yes", "Прятать")];
 pub const CROPS: &[(&str, &str)] = &[("free", "Свободно"), ("1:1", "Квадрат"), ("4:3", "4:3"), ("3:4", "3:4"), ("16:9", "16:9"), ("9:16", "9:16")];
 pub const SIDES: &[(&str, &str)] = &[("none", "Нет"), ("left", "Слева"), ("right", "Справа"), ("top", "Сверху"), ("bottom", "Снизу")];
