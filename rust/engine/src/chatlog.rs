@@ -21,6 +21,7 @@ pub const LOG_FONT: &str = "arialbd.ttf";
 pub const LOG_SIZE: f64 = 18.0 / 1440.0;
 pub const LOG_PITCH: f64 = 21.5 / 1440.0;
 pub const LOG_LEFT: f64 = 27.0 / 1440.0;
+pub const LOG_GAMMA: f32 = 0.75;
 pub const LOG_WIDTH: f64 = 0.25;
 pub const LOG_SPAN_S: i64 = 60 * 60;
 pub const LOG_GAP_S: i64 = 3 * 60;
@@ -200,7 +201,7 @@ pub fn log_rows(lines: &[Line], measure: &dyn Fn(&str) -> f32, limit: f32) -> Ve
 
 pub fn log_frame(lines: &[Line], size: (u32, u32)) -> RgbImage {
     let (w, h) = size;
-    let face = Face::new(LOG_FONT, py::round(LOG_SIZE * h as f64).max(8));
+    let face = Face::new(LOG_FONT, py::round(LOG_SIZE * h as f64).max(8)).map(|f| Face { gamma: LOG_GAMMA, ..f });
     let pitch = LOG_PITCH * h as f64;
     let left = py::round(LOG_LEFT * h as f64);
     let Some(face) = face else { return RgbImage::new(w, h) };

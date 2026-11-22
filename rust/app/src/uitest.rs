@@ -389,6 +389,26 @@ pub fn steps() -> Vec<Step> {
             let gone = !a.feed.names.contains(&DOOMED.to_string()) && a.feed.index == 2 && !out.join(format!("{DOOMED}.jpg")).exists();
             expect(gone, &format!("delete left the shot behind: index {}", a.feed.index))
         }), 4),
+        Wait("before chat again", Box::new(loaded)),
+        Do("chat again", Box::new(|a| {
+            let name = a.feed.name().ok_or("no shot")?;
+            let mut state = engine::capture::Session::named(&name);
+            state.bg = Some(image::open(fixtures().join("real_bg.webp")).map_err(|e| e.to_string())?.to_rgb8());
+            let frame = image::open(fixtures().join("real_chat_sys.png")).map_err(|e| e.to_string())?.to_rgb8();
+            engine::capture::handle(frame, &mut state, &a.cfg).map(|_| ())
+        }), 20),
+        Do("back to recaptured", Box::new(|a| {
+            a.feed.go(2);
+            Ok(())
+        }), 10),
+        Wait("recaptured", Box::new(loaded)),
+        Do("recapture shows", Box::new(|a| {
+            let name = a.feed.name().unwrap_or_default();
+            let json = std::fs::read_to_string(a.cfg.out.join("src").join(format!("{name}.json"))).unwrap_or_default();
+            let disk = serde_json::from_str::<Value>(&json).ok().and_then(|e| e["keep"].as_array().map(|k| k.len())).unwrap_or(0);
+            let shown = edit_of(a).keep.len();
+            expect(name == NAMES[0] && shown == disk, &format!("F2 + F11 chat is missing in the editor: {shown} rows shown, {disk} saved"))
+        }), 2),
     ]
 }
 

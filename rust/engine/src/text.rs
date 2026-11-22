@@ -26,6 +26,7 @@ pub fn font(name: &str) -> Option<FontArc> {
 pub struct Face {
     pub font: FontArc,
     pub scale: PxScale,
+    pub gamma: f32,
 }
 
 impl Face {
@@ -36,7 +37,7 @@ impl Face {
             Some(em) => PxScale::from(size * font.height_unscaled() / em),
             None => PxScale::from(size),
         };
-        Some(Face { font, scale })
+        Some(Face { font, scale, gamma: 1.0 })
     }
 
     pub fn ascent(&self) -> f32 {
@@ -129,7 +130,7 @@ impl Face {
                 if px < 0 || py < 0 || px >= w || py >= h || cov <= 0.0 {
                     return;
                 }
-                let cov = cov.min(1.0);
+                let cov = cov.min(1.0).powf(self.gamma);
                 let p = img.get_pixel_mut(px as u32, py as u32);
                 for c in 0..3 {
                     p[c] = (color[c] as f32 * cov + p[c] as f32 * (1.0 - cov)).round().clamp(0.0, 255.0) as u8;

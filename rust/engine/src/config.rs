@@ -6,7 +6,7 @@ use regex::Regex;
 
 use crate::chat::Kind;
 
-pub const VERSION: &str = "2.0.3";
+pub const VERSION: &str = "2.0.4";
 pub const NEWS_VERSION: &str = "2.0";
 
 #[derive(Clone, Debug, PartialEq)]

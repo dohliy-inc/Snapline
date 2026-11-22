@@ -407,6 +407,9 @@ impl Feed {
     pub fn new_shot(&mut self, name: &str) {
         self.saves.remove(name);
         self.cache.remove(name);
+        if self.shot.as_ref().is_some_and(|s| s.name.as_deref() == Some(name)) {
+            self.shot = None;
+        }
         self.forget(name);
         self.refresh_names();
         if self.drag.is_none() {
